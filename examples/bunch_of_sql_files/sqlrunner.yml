@@ -1,0 +1,9 @@
+version: 1
+
+general:
+  default_row_count: 10
+  seed: 12345
+  fixture_directory: fixtures
+  sql_file_globs:
+    - "**/*.sql"
+  sql_dialect: snowflake
