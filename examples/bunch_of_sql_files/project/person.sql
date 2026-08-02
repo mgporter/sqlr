@@ -12,6 +12,7 @@ projected as (
     b.age,
     b.email,
     b.modified_at,
+    b.rn,
     a.street,
     a.city
   from dedupped b
