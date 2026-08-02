@@ -5,6 +5,7 @@ import typer
 
 from sqlrunner import config as config_module
 from sqlrunner.catalog import find_sql_files
+from sqlrunner.schema_resolution import resolve_schema
 from sqlrunner.sql_analysis import analyze_file
 
 app = typer.Typer()
@@ -64,7 +65,12 @@ def main(
                 len(result.ctes),
                 len(result.external_sources),
             )
-        typer.echo(result.model_dump_json(indent=2))
+        # typer.echo(result.model_dump_json(indent=2))
+
+        table_schemas = resolve_schema(result)
+
+        # for table_schema in table_schemas:
+        #     typer.echo(table_schema.model_dump_json(indent=2))
 
 
 

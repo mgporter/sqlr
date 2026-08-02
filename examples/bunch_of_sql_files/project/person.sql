@@ -7,12 +7,15 @@ with dedupped as (
 ),
 projected as (
   select
-    id,
-    name,
-    age,
-    email,
-    modified_at
-  from dedupped
-  where rn = 1
+    b.id,
+    b.name,
+    b.age,
+    b.email,
+    b.modified_at,
+    a.street,
+    a.city
+  from dedupped b
+  left join mydatabase.myschema.address a on b.id = a.person_id
+  where b.rn = 1
 )
 select * from projected
