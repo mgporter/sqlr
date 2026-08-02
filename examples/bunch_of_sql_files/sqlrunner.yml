@@ -7,3 +7,4 @@ general:
   sql_file_globs:
     - "**/*.sql"
   sql_dialect: snowflake
+  star_over_join_behavior: guess

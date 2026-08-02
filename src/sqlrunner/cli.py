@@ -53,24 +53,39 @@ def main(
 
     for sql_file in file_inventory.files:
         logger.debug("analyzing %s", sql_file.relative_path)
-        result = analyze_file(sql_file.path, dialect=cfg.general.sql_dialect)
+        result = analyze_file(
+            sql_file.path,
+            dialect=cfg.general.sql_dialect,
+            star_over_join_behavior=cfg.general.star_over_join_behavior,
+        )
         if result.errors:
-            logger.error(
-                "errors analyzing %s: %s", sql_file.relative_path, result.errors
-            )
-        else:
-            logger.info(
-                "analysis of %s: %d CTEs, %d external sources",
+            for error in result.errors:
+                typer.echo(f"{sql_file.relative_path}: {error}", err=True)
+            continue
+
+        for warning in result.warnings:
+            logger.warning("%s: %s", sql_file.relative_path, warning)
+        for ambiguity in result.ambiguities:
+            logger.warning(
+                "%s: column %r in %s attributed to %s (%s, %s)",
                 sql_file.relative_path,
-                len(result.ctes),
-                len(result.external_sources),
+                ambiguity.column,
+                ambiguity.relation,
+                ambiguity.chosen,
+                ambiguity.reason,
+                ambiguity.confidence or ambiguity.resolution,
             )
-        # typer.echo(result.model_dump_json(indent=2))
 
-        table_schemas = resolve_schema(result)
+        logger.info(
+            "analysis of %s: %d relations, %d external sources, %d projected columns",
+            sql_file.relative_path,
+            len(result.relations),
+            len(result.sources),
+            len(result.projection),
+        )
 
-        # for table_schema in table_schemas:
-        #     typer.echo(table_schema.model_dump_json(indent=2))
+        schema = resolve_schema(result)
+        logger.debug("resolved schema for %s: %s", sql_file.relative_path, schema.model_dump_json(indent=2))
 
 
 
