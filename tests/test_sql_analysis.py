@@ -189,6 +189,32 @@ def test_usage_arithmetic() -> None:
     assert {u.kind for u in result.usages} == {"arithmetic"}
 
 
+def test_usage_coalesce_default() -> None:
+    result = analyze_sql("select coalesce(bonus, 0) from person")
+
+    assert ("person", "bonus", "coalesce_default", "int") in usage_tuples(result)
+
+
+def test_coalesce_of_two_columns_carries_no_literal_evidence() -> None:
+    result = analyze_sql("select coalesce(bonus, fallback) from person")
+
+    assert not [u for u in result.usages if u.kind == "coalesce_default"]
+
+
+def test_date_part_keyword_is_not_a_column() -> None:
+    # Without a dialect sqlglot parses the `year` unit as a column reference, which would
+    # otherwise invent a `year` column on `person`.
+    result = analyze_sql("select datediff(year, hire_date, current_date()) from person")
+
+    assert source_columns(result, "person") == {"hire_date"}
+
+
+def test_a_qualified_date_part_name_is_still_a_column() -> None:
+    result = analyze_sql("select datediff(p.year, p.hire_date, current_date()) from person p")
+
+    assert source_columns(result, "person") == {"year", "hire_date"}
+
+
 def test_ambiguous_unqualified_column_is_dropped_and_reported() -> None:
     sql = """
     select p.id from person p

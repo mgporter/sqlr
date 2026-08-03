@@ -16,7 +16,12 @@ from pydantic import BaseModel
 from sqlglot import exp
 
 from sqlrunner.sql_analysis.resolver import Resolver
-from sqlrunner.sql_analysis.relations import RelationGraph, RelationInfo
+from sqlrunner.sql_analysis.relations import (
+    RelationGraph,
+    RelationInfo,
+    literal_kind,
+    number_shape,
+)
 from sqlrunner.sql_analysis.types import (
     CardinalityFact,
     ColumnNode,
@@ -51,6 +56,7 @@ DATE_FUNCTION_CLASSES = {
 }
 
 BOOLEAN_CONTEXT_PARENTS = (exp.Not, exp.Where, exp.And, exp.Or, exp.If)
+TYPE_TRANSPARENT_PARENTS = (exp.Coalesce, exp.Nullif, exp.Greatest, exp.Least)
 COMPARISON_CLASSES = (exp.GT, exp.LT, exp.GTE, exp.LTE, exp.EQ, exp.NEQ)
 ARITHMETIC_CLASSES = (exp.Add, exp.Sub, exp.Mul, exp.Div)
 
@@ -71,20 +77,6 @@ FLIPPED_OPERATORS: dict[PredicateOperator, PredicateOperator] = {
     ">=": "<=",
     "<=": ">=",
 }
-
-
-def number_shape(literals: list[exp.Literal]) -> str:
-    if any("." in lit.this or "e" in lit.this.lower() for lit in literals):
-        return "float"
-    return "int"
-
-
-def _literal_kind(literals: list[exp.Literal]) -> LiteralKind:
-    if all(lit.is_string for lit in literals):
-        return "string"
-    if all(lit.is_number for lit in literals):
-        return "int" if number_shape(literals) == "int" else "float"
-    return "mixed"
 
 
 def classify_usage(column: exp.Column) -> list[tuple[str, str | None]]:
@@ -120,6 +112,17 @@ def classify_usage(column: exp.Column) -> list[tuple[str, str | None]]:
     if isinstance(parent, BOOLEAN_CONTEXT_PARENTS) and parent.this is column:
         return [("boolean_context", None)]
 
+    if isinstance(parent, TYPE_TRANSPARENT_PARENTS):
+        # `coalesce(bonus, 0)` types `bonus`: every argument has to share one domain.
+        siblings = [
+            argument
+            for argument in parent.iter_expressions()
+            if isinstance(argument, exp.Literal)
+        ]
+        if siblings:
+            return [("coalesce_default", literal_kind(siblings))]
+        return []
+
     if type(parent).__name__ in DATE_FUNCTION_CLASSES:
         return [("date_function", type(parent).__name__)]
 
@@ -143,14 +146,14 @@ def _predicate(
         operator = COMPARISON_OPERATORS[type(parent)]
         if parent.right is column:
             operator = FLIPPED_OPERATORS[operator]
-        return operator, [str(other.this)], _literal_kind([other])
+        return operator, [str(other.this)], literal_kind([other])
 
     if isinstance(parent, exp.In) and parent.this is column:
         literals = [e for e in parent.expressions if isinstance(e, exp.Literal)]
         if not literals or len(literals) != len(parent.expressions):
             return None
         operator = "not_in" if isinstance(parent.parent, exp.Not) else "in"
-        return operator, [str(lit.this) for lit in literals], _literal_kind(literals)
+        return operator, [str(lit.this) for lit in literals], literal_kind(literals)
 
     if isinstance(parent, (exp.Like, exp.ILike)) and parent.this is column:
         pattern = parent.expression
@@ -164,7 +167,7 @@ def _predicate(
         literals = [b for b in bounds if isinstance(b, exp.Literal)]
         if len(literals) != 2:
             return None
-        return "between", [str(lit.this) for lit in literals], _literal_kind(literals)
+        return "between", [str(lit.this) for lit in literals], literal_kind(literals)
 
     if (
         isinstance(parent, exp.Is)

@@ -1,7 +1,9 @@
 from pathlib import Path
 
-from sqlrunner.schema_resolution import resolve_schema
-from sqlrunner.schema_resolution.types import ColumnSchema, StatementSchema
+import pytest
+
+from sqlrunner.schema_resolution import resolve_schema, widen
+from sqlrunner.schema_resolution.types import ColumnSchema, ResolvedType, StatementSchema
 from sqlrunner.sql_analysis import analyze_file, analyze_sql
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -34,16 +36,23 @@ def test_usage_beats_name_pattern() -> None:
     assert cols["order_id"] == ("string", "usage")
 
 
-def test_numeric_comparison_infers_integer() -> None:
+def test_int_literal_comparison_infers_numeric() -> None:
+    # `quantity > 5` is equally true of an INT, a DECIMAL and a DOUBLE column.
     cols = _columns_by_name("select id from orders where quantity > 5")
 
-    assert cols["quantity"] == ("integer", "usage")
+    assert cols["quantity"] == ("numeric", "usage")
 
 
-def test_numeric_comparison_infers_decimal() -> None:
+def test_float_literal_comparison_infers_numeric() -> None:
     cols = _columns_by_name("select id from orders where amount > 5.5")
 
-    assert cols["amount"] == ("decimal", "usage")
+    assert cols["amount"] == ("numeric", "usage")
+
+
+def test_arithmetic_infers_numeric() -> None:
+    cols = _columns_by_name("select salary * 12 as annual from orders")
+
+    assert cols["salary"] == ("numeric", "usage")
 
 
 def test_in_list_strings_infers_string() -> None:
@@ -58,12 +67,26 @@ def test_date_function_infers_date() -> None:
     assert cols["created_at"] == ("date", "usage")
 
 
-def test_cast_infers_explicit_type() -> None:
+def test_cast_does_not_type_the_column_it_reads() -> None:
+    # A cast fixes the type of its *result*. `shipped_on` only has to be castable to a
+    # timestamp, which a string column is too.
     cols = _columns_by_name(
         "select id from orders where cast(shipped_on as timestamp) = current_timestamp"
     )
 
-    assert cols["shipped_on"] == ("timestamp", "usage")
+    assert cols["shipped_on"] == ("unknown", "unknown")
+
+
+def test_coalesce_literal_types_the_column_beside_it() -> None:
+    cols = _columns_by_name("select coalesce(bonus, 0) as bonus from orders")
+
+    assert cols["bonus"] == ("numeric", "usage")
+
+
+def test_coalesce_string_literal_types_the_column_beside_it() -> None:
+    cols = _columns_by_name("select coalesce(nickname, 'n/a') as nickname from orders")
+
+    assert cols["nickname"] == ("string", "usage")
 
 
 def test_boolean_context_infers_boolean() -> None:
@@ -72,10 +95,11 @@ def test_boolean_context_infers_boolean() -> None:
     assert cols["active"] == ("boolean", "usage")
 
 
-def test_name_pattern_fallback_id() -> None:
+def test_id_suffix_is_not_a_name_pattern() -> None:
+    # An `*_id` is as likely to be a uuid string as an integer.
     cols = _columns_by_name("select customer_id from orders")
 
-    assert cols["customer_id"] == ("integer", "name_pattern")
+    assert cols["customer_id"] == ("unknown", "unknown")
 
 
 def test_name_pattern_fallback_at() -> None:
@@ -104,23 +128,56 @@ def test_cast_to_unknown_target_falls_back_to_name_pattern() -> None:
 
 def test_conflicting_usage_prefers_higher_confidence() -> None:
     cols = _columns_by_name(
-        "select id from orders where cast(code as varchar) = '5' and code > 1"
+        "select id from orders where code in ('a', 'b') and code > 1"
     )
 
     assert cols["code"] == ("string", "usage")
 
 
+def test_equally_weighted_conflicting_usage_is_widened() -> None:
+    # Two coalesce defaults of the same weight disagree; nothing covers both.
+    cols = _columns_by_name(
+        "select coalesce(code, 0), coalesce(code, 'x') from orders"
+    )
+
+    assert cols["code"] == ("unknown", "unknown")
+
+
 def test_multiple_tables_resolved_independently() -> None:
     sql = """
-    select o.amount, p.customer_id
+    select o.amount, p.nickname
     from orders o
     join person p on p.id = o.person_id
-    where o.amount > 100
+    where o.amount > 100 and p.nickname like 'a%'
     """
     schema = schema_for(sql)
 
-    assert columns_of(schema, "orders")["amount"].resolved_type == "integer"
-    assert columns_of(schema, "person")["customer_id"].resolved_type == "integer"
+    assert columns_of(schema, "orders")["amount"].resolved_type == "numeric"
+    assert columns_of(schema, "person")["nickname"].resolved_type == "string"
+
+
+# ---- type families -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    [
+        ("integer", "integer", "integer"),
+        ("integer", "decimal", "number"),
+        ("integer", "float", "numeric"),
+        ("number", "float", "numeric"),
+        ("integer", "number", "number"),
+        ("numeric", "decimal", "numeric"),
+        ("integer", "string", "unknown"),
+        ("date", "timestamp", "unknown"),
+        ("integer", "unknown", "unknown"),
+    ],
+)
+def test_widen_returns_the_narrowest_covering_type(
+    left: ResolvedType, right: ResolvedType, expected: ResolvedType
+) -> None:
+    assert widen(left, right) == expected
+    assert widen(right, left) == expected
 
 
 # ---- join groups -------------------------------------------------------------------
@@ -131,7 +188,7 @@ def test_join_group_propagates_a_type_to_the_untyped_side() -> None:
     select o.id
     from orders o
     join person p on p.id = o.person_id
-    where cast(p.id as varchar) = 'x'
+    where p.id in ('x', 'y')
     """
     schema = schema_for(sql)
 
@@ -164,6 +221,19 @@ def test_stronger_evidence_survives_join_group_unification() -> None:
     person_id = columns_of(schema, "orders")["person_id"]
     assert person_id.resolved_type == "string"
     assert person_id.source == "usage"
+
+
+def test_join_group_with_conflicting_member_types_is_widened() -> None:
+    sql = """
+    with a as (select cast(k as int) as k from t1),
+         b as (select cast(k as decimal) as k from t2)
+    select a.k from a join b on a.k = b.k
+    """
+    schema = schema_for(sql)
+
+    assert [group for group in schema.join_groups] == [["cte:a.k", "cte:b.k"]]
+    projection = {column.name: column for column in schema.projection}
+    assert projection["k"].resolved_type == "number"
 
 
 # ---- constraints, nullability, confidence ------------------------------------------
@@ -220,7 +290,7 @@ def test_projection_types_follow_lineage_to_the_source() -> None:
     schema = resolve_schema(analyze_file(PERSON_SQL))
 
     projection = {column.name: column for column in schema.projection}
-    assert projection["age"].resolved_type == "integer"
+    assert projection["age"].resolved_type == "numeric"
     assert projection["modified_at"].resolved_type == "timestamp"
     assert projection["age"].origins == ["table:mydatabase.myschema.person.age"]
 
@@ -237,5 +307,56 @@ def test_aggregate_projection_type_comes_from_the_expression() -> None:
     schema = schema_for("select person_id, sum(amount) as total from orders group by person_id")
 
     projection = {column.name: column for column in schema.projection}
-    assert projection["total"].resolved_type == "decimal"
+    assert projection["total"].resolved_type == "numeric"
     assert projection["total"].source == "expression"
+
+
+def test_cast_types_the_column_it_produces() -> None:
+    schema = schema_for("select cast(salary as decimal(10, 2)) as salary from orders")
+
+    projection = {column.name: column for column in schema.projection}
+    assert projection["salary"].resolved_type == "decimal"
+    assert projection["salary"].source == "expression"
+
+
+def test_cast_to_a_float_type_is_not_a_decimal() -> None:
+    schema = schema_for("select cast(ratio as double) as ratio from orders")
+
+    projection = {column.name: column for column in schema.projection}
+    assert projection["ratio"].resolved_type == "float"
+
+
+def test_cast_through_a_cte_reaches_the_final_projection() -> None:
+    sql = """
+    with c as (select cast(salary as decimal(10, 2)) as salary from orders)
+    select * from c
+    """
+    schema = schema_for(sql)
+
+    projection = {column.name: column for column in schema.projection}
+    assert projection["salary"].resolved_type == "decimal"
+
+
+def test_coalesce_literal_types_the_column_it_produces() -> None:
+    schema = schema_for("select coalesce(bonus, 0) as bonus from orders")
+
+    projection = {column.name: column for column in schema.projection}
+    assert projection["bonus"].resolved_type == "numeric"
+    assert projection["bonus"].source == "expression"
+
+
+def test_coalesce_of_two_columns_stays_unknown() -> None:
+    schema = schema_for("select coalesce(bonus, fallback) as bonus from orders")
+
+    projection = {column.name: column for column in schema.projection}
+    assert projection["bonus"].resolved_type == "unknown"
+
+
+def test_datediff_projection_is_an_integer() -> None:
+    schema = schema_for(
+        "select datediff(year, hire_date, current_date()) as tenure from employee"
+    )
+
+    projection = {column.name: column for column in schema.projection}
+    assert projection["tenure"].resolved_type == "integer"
+    assert projection["tenure"].source == "expression"

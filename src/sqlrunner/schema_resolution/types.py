@@ -7,12 +7,27 @@ from sqlrunner.sql_analysis.types import Confidence, PredicateOperator
 ResolvedType = Literal[
     "integer",
     "decimal",
+    "float",
+    "number",
+    "numeric",
     "string",
     "date",
     "timestamp",
     "boolean",
     "unknown",
 ]
+"""A concrete type, or a family that covers several.
+
+Most evidence pins down that a column holds a number without saying which kind: `x * 12`
+and `x > 5` are equally true of an INT, a DECIMAL and a DOUBLE. Rather than pick one and
+be wrong, those resolve to a family:
+
+- `number`  = `integer` | `decimal`  (exact)
+- `numeric` = `integer` | `decimal` | `float`
+
+Only evidence that names a type - a cast, or a function with a fixed return type - yields
+a concrete one.
+"""
 
 TypeSource = Literal["usage", "join_group", "expression", "name_pattern", "unknown"]
 

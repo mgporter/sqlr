@@ -98,6 +98,8 @@ def _output_column(
         ordinal=output.ordinal,
         kind=output.kind,  # type: ignore[arg-type]
         function=output.function,
+        cast_type=output.cast_type,
+        literal_kinds=list(output.literal_kinds),
         origins=origins,
         star_sources=list(output.star_sources),
     )
@@ -134,6 +136,8 @@ def _build_projection(
                 ordinal=ordinal,
                 kind=output.kind,  # type: ignore[arg-type]
                 function=output.function,
+                cast_type=output.cast_type,
+                literal_kinds=list(output.literal_kinds),
                 origins=origins,
                 star_of=list(output.star_sources),
             )

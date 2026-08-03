@@ -11,12 +11,13 @@ See `__init__.py` for the pipeline as a whole.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from sqlglot import exp
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
-from sqlrunner.sql_analysis.types import RelationRef
+from sqlrunner.sql_analysis.types import LiteralKind, RelationRef
 
 _SET_OPERATION_BASE = getattr(exp, "SetOperation", None)
 SET_OPERATION_CLASSES: tuple[type[exp.Expr], ...] = (
@@ -28,6 +29,39 @@ UNSUPPORTED_SOURCES: tuple[type[exp.Expr], ...] = (
     exp.Lateral,
     exp.Values,
 )
+
+DATE_PART_KEYWORDS = {
+    "year",
+    "quarter",
+    "month",
+    "week",
+    "weekday",
+    "dayofweek",
+    "dayofyear",
+    "day",
+    "hour",
+    "minute",
+    "second",
+    "millisecond",
+    "microsecond",
+    "nanosecond",
+    "epoch",
+}
+
+UNIT_TAKING_CLASSES = {
+    "DateDiff",
+    "DateAdd",
+    "DateSub",
+    "DateTrunc",
+    "DatetimeDiff",
+    "DatetimeAdd",
+    "DatetimeSub",
+    "DatetimeTrunc",
+    "TimestampDiff",
+    "TimestampAdd",
+    "TimestampSub",
+    "TimestampTrunc",
+}
 
 
 def qualified_name(table: exp.Table) -> str:
@@ -92,6 +126,13 @@ class OutputCol:
     # multiple elements for unqualified stars (select * from a join b).
     star_sources: list[RelationRef] = field(default_factory=list[RelationRef])
     function: str | None = None
+
+    # Type evidence carried by the expression itself, for derived columns only. The
+    # resolver stops at a derived column, so this is all schema resolution ever gets
+    # to type one with.
+    cast_type: str | None = None
+    literal_kinds: list[LiteralKind] = field(default_factory=list[LiteralKind])
+
     expression: exp.Expr | None = None
 
 
@@ -219,13 +260,61 @@ def ordered_dedupe(refs: list[RelationRef]) -> list[RelationRef]:
     return out
 
 
-def _function_name(expression: exp.Expr) -> str:
+def number_shape(literals: Sequence[exp.Literal]) -> str:
+    if any("." in lit.this or "e" in lit.this.lower() for lit in literals):
+        return "float"
+    return "int"
+
+
+def literal_kind(literals: Sequence[exp.Literal]) -> LiteralKind:
+    if all(lit.is_string for lit in literals):
+        return "string"
+    if all(lit.is_number for lit in literals):
+        return "int" if number_shape(literals) == "int" else "float"
+    return "mixed"
+
+
+def is_date_part(column: exp.Column) -> bool:
+    """True for a unit keyword sqlglot mis-parsed into a column reference.
+
+    Without a dialect, `datediff(year, a, b)` parses `year` as a column, which would
+    otherwise invent a `year` column on whatever table `a` came from. Only unqualified
+    names count, so `t.year` stays a real column.
+    """
+    if column.table or column.name.lower() not in DATE_PART_KEYWORDS:
+        return False
+    parent = column.parent
+    return parent is not None and type(parent).__name__ in UNIT_TAKING_CLASSES
+
+
+def _unwrap(expression: exp.Expr) -> exp.Expr:
+    """The expression that decides an output column's shape, minus its wrappers."""
     inner = expression
     while isinstance(inner, exp.Paren):
         inner = inner.this
-    if isinstance(inner, exp.Window):
-        return type(inner.this).__name__
-    return type(inner).__name__
+    if isinstance(inner, exp.Window) and inner.this is not None:
+        return inner.this
+    return inner
+
+
+def _cast_type(expression: exp.Expr) -> str | None:
+    """The target type of a top-level cast, e.g. `cast(x as decimal(10, 2))` -> DECIMAL."""
+    return expression.to.this.name if isinstance(expression, exp.Cast) else None
+
+
+def _literal_kinds(expression: exp.Expr) -> list[LiteralKind]:
+    """Kinds of the literals written directly as arguments of `expression`.
+
+    Only direct arguments, so `coalesce(bonus, 0)` yields `int` but the `0` buried in a
+    nested call does not speak for the column the outer call produces.
+    """
+    kinds: list[LiteralKind] = []
+    for argument in expression.iter_expressions():
+        if isinstance(argument, exp.Literal):
+            kind = literal_kind([argument])
+            if kind not in kinds:
+                kinds.append(kind)
+    return kinds
 
 
 class _GraphBuilder:
@@ -297,7 +386,9 @@ class _GraphBuilder:
         # `Scope.columns` leaks columns belonging to nested subqueries, which would
         # otherwise be attributed to this scope's sources.
         info.own_columns = [
-            column for column in scope.columns if self._owning_ref(column) == ref
+            column
+            for column in scope.columns
+            if self._owning_ref(column) == ref and not is_date_part(column)
         ]
         info.scope_column_ids = {id(column) for column in info.own_columns}
         info.parent = self._parent_ref(scope.expression)
@@ -468,12 +559,15 @@ class _GraphBuilder:
             for column in inner.find_all(exp.Column)
             if id(column) in info.scope_column_ids
         ]
+        producer = _unwrap(inner)
         return OutputCol(
             name=name,
             ordinal=ordinal,
             kind="derived",
             inputs=inputs,
-            function=_function_name(inner),
+            function=type(producer).__name__,
+            cast_type=_cast_type(producer),
+            literal_kinds=_literal_kinds(producer),
             expression=select,
         )
 

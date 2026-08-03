@@ -34,6 +34,7 @@ UsageKind = Literal[
     "arithmetic",
     "date_function",
     "cast",
+    "coalesce_default",
 ]
 
 PredicateOperator = Literal[
@@ -107,6 +108,10 @@ class OutputColumn(BaseModel):
     kind: OutputColumnKind
     function: str | None = None
     """For `derived` columns, the sqlglot class name of the producing expression."""
+    cast_type: str | None = None
+    """For `Cast` columns, the target type name, e.g. `DECIMAL`."""
+    literal_kinds: list[LiteralKind] = []
+    """For `derived` columns, the kinds of the literals written directly as arguments."""
     origins: list[ColumnOrigin] = []
     star_sources: list[RelationRef] = []
     """For `star` columns, the relations the `*` covers."""
@@ -141,6 +146,8 @@ class ProjectedColumn(BaseModel):
     ordinal: int
     kind: OutputColumnKind
     function: str | None = None
+    cast_type: str | None = None
+    literal_kinds: list[LiteralKind] = []
     origins: list[ColumnOrigin] = []
     star_of: list[RelationRef] = []
     """Set when the column is an unexpandable `*` over these relations."""
