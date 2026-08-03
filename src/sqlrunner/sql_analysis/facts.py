@@ -1,15 +1,21 @@
-"""Fact extraction: usage, predicates, joins, nullability, cardinality.
+"""Step 4 of the pipeline: extract facts about columns.
 
-Every fact is attached to the `ColumnNode`s a reference resolves to. Because the resolver
-terminates at derived columns, evidence about `sum(x)` or `row_number()` can never reach
-the base columns feeding them.
+    (RelationGraph, Resolver) -> Facts
+
+Usage, predicates, joins, nullability and cardinality. Every fact is attached to the
+`ColumnNode`s a reference resolves to. Because the resolver terminates at derived columns,
+evidence about `sum(x)` or `row_number()` can never reach the base columns feeding them.
+
+See `__init__.py` for the pipeline as a whole.
 """
 
 from __future__ import annotations
 
+from pydantic import BaseModel
+
 from sqlglot import exp
 
-from sqlrunner.sql_analysis.lineage import Resolver
+from sqlrunner.sql_analysis.resolver import Resolver
 from sqlrunner.sql_analysis.relations import RelationGraph, RelationInfo
 from sqlrunner.sql_analysis.types import (
     CardinalityFact,
@@ -172,23 +178,40 @@ def _predicate(
     return None
 
 
-class FactExtractor:
+# @dataclass
+class Facts(BaseModel):
+    """Everything step 4 hands to step 5. Flat lists, keyed by `ColumnNode`."""
+
+    usages: list[UsageFact] = []
+    predicates: list[PredicateFact] = []
+    joins: list[JoinFact] = []
+    nullability: list[NullabilityFact] = []
+    cardinality: list[CardinalityFact] = []
+
+    observed: list[ColumnOrigin] = []
+    """Every column reference that resolved, with the confidence of its attribution.
+
+    This is what tells the assembler a table has a column even when the column is only
+    ever mentioned in a WHERE clause.
+    """
+
+
+def extract_facts(graph: RelationGraph, resolver: Resolver) -> Facts:
+    """Walk every scope in `graph`, resolving references through `resolver`.
+
+    May raise `StarOverJoinAbort` - resolution happens lazily inside the resolver, so the
+    error surfaces here rather than when the resolver was constructed.
+    """
+    return _FactExtractor(graph, resolver).run()
+
+
+class _FactExtractor:
     def __init__(self, graph: RelationGraph, resolver: Resolver) -> None:
         self.graph = graph
         self.resolver = resolver
-        self.usages: list[UsageFact] = []
-        self.predicates: list[PredicateFact] = []
-        self.joins: list[JoinFact] = []
-        self.nullability: list[NullabilityFact] = []
-        self.cardinality: list[CardinalityFact] = []
-        self.observed: list[ColumnOrigin] = []
-        """Every column reference that resolved, with the confidence of its attribution.
+        self.facts = Facts()
 
-        This is what tells the assembler a table has a column even when the column is
-        only ever mentioned in a WHERE clause.
-        """
-
-    def run(self) -> None:
+    def run(self) -> Facts:
         for ref in self.graph.order:
             info = self.graph.relations[ref]
             if info.scope is None or info.is_setop:
@@ -196,6 +219,7 @@ class FactExtractor:
             self._columns(info)
             self._joins(info)
             self._cardinality(info)
+        return self.facts
 
     # ---- per-column facts -----------------------------------------------------
 
@@ -205,11 +229,11 @@ class FactExtractor:
             if not resolution.resolved:
                 continue
             nodes = resolution.nodes
-            self.observed.extend(resolution.origins)
+            self.facts.observed.extend(resolution.origins)
 
             for kind, detail in classify_usage(column):
                 for node in nodes:
-                    self.usages.append(
+                    self.facts.usages.append(
                         UsageFact(node=node, kind=kind, detail=detail)  # type: ignore[arg-type]
                     )
 
@@ -217,7 +241,7 @@ class FactExtractor:
             if predicate is not None:
                 operator, values, literal_kind = predicate
                 for node in nodes:
-                    self.predicates.append(
+                    self.facts.predicates.append(
                         PredicateFact(
                             node=node,
                             operator=operator,
@@ -229,7 +253,7 @@ class FactExtractor:
 
             if isinstance(column.parent, exp.Coalesce):
                 for node in nodes:
-                    self.nullability.append(
+                    self.facts.nullability.append(
                         NullabilityFact(
                             node=node, nullable=True, reason="coalesce_argument"
                         )
@@ -239,7 +263,7 @@ class FactExtractor:
                 binding = info.binding_for(column.table)
                 if binding is not None and binding.is_outer_padded:
                     for node in nodes:
-                        self.nullability.append(
+                        self.facts.nullability.append(
                             NullabilityFact(
                                 node=node, nullable=True, reason="outer_join_padded"
                             )
@@ -250,12 +274,12 @@ class FactExtractor:
     ) -> None:
         if operator == "is_null":
             for node in nodes:
-                self.nullability.append(
+                self.facts.nullability.append(
                     NullabilityFact(node=node, nullable=True, reason="is_null_predicate")
                 )
         elif operator == "is_not_null":
             for node in nodes:
-                self.nullability.append(
+                self.facts.nullability.append(
                     NullabilityFact(
                         node=node, nullable=False, reason="is_not_null_predicate"
                     )
@@ -301,8 +325,8 @@ class FactExtractor:
         if not (left_resolution.resolved and right_resolution.resolved):
             return
 
-        self.observed.extend(left_resolution.origins)
-        self.observed.extend(right_resolution.origins)
+        self.facts.observed.extend(left_resolution.origins)
+        self.facts.observed.extend(right_resolution.origins)
 
         for left_node in left_resolution.nodes:
             for right_node in right_resolution.nodes:
@@ -313,12 +337,12 @@ class FactExtractor:
                     and left_node.relation == right_node.relation
                 ):
                     continue
-                self.joins.append(
+                self.facts.joins.append(
                     JoinFact(left=left_node, right=right_node, join_type=join_type)
                 )
                 if join_type == "INNER":
                     for node in (left_node, right_node):
-                        self.nullability.append(
+                        self.facts.nullability.append(
                             NullabilityFact(
                                 node=node, nullable=False, reason="inner_join_key"
                             )
@@ -335,7 +359,9 @@ class FactExtractor:
         if group is not None:
             nodes = self._resolve_columns(info, group.expressions)
             if nodes:
-                self.cardinality.append(CardinalityFact(nodes=nodes, kind="group_by"))
+                self.facts.cardinality.append(
+                    CardinalityFact(nodes=nodes, kind="group_by")
+                )
 
         if expression.args.get("distinct") is not None:
             nodes = []
@@ -346,13 +372,15 @@ class FactExtractor:
                 if resolution.resolved:
                     nodes.extend(resolution.nodes)
             if nodes:
-                self.cardinality.append(CardinalityFact(nodes=nodes, kind="distinct"))
+                self.facts.cardinality.append(
+                    CardinalityFact(nodes=nodes, kind="distinct")
+                )
 
         for window in expression.find_all(exp.Window):
             partition: list[exp.Expr] = window.args.get("partition_by") or []
             nodes = self._resolve_columns(info, partition)
             if nodes:
-                self.cardinality.append(
+                self.facts.cardinality.append(
                     CardinalityFact(nodes=nodes, kind="partition_by")
                 )
 
@@ -361,7 +389,7 @@ class FactExtractor:
                 ordered = [o.this for o in order.expressions]
                 nodes = self._resolve_columns(info, ordered)
                 if nodes:
-                    self.cardinality.append(
+                    self.facts.cardinality.append(
                         CardinalityFact(nodes=nodes, kind="window_order_by")
                     )
 

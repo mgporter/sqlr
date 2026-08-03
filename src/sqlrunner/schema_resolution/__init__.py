@@ -133,10 +133,16 @@ def _type_from_name(column: str) -> tuple[ResolvedType, str] | None:
     lower = column.lower()
     if lower.startswith("is_"):
         return ("boolean", "is_*")
-    if lower.endswith("_id"):
-        return ("integer", "*_id")
     if lower.endswith("_at"):
         return ("timestamp", "*_at")
+    if lower.endswith("_timestamp"):
+        return ("timestamp", "*_timestamp")
+    if lower.endswith("_ts"):
+        return ("timestamp", "*_ts")
+    if lower.endswith("_name"):
+        return ("string", "*_name")
+    if lower.endswith("_amount"):
+        return ("decimal", "*_amount")
     return None
 
 

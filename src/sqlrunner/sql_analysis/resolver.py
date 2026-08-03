@@ -1,9 +1,13 @@
-"""Pass B: resolve column references backwards through the relation graph.
+"""Column resolution over the relation graph.
 
-There is no catalog, so a `*` cannot be expanded forwards. Instead every reference is
-resolved on demand: `projected` asks `dedupped` for `name`, `dedupped` has no explicit
-`name` but has one star source, so the request is forwarded to `person`, which is an
-external table and therefore terminal. Star chains recurse naturally.
+This is deliberately *not* a pipeline step. There is no catalog, so a `*` cannot be
+expanded forwards, which means resolution cannot be run to completion up front. Instead
+`Resolver` is a lazy, memoizing service built once per statement and queried on demand by
+the two steps that follow it - fact extraction (step 4) and assembly (step 5).
+
+A query resolves backwards: `projected` asks `dedupped` for `name`, `dedupped` has no
+explicit `name` but has one star source, so the request is forwarded to `person`, which is
+an external table and therefore terminal. Star chains recurse naturally.
 
 Facts stop at derived columns: `resolve` returns the derived node itself rather than its
 inputs, so evidence about `sum(x)` can never reach `x`.
@@ -21,6 +25,7 @@ from sqlrunner.sql_analysis.relations import (
     RelationGraph,
     RelationInfo,
     line_of,
+    ordered_dedupe,
 )
 from sqlrunner.sql_analysis.types import (
     CONFIDENCE_RANK,
@@ -90,16 +95,6 @@ class Resolution:
 
 
 UNRESOLVED = Resolution(nodes=[], confidence="explicit", status="unresolved")
-
-
-def _dedupe(refs: list[RelationRef]) -> list[RelationRef]:
-    seen: set[RelationRef] = set()
-    out: list[RelationRef] = []
-    for ref in refs:
-        if ref not in seen:
-            seen.add(ref)
-            out.append(ref)
-    return out
 
 
 class Resolver:
@@ -253,7 +248,7 @@ class Resolver:
             )
             return None
 
-        declaring = _dedupe(
+        declaring = ordered_dedupe(
             [b.ref for b in info.bindings if self._declares(b.ref, column)]
         )
         if len(declaring) == 1:
@@ -288,7 +283,7 @@ class Resolver:
         self._record(
             info,
             column,
-            _dedupe([b.ref for b in info.bindings]),
+            ordered_dedupe([b.ref for b in info.bindings]),
             "unqualified_multi_source",
             "dropped",
             expression=expression,
@@ -318,7 +313,7 @@ class Resolver:
                 return None
             if len(parent.bindings) == 1:
                 return parent.bindings[0].ref
-            declaring = _dedupe(
+            declaring = ordered_dedupe(
                 [b.ref for b in parent.bindings if self._declares(b.ref, column)]
             )
             if len(declaring) == 1:

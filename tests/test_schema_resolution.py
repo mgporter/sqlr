@@ -4,7 +4,8 @@ from sqlrunner.schema_resolution import resolve_schema
 from sqlrunner.schema_resolution.types import ColumnSchema, StatementSchema
 from sqlrunner.sql_analysis import analyze_file, analyze_sql
 
-PERSON_SQL = Path("examples/bunch_of_sql_files/project/person.sql")
+FIXTURES = Path(__file__).parent / "fixtures"
+PERSON_SQL = FIXTURES / "person.sql"
 
 
 def schema_for(sql: str) -> StatementSchema:

@@ -1,5 +1,5 @@
 with dedupped as (
-  select 
+  select
     *,
     row_number() over (partition by id order by modified_at desc) as rn
   from mydatabase.myschema.person
@@ -12,7 +12,6 @@ projected as (
     b.age,
     b.email,
     b.modified_at,
-    b.rn,
     a.street,
     a.city
   from dedupped b

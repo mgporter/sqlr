@@ -5,7 +5,8 @@ import pytest
 from sqlrunner.sql_analysis import analyze_file, analyze_sql
 from sqlrunner.sql_analysis.types import SqlAnalysisResult
 
-PERSON_SQL = Path("examples/bunch_of_sql_files/project/person.sql")
+FIXTURES = Path(__file__).parent / "fixtures"
+PERSON_SQL = FIXTURES / "person.sql"
 
 
 def source_columns(result: SqlAnalysisResult, table: str) -> set[str]:

@@ -1,8 +1,12 @@
-"""Pass A: build the relation graph.
+"""Step 2 of the pipeline: build the relation graph.
+
+    statement (parsed, table-qualified) -> RelationGraph
 
 One `RelationInfo` per SELECT scope (plus one per external table), holding the ordered
 FROM/JOIN bindings and the SELECT list decomposed into passthrough / derived / star
 columns. Nothing is resolved here; this is the raw material the resolver walks backwards.
+
+See `__init__.py` for the pipeline as a whole.
 """
 
 from __future__ import annotations
@@ -84,7 +88,7 @@ class OutputCol:
     # will have multiple inputs (e.g. `SELECT a + b AS c` -> inputs=[a, b]).
     inputs: list[InputRef] = field(default_factory=list[InputRef])
 
-    # Empty for passthrough and derived columns; single elemnt for qualified stars (a.*),
+    # Empty for passthrough and derived columns; single element for qualified stars (a.*),
     # multiple elements for unqualified stars (select * from a join b).
     star_sources: list[RelationRef] = field(default_factory=list[RelationRef])
     function: str | None = None
@@ -169,6 +173,51 @@ class RelationGraph:
     def get(self, ref: RelationRef) -> RelationInfo | None:
         return self.relations.get(ref)
 
+    def expand_outputs(
+        self, ref: RelationRef, seen: frozenset[RelationRef] = frozenset()
+    ) -> list[tuple[RelationRef, OutputCol]] | None:
+        """Flatten a relation's SELECT list, splicing in `*` sources recursively.
+
+        Each result pairs an output column with the relation that owns it, so the caller
+        can resolve the column against the right scope.
+
+        Returns None when a `*` reads a relation whose column list is unknown - an
+        external table, or a set operation with a starred branch.
+        """
+        info = self.get(ref)
+        if info is None or info.is_table or ref in seen:
+            return None
+        if not info.outputs:
+            return None
+
+        seen = seen | {ref}
+        expanded: list[tuple[RelationRef, OutputCol]] = []
+
+        for output in info.outputs:
+            if output.kind != "star":
+                expanded.append((ref, output))
+                continue
+            if not output.star_sources:
+                return None
+            for source in output.star_sources:
+                nested = self.expand_outputs(source, seen)
+                if nested is None:
+                    return None
+                expanded.extend(nested)
+
+        return expanded
+
+
+def ordered_dedupe(refs: list[RelationRef]) -> list[RelationRef]:
+    """Drop duplicate refs, keeping first-seen order."""
+    seen: set[RelationRef] = set()
+    out: list[RelationRef] = []
+    for ref in refs:
+        if ref not in seen:
+            seen.add(ref)
+            out.append(ref)
+    return out
+
 
 def _function_name(expression: exp.Expr) -> str:
     inner = expression
@@ -177,16 +226,6 @@ def _function_name(expression: exp.Expr) -> str:
     if isinstance(inner, exp.Window):
         return type(inner.this).__name__
     return type(inner).__name__
-
-
-def _ordered_dedupe(refs: list[RelationRef]) -> list[RelationRef]:
-    seen: set[RelationRef] = set()
-    out: list[RelationRef] = []
-    for ref in refs:
-        if ref not in seen:
-            seen.add(ref)
-            out.append(ref)
-    return out
 
 
 class _GraphBuilder:
@@ -272,8 +311,8 @@ class _GraphBuilder:
             return
 
         self._build_bindings(scope, info)
-        self._build_qualified_refs(scope, info)
-        self._build_outputs(scope, info)
+        self._build_qualified_refs(info)
+        self._build_outputs(info)
 
     def _parent_ref(self, expression: exp.Expr) -> RelationRef | None:
         node = expression.parent
@@ -358,7 +397,7 @@ class _GraphBuilder:
                 )
             )
 
-    def _build_qualified_refs(self, scope: Scope, info: RelationInfo) -> None:
+    def _build_qualified_refs(self, info: RelationInfo) -> None:
         for column in info.own_columns:
             if not column.table:
                 continue
@@ -367,12 +406,12 @@ class _GraphBuilder:
                 continue
             info.qualified_refs.setdefault(column.name.lower(), []).append(binding.ref)
 
-    def _build_outputs(self, scope: Scope, info: RelationInfo) -> None:
-        expression = scope.expression
+    def _build_outputs(self, info: RelationInfo) -> None:
+        expression = info.expression
         if not isinstance(expression, exp.Select):
             return
 
-        binding_refs = _ordered_dedupe([b.ref for b in info.bindings])
+        binding_refs = ordered_dedupe([b.ref for b in info.bindings])
 
         for ordinal, select in enumerate(expression.selects):
             output = self._build_output(info, select, ordinal, binding_refs)
@@ -381,7 +420,7 @@ class _GraphBuilder:
                 info.outputs_by_name.setdefault(output.name.lower(), output)
 
         info.star_sources = self._order_by_binding(
-            info, _ordered_dedupe([r for o in info.outputs for r in o.star_sources])
+            info, ordered_dedupe([r for o in info.outputs for r in o.star_sources])
         )
 
     def _build_output(
