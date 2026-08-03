@@ -85,7 +85,7 @@ def main(
         )
 
         schema = resolve_schema(result)
-        logger.debug("resolved schema for %s: %s", sql_file.relative_path, schema.model_dump_json(indent=2))
+        # logger.debug("resolved schema for %s: %s", sql_file.relative_path, schema.model_dump_json(indent=2))
 
 
 

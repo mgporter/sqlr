@@ -78,7 +78,14 @@ class OutputCol:
     name: str | None
     ordinal: int
     kind: str
+
+    # The inputs that contribute to this output column. A column passed through
+    # will have one input; but a column derived from others 
+    # will have multiple inputs (e.g. `SELECT a + b AS c` -> inputs=[a, b]).
     inputs: list[InputRef] = field(default_factory=list[InputRef])
+
+    # Empty for passthrough and derived columns; single elemnt for qualified stars (a.*),
+    # multiple elements for unqualified stars (select * from a join b).
     star_sources: list[RelationRef] = field(default_factory=list[RelationRef])
     function: str | None = None
     expression: exp.Expr | None = None
@@ -86,20 +93,47 @@ class OutputCol:
 
 @dataclass
 class RelationInfo:
+
+    """ A relationRef with its associated metadata, 
+    including the scope, expression, bindings, outputs, and other relevant information.
+    """
+
     ref: RelationRef
+
+    # The scope the relation came from
     scope: Scope | None = None
     expression: exp.Expr | None = None
+
+    # set operations
     is_setop: bool = False
     branches: list[RelationRef] = field(default_factory=list[RelationRef])
+
+    # For CTEs, what relations (tables/cte references) are within this relation
     bindings: list[Binding] = field(default_factory=list[Binding])
+
+    # Columns output by this CTE's select statement
     outputs: list[OutputCol] = field(default_factory=list[OutputCol])
     outputs_by_name: dict[str, OutputCol] = field(default_factory=dict[str, OutputCol])
+
+    # The relations that could contribute to a star output.
+    # Eg. select * from a join b -> yields [table:a, table:b] (both tables' columns could contribute to the star's columns)
+    # E.g. select a.*, b.id from a join b -> yields [table:a] (only a's columns could contribute to the star's columns)
     star_sources: list[RelationRef] = field(default_factory=list[RelationRef])
+
+    # Within this cte, dict of column names to the relations that could provide them.
+    # Usually there will be only one relation per column, but there could be more when...
+    #  - select * from a join b where a.id = b.id  -> 'id' could come from either a or b
+    #  - The same column is referenced in the cte more than once, than list could have duplicates: e.g. qualified_refs["id"] = [table:a, table:a]
     qualified_refs: dict[str, list[RelationRef]] = field(
         default_factory=dict[str, list[RelationRef]]
     )
+
+    # list of columns that are defined in this relation's scope, but not necessarily outputted by it.
     own_columns: list[exp.Column] = field(default_factory=list[exp.Column])
+
+    # Generated ids of all columns in own_columns
     scope_column_ids: set[int] = field(default_factory=set[int])
+
     parent: RelationRef | None = None
 
     @property
@@ -111,6 +145,7 @@ class RelationInfo:
         return self.ref.kind == "table"
 
     def binding_for(self, alias: str) -> Binding | None:
+        """ Return the binding for the given alias, or None if not found. """
         lowered = alias.lower()
         for binding in self.bindings:
             if binding.alias.lower() == lowered:
@@ -118,6 +153,7 @@ class RelationInfo:
         return None
 
     def declares(self, column: str) -> bool:
+        """ True if this relation outputs a column with the given name. """
         return column.lower() in self.outputs_by_name
 
 

@@ -40,6 +40,17 @@ from sqlrunner.sql_analysis.types import (
 
 DEFAULT_STAR_OVER_JOIN_BEHAVIOR: StarOverJoinBehavior = "guess"
 
+def analyze_file(
+    path: Path,
+    dialect: str | None = None,
+    star_over_join_behavior: StarOverJoinBehavior = DEFAULT_STAR_OVER_JOIN_BEHAVIOR,
+) -> SqlAnalysisResult:
+    return analyze_sql(
+        Path(path).read_text(),
+        dialect=dialect,
+        star_over_join_behavior=star_over_join_behavior,
+    )
+
 
 def analyze_sql(
     sql: str,
@@ -59,18 +70,6 @@ def analyze_sql(
     return _merge(results)
 
 
-def analyze_file(
-    path: Path,
-    dialect: str | None = None,
-    star_over_join_behavior: StarOverJoinBehavior = DEFAULT_STAR_OVER_JOIN_BEHAVIOR,
-) -> SqlAnalysisResult:
-    return analyze_sql(
-        Path(path).read_text(),
-        dialect=dialect,
-        star_over_join_behavior=star_over_join_behavior,
-    )
-
-
 def _analyze_statement(
     statement: exp.Expr,
     dialect: str | None,
@@ -83,7 +82,9 @@ def _analyze_statement(
         return SqlAnalysisResult(errors=[str(e)])
 
     resolver = Resolver(
-        graph, star_over_join_behavior=star_over_join_behavior, dialect=dialect
+        graph,
+        star_over_join_behavior=star_over_join_behavior,
+        dialect=dialect
     )
     extractor = FactExtractor(graph, resolver)
 

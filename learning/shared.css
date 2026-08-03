@@ -1,0 +1,206 @@
+/* Shared styles for learning/ explainer pages. */
+
+:root {
+  --bg: #f3f4f3;
+  --bg-panel: #fff;
+  --ink: #1a1e22;
+  --ink-soft: #4b535a;
+  --ink-faint: #7c848b;
+  --rule: #dde0e0;
+  --rule-strong: #c3c8c8;
+  --accent: #0d7a82;
+  --accent-ink: #075055;
+  --accent-soft: #d8ecec;
+  --amber: #a8631a;
+  --amber-soft: #f3e3cd;
+  --code-bg: #1c2226;
+  --code-ink: #dbe4e6;
+  --code-key: #6fd6c9;
+  --code-str: #e3b075;
+  --code-dim: #7a8790;
+  --code-flag: #ef9b6a;
+  --shadow: 0 1px 2px rgba(20, 30, 30, 0.06), 0 6px 20px rgba(20, 30, 30, 0.05);
+}
+:root[data-theme="dark"] {
+  --bg: #14181a;
+  --bg-panel: #1b2124;
+  --ink: #e7ecec;
+  --ink-soft: #aab3b6;
+  --ink-faint: #7c868a;
+  --rule: #2a3235;
+  --rule-strong: #3a4447;
+  --accent: #5fd0d4;
+  --accent-ink: #a6ecec;
+  --accent-soft: #1e3436;
+  --amber: #e7a25c;
+  --amber-soft: #3a2c1a;
+  --code-bg: #0f1315;
+  --code-ink: #d7dfe0;
+  --code-key: #7fe0d2;
+  --code-str: #e9bb84;
+  --code-dim: #66727a;
+  --code-flag: #f0a877;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #14181a;
+    --bg-panel: #1b2124;
+    --ink: #e7ecec;
+    --ink-soft: #aab3b6;
+    --ink-faint: #7c868a;
+    --rule: #2a3235;
+    --rule-strong: #3a4447;
+    --accent: #5fd0d4;
+    --accent-ink: #a6ecec;
+    --accent-soft: #1e3436;
+    --amber: #e7a25c;
+    --amber-soft: #3a2c1a;
+    --code-bg: #0f1315;
+    --code-ink: #d7dfe0;
+    --code-key: #7fe0d2;
+    --code-str: #e9bb84;
+    --code-dim: #66727a;
+    --code-flag: #f0a877;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: Charter, "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  font-size: 17px;
+  line-height: 1.62;
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3, h4 {
+  font-family: "Avenir Next", Avenir, "Century Gothic", "Segoe UI", sans-serif;
+  color: var(--ink);
+  text-wrap: balance;
+  line-height: 1.15;
+}
+code, pre, .mono, kbd {
+  font-family: Menlo, Consolas, "SFMono-Regular", "Liberation Mono", monospace;
+}
+a { color: var(--accent-ink); }
+
+.shell { max-width: 1180px; margin: 0 auto; padding: 0 28px 120px; }
+
+header.masthead {
+  max-width: 1180px; margin: 0 auto; padding: 56px 28px 30px;
+  border-bottom: 1px solid var(--rule);
+}
+.eyebrow {
+  font-family: "Avenir Next", Avenir, sans-serif;
+  font-size: 12.5px; letter-spacing: 0.09em; text-transform: uppercase;
+  color: var(--accent-ink); font-weight: 600;
+  display: flex; align-items: center; gap: 8px; margin-bottom: 14px;
+}
+.eyebrow .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+h1.title {
+  font-size: clamp(30px, 4vw, 42px); font-weight: 700; margin: 0 0 10px;
+  max-width: 18ch;
+}
+.subtitle { font-size: 18px; color: var(--ink-soft); max-width: 62ch; margin: 0 0 22px; }
+.meta-row { display: flex; flex-wrap: wrap; gap: 10px; font-family: "Avenir Next", Avenir, sans-serif; font-size: 12.5px; }
+.meta-chip {
+  border: 1px solid var(--rule-strong); border-radius: 999px; padding: 5px 12px;
+  color: var(--ink-soft); background: var(--bg-panel);
+}
+
+.layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 56px; padding-top: 40px; }
+@media (max-width: 860px) { .layout { grid-template-columns: 1fr; } nav.toc { display: none; } }
+
+nav.toc { position: sticky; top: 28px; align-self: start; font-family: "Avenir Next", Avenir, sans-serif; }
+nav.toc .toc-label { font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-faint); margin-bottom: 12px; }
+nav.toc ol { list-style: none; margin: 0; padding: 0; counter-reset: toc; border-left: 1px solid var(--rule); }
+nav.toc li { counter-increment: toc; margin: 0; }
+nav.toc a {
+  display: block; padding: 7px 0 7px 16px; margin-left: -1px; border-left: 1px solid transparent;
+  color: var(--ink-soft); text-decoration: none; font-size: 13.5px; line-height: 1.3;
+}
+nav.toc a:hover { color: var(--accent-ink); border-left-color: var(--accent); }
+nav.toc a::before { content: counter(toc) "  "; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+
+main { min-width: 0; }
+section { margin: 0 0 64px; }
+section h2 {
+  font-size: 25px; margin: 0 0 6px; padding-top: 4px;
+  display: flex; align-items: baseline; gap: 10px;
+}
+section h2 .num { font-size: 15px; color: var(--accent-ink); font-family: Menlo, monospace; }
+section .lede { color: var(--ink-soft); font-size: 16px; margin: 0 0 22px; max-width: 68ch; }
+h3 { font-size: 18px; margin: 28px 0 10px; }
+p { max-width: 68ch; margin: 0 0 16px; }
+ul, ol { max-width: 66ch; padding-left: 22px; }
+li { margin-bottom: 6px; }
+strong { color: var(--ink); }
+
+.callout {
+  border-left: 3px solid var(--accent); background: var(--accent-soft);
+  padding: 12px 18px; border-radius: 0 8px 8px 0; max-width: 68ch; margin: 18px 0;
+  font-size: 15.5px; color: var(--ink);
+}
+.callout.amber { border-left-color: var(--amber); background: var(--amber-soft); }
+.callout p:last-child { margin-bottom: 0; }
+
+pre.code {
+  background: var(--code-bg); color: var(--code-ink);
+  border-radius: 10px; padding: 16px 20px; overflow-x: auto;
+  box-shadow: var(--shadow); font-size: 13.3px; line-height: 1.6;
+  margin: 14px 0 20px;
+}
+pre.code .ln { color: var(--code-dim); }
+pre.code .kw { color: var(--code-key); }
+pre.code .str { color: var(--code-str); }
+pre.code .fl { color: var(--code-flag); }
+pre.code .cm { color: var(--code-dim); font-style: italic; }
+figcaption, .cap {
+  font-family: "Avenir Next", Avenir, sans-serif; font-size: 12.5px; color: var(--ink-faint);
+  letter-spacing: 0.02em; margin: -12px 0 20px;
+}
+
+.pill {
+  display: inline-flex; align-items: center; gap: 5px; font-family: Menlo, monospace;
+  font-size: 12px; padding: 2px 9px; border-radius: 999px; font-weight: 600;
+  white-space: nowrap;
+}
+.pill.explicit { background: var(--accent); color: #06282a; }
+.pill.inferred { background: var(--accent-soft); color: var(--accent-ink); border: 1px solid var(--accent); }
+.pill.guessed { background: transparent; color: var(--ink-soft); border: 1px dashed var(--rule-strong); }
+
+table.confidence { border-collapse: collapse; width: 100%; max-width: 68ch; margin: 10px 0 22px; font-size: 14.5px; }
+table.confidence th, table.confidence td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+table.confidence th { font-family: "Avenir Next", Avenir, sans-serif; font-size: 11.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-faint); }
+
+.flow {
+  display: flex; align-items: stretch; gap: 0; flex-wrap: wrap;
+  margin: 20px 0 8px; font-family: "Avenir Next", Avenir, sans-serif;
+}
+.flow .node {
+  background: var(--bg-panel); border: 1px solid var(--rule-strong); border-radius: 8px;
+  padding: 10px 14px; font-size: 13px; box-shadow: var(--shadow); min-width: 128px;
+}
+.flow .node .k { font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-faint); }
+.flow .node .n { font-family: Menlo, monospace; font-size: 13px; margin-top: 2px; }
+.flow .arrow { display: flex; align-items: center; padding: 0 10px; color: var(--ink-faint); font-size: 15px; }
+.flow-caption { font-size: 12.5px; color: var(--ink-faint); margin: 6px 0 22px; }
+
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+@media (max-width: 720px) { .split { grid-template-columns: 1fr; } }
+
+.rule-card {
+  border: 1px solid var(--rule); border-radius: 10px; padding: 16px 18px; background: var(--bg-panel);
+  box-shadow: var(--shadow);
+}
+.rule-card .rn { font-family: "Avenir Next", Avenir, sans-serif; font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent-ink); font-weight: 700; margin-bottom: 6px; }
+.rule-card h4 { margin: 0 0 8px; font-size: 15.5px; }
+.rule-card p { font-size: 14.5px; margin-bottom: 10px; }
+
+footer.end {
+  max-width: 68ch; margin: 60px auto 0; padding-top: 24px; border-top: 1px solid var(--rule);
+  color: var(--ink-faint); font-size: 13.5px; font-family: "Avenir Next", Avenir, sans-serif;
+}

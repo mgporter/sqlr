@@ -71,6 +71,7 @@ def weakest(left: Confidence, right: Confidence) -> Confidence:
     return left if CONFIDENCE_RANK[left] <= CONFIDENCE_RANK[right] else right
 
 
+# A Resolution is usually a single resolved column, but could have multiple ColumnNodes in set operations
 @dataclass
 class Resolution:
     nodes: list[ColumnNode] = field(default_factory=list[ColumnNode])
@@ -155,10 +156,13 @@ class Resolver:
     # ---- resolution -----------------------------------------------------------
 
     def _resolve(self, ref: RelationRef, column: str) -> Resolution:
+        # If `ref` is a table, we cannot resolve any further.
         info = self.graph.get(ref)
         if info is None or info.is_table:
             return Resolution([ColumnNode(relation=ref, column=column)], "explicit")
 
+        # If `ref` is a derived relation, we can only resolve against its outputs. If the
+        # column is not present, we cannot resolve further.
         output = info.outputs_by_name.get(column.lower())
         if output is not None:
             if output.kind == "derived":
@@ -323,6 +327,7 @@ class Resolver:
         return None
 
     def _declares(self, ref: RelationRef, column: str) -> bool:
+        """Does `ref` explicitly declare `column`?"""
         info = self.graph.get(ref)
         return info is not None and not info.is_table and info.declares(column)
 

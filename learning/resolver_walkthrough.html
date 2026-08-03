@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Resolver: backward column resolution in sql_analysis</title>
+<link rel="stylesheet" href="shared.css">
+</head>
+<body>
+
+<header class="masthead">
+  <div class="eyebrow"><span class="dot"></span> sql_analysis &middot; lineage.py &middot; Pass B</div>
+  <h1 class="title">The Resolver: how column lineage is walked backward</h1>
+  <p class="subtitle">An in-depth guide to <code>Resolver</code>, the class that turns <code>a.id</code> and bare
+  <code>select *</code> into a chain of column origins &mdash; with real traced output from
+  <code>person.sql</code> and three hand-built star-over-join cases.</p>
+  <div class="meta-row">
+    <span class="meta-chip">src/sqlrunner/sql_analysis/lineage.py</span>
+    <span class="meta-chip">no catalog required</span>
+    <span class="meta-chip">memoized, cycle-safe</span>
+  </div>
+</header>
+
+<div class="shell">
+<div class="layout">
+
+<nav class="toc">
+  <div class="toc-label">Contents</div>
+  <ol>
+    <li><a href="#why">Why a resolver</a></li>
+    <li><a href="#shape">Resolution, the return type</a></li>
+    <li><a href="#entry">Two entry points</a></li>
+    <li><a href="#dispatch">_resolve: the four cases</a></li>
+    <li><a href="#bind">bind_alias: which relation owns a name</a></li>
+    <li><a href="#star">Star over join</a></li>
+    <li><a href="#memo">Memoization &amp; cycles</a></li>
+    <li><a href="#trace">Full trace: person.sql</a></li>
+    <li><a href="#takeaways">Takeaways</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="why">
+  <h2><span class="num">01</span> Why a resolver</h2>
+  <p class="lede">There is no schema catalog anywhere in sqlrunner. When a SELECT reads <code>b.id</code>,
+  nothing on disk says what table <code>id</code> ultimately comes from &mdash; that has to be worked out
+  purely from the SQL text.</p>
+  <p>The trick is direction. Instead of expanding <code>*</code> forward (which requires knowing a table's
+  real columns), the Resolver walks <strong>backward</strong>: a relation asks its own FROM/JOIN sources
+  &ldquo;do you have a column named X?&rdquo;, and that question recurses until it hits an external table,
+  which is treated as terminal and trusted at face value.</p>
+  <div class="flow">
+    <div class="node"><div class="k">root asks</div><div class="n">projected.id</div></div>
+    <div class="arrow">&larr;</div>
+    <div class="node"><div class="k">projected asks</div><div class="n">dedupped.id</div></div>
+    <div class="arrow">&larr;</div>
+    <div class="node"><div class="k">dedupped's only star source</div><div class="n">person.id</div></div>
+    <div class="arrow">&larr;</div>
+    <div class="node"><div class="k">terminal</div><div class="n">table:person</div></div>
+  </div>
+  <p class="flow-caption">Every arrow above is one recursive <code>resolver.resolve()</code> call. This exact chain is traced live in §8.</p>
+  <div class="callout">
+    <p>One structural rule makes this tractable: <strong>facts stop at derived columns</strong>.
+    <code>resolve()</code> returns the derived node itself (e.g. <code>rn</code>, a <code>ROW_NUMBER()</code>)
+    rather than reaching into its inputs &mdash; so evidence gathered about <code>sum(x)</code> can never
+    leak backward onto <code>x</code>. See <code>_resolve</code>, lineage.py:164&ndash;167.</p>
+  </div>
+</section>
+
+<section id="shape">
+  <h2><span class="num">02</span> Resolution, the return type</h2>
+  <p class="lede">Every resolver method funnels into one small dataclass.</p>
+  <pre class="code"><span class="cm"># lineage.py:74-91</span>
+<span class="kw">@dataclass</span>
+<span class="kw">class</span> Resolution:
+    nodes: list[ColumnNode] = field(default_factory=list)
+    confidence: Confidence = <span class="str">"explicit"</span>
+    status: ResolutionStatus = <span class="str">"resolved"</span>   <span class="cm"># resolved | ambiguous | unresolved</span>
+
+    <span class="kw">@property</span>
+    <span class="kw">def</span> resolved(self) -> bool:
+        <span class="kw">return</span> self.status == <span class="str">"resolved"</span> <span class="kw">and</span> bool(self.nodes)
+
+    <span class="kw">@property</span>
+    <span class="kw">def</span> origins(self) -> list[ColumnOrigin]:
+        <span class="kw">return</span> [ColumnOrigin(node=node, confidence=self.confidence) <span class="kw">for</span> node <span class="kw">in</span> self.nodes]</pre>
+  <p><code>nodes</code> is a list, not a single value, because a resolution can legitimately fan out
+  &mdash; a UNION branch column has one origin per branch (<code>_resolve_branches</code>, lineage.py:218).
+  <code>confidence</code> is the weakest link across the whole chain: every hop takes
+  <code>weakest(current, upstream)</code> (lineage.py:70&ndash;71), so one shaky guess anywhere downgrades
+  everything built on top of it.</p>
+  <table class="confidence">
+    <tr><th>Confidence</th><th>Meaning</th><th>Set by</th></tr>
+    <tr><td><span class="pill explicit">explicit</span></td><td>Written out, qualified or unambiguously unqualified</td><td>terminal table hit; single unqualified match; single FROM source</td></tr>
+    <tr><td><span class="pill inferred">inferred</span></td><td>Resolved through a <code>*</code> with exactly one source, or a join guess backed by real evidence</td><td><code>_pick_star_source</code> len==1 case; rules 1 &amp; 2 of <code>_guess_star_source</code></td></tr>
+    <tr><td><span class="pill guessed">guessed</span></td><td>Resolved through a <code>*</code> over a join with <strong>zero</strong> evidence</td><td>rule 3 of <code>_guess_star_source</code> &mdash; leftmost source wins by default</td></tr>
+  </table>
+</section>
+
+<section id="entry">
+  <h2><span class="num">03</span> Two entry points</h2>
+  <p class="lede"><code>resolve_column_expr</code> is for a column as it's actually written (with sqlglot's <code>exp.Column</code> node, so it still has a <code>.table</code> alias attached). <code>resolve</code> is the lower-level, alias-free primitive that everything &mdash; including <code>resolve_column_expr</code> &mdash; bottoms out in.</p>
+  <pre class="code"><span class="cm"># lineage.py:124-135</span>
+<span class="kw">def</span> resolve_column_expr(self, info: RelationInfo, column: exp.Column) -> Resolution:
+    bound = self.bind_alias(info, column.table <span class="kw">or</span> <span class="kw">None</span>, column.name, column)
+    <span class="kw">if</span> bound <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">return</span> UNRESOLVED
+    ref, confidence = bound
+    result = self.resolve(ref, column.name)
+    <span class="kw">return</span> Resolution(result.nodes, weakest(confidence, result.confidence), result.status)</pre>
+  <p>Everywhere else in the assembly code (<code>__init__.py</code>'s <code>_output_column</code> and
+  <code>_build_projection</code>) calls the plain <code>resolve(ref, name)</code> directly, because by that
+  point the alias has already been resolved once while the relation graph was built &mdash; <code>OutputCol.inputs</code>
+  stores an <code>InputRef(column, alias)</code> pair, and <code>_resolve_inputs</code> (lineage.py:186) is
+  what re-binds that alias via <code>bind_alias</code> before recursing.</p>
+</section>
+
+<section id="dispatch">
+  <h2><span class="num">04</span> _resolve: the four cases</h2>
+  <p class="lede">Given a relation and a column name, exactly one of four things happens:</p>
+  <pre class="code"><span class="cm"># lineage.py:157-184, abridged</span>
+<span class="kw">def</span> _resolve(self, ref: RelationRef, column: str) -> Resolution:
+    info = self.graph.get(ref)
+    <span class="kw">if</span> info <span class="kw">is</span> <span class="kw">None</span> <span class="kw">or</span> info.is_table:
+        <span class="fl">return Resolution([ColumnNode(relation=ref, column=column)], "explicit")</span>  <span class="cm"># 1. terminal</span>
+
+    output = info.outputs_by_name.get(column.lower())
+    <span class="kw">if</span> output <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+        <span class="kw">if</span> output.kind == <span class="str">"derived"</span>:
+            <span class="fl">return Resolution([ColumnNode(relation=ref, column=output.name)], "explicit")</span>  <span class="cm"># 2. derived, stop here</span>
+        <span class="kw">return</span> self._resolve_inputs(info, output.inputs)  <span class="cm"># 2b. passthrough, follow the input</span>
+
+    <span class="kw">if</span> info.is_setop:
+        <span class="fl">return self._resolve_branches(info, column)</span>  <span class="cm"># 3. ask every branch by name</span>
+
+    <span class="kw">if</span> info.star_sources:
+        target, confidence = self._pick_star_source(info, column)
+        <span class="fl">...</span>  <span class="cm"># 4. no explicit column, but a * covers it</span>
+
+    <span class="kw">return</span> UNRESOLVED</pre>
+  <p>Case order matters: an explicit column (case 2) always wins over a star (case 4), even if the relation
+  also has a <code>*</code> in its SELECT list &mdash; that's exactly what happens with <code>dedupped</code>
+  in person.sql, whose SELECT is <code>*, row_number() ... as rn</code>: <code>rn</code> hits case 2 (derived,
+  stops), everything else falls through to case 4 (the single star source, <code>person</code>).</p>
+</section>
+
+<section id="bind">
+  <h2><span class="num">05</span> bind_alias: which relation owns a name</h2>
+  <p class="lede">Before a column can be resolved, its alias (if any) has to be mapped to a concrete relation.
+  <code>bind_alias</code> is a priority list, first match wins:</p>
+  <ol>
+    <li><strong>Qualified, alias found in this scope's bindings</strong> &rarr; that relation, <span class="pill explicit">explicit</span>.</li>
+    <li><strong>Qualified, alias not local</strong> &rarr; walk up <code>info.parent</code> looking for a correlated outer binding (<code>_bind_outer</code>, lineage.py:294). Still <span class="pill explicit">explicit</span> if found.</li>
+    <li><strong>Qualified, alias nowhere</strong> &rarr; record an <code>unknown_alias</code> ambiguity, drop it.</li>
+    <li><strong>Unqualified, exactly one binding declares it explicitly</strong> &rarr; that relation.</li>
+    <li><strong>Unqualified, &gt;1 binding declares it</strong> &rarr; <code>unqualified_multi_source</code> ambiguity, dropped &mdash; genuinely ambiguous, no guessing here.</li>
+    <li><strong>Unqualified, only one binding total</strong> &rarr; that binding, trivially.</li>
+    <li><strong>Unqualified, nobody declares it, but there's a <code>*</code></strong> &rarr; falls through to star-over-join (&sect;6).</li>
+    <li><strong>No bindings at all</strong> &rarr; try a correlated outer unqualified match, else <code>unresolved_column</code>.</li>
+  </ol>
+  <p>Step 5 is worth dwelling on: it's stricter than the star case. If two <em>explicit, named</em> columns
+  collide, that's a real authoring ambiguity in the SQL and the Resolver refuses to guess. Guessing is
+  reserved entirely for <code>*</code>, where sqlrunner has decided a best-effort attribution is more useful
+  than refusing outright.</p>
+</section>
+
+<section id="star">
+  <h2><span class="num">06</span> Star over join</h2>
+  <p class="lede">When a relation does <code>select *</code> (or forwards to one) over more than one FROM/JOIN
+  source, and the requested column isn't explicitly declared anywhere, <code>_guess_star_source</code>
+  (lineage.py:376&ndash;393) tries three rules in order. Each was run for real below.</p>
+
+  <div class="split">
+    <div class="rule-card">
+      <div class="rn">Rule 1 &middot; declaration</div>
+      <h4>A candidate explicitly declares the column</h4>
+      <p>Only fires when a candidate is itself a CTE/subquery with a named output &mdash; raw tables never
+      "declare" anything to the graph, so this rule is dead on joins of two plain tables.</p>
+    </div>
+    <div class="rule-card">
+      <div class="rn">Rule 2 &middot; qualification</div>
+      <h4>The column is qualified elsewhere in the same scope</h4>
+      <p>A join condition like <code>on o.id = oi.order_id</code> counts &mdash; it lives in the same scope
+      as the star, so it silently proves <code>id</code> belongs to <code>o</code> before you even reach the
+      SELECT list.</p>
+    </div>
+  </div>
+  <div class="rule-card" style="margin-top:20px; max-width: 68ch;">
+    <div class="rn">Rule 3 &middot; no evidence</div>
+    <h4>Leftmost candidate wins, confidence downgrades to <span class="pill guessed">guessed</span></h4>
+    <p style="margin-bottom:0">FROM-clause order decides. This is the only rule that <code>star_over_join_behavior="error"</code>
+    treats as fatal &mdash; rules 1 and 2 are evidence, not guesswork, so error mode lets them stand.</p>
+  </div>
+
+  <h3>Rule 1, traced</h3>
+  <pre class="code"><span class="cm">with meta as (
+  select id, extra_flag from raw_meta
+),
+combined as (
+  select * from meta m join events e on m.id = e.meta_id
+)
+select extra_flag from combined</span>
+
+resolve(cte:combined, <span class="str">'extra_flag'</span>)
+    [star-over-join] cte:combined column=<span class="str">'extra_flag'</span> candidates=[<span class="fl">'cte:meta'</span>, 'table:events'] -> chosen=<span class="fl">cte:meta</span> confidence=<span class="pill inferred" style="font-size:12px">inferred</span>
+  resolve(cte:meta, <span class="str">'extra_flag'</span>)
+      [bind_alias] cte:meta alias=None column=<span class="str">'extra_flag'</span> -> table:raw_meta (explicit)
+    resolve(table:raw_meta, <span class="str">'extra_flag'</span>)
+    -> status=resolved confidence=explicit nodes=[<span class="fl">'table:raw_meta.extra_flag'</span>]
+  -> status=resolved confidence=explicit nodes=['table:raw_meta.extra_flag']
+-> status=resolved confidence=<span class="fl">inferred</span> nodes=['table:raw_meta.extra_flag']</pre>
+  <p class="cap">meta declares extra_flag explicitly, so it wins over events without touching the join condition.</p>
+
+  <h3>Rule 2, traced</h3>
+  <pre class="code"><span class="cm">with combined as (
+  select * from orders o join order_items oi on o.id = oi.order_id
+  where oi.sku = 'WIDGET'
+)
+select sku from combined</span>
+
+resolve(cte:combined, <span class="str">'sku'</span>)
+    [star-over-join] cte:combined column=<span class="str">'sku'</span> candidates=['table:orders', 'table:order_items'] -> chosen=<span class="fl">table:order_items</span> confidence=<span class="pill inferred" style="font-size:12px">inferred</span>
+  resolve(table:order_items, <span class="str">'sku'</span>)
+  -> status=resolved confidence=explicit nodes=['table:order_items.sku']
+-> status=resolved confidence=<span class="fl">inferred</span> nodes=['table:order_items.sku']</pre>
+  <p class="cap"><code>sku</code> is never selected explicitly &mdash; the WHERE clause's <code>oi.sku</code> is the only evidence, and it's enough.</p>
+
+  <h3>Rule 3, traced &mdash; and why <code>id</code> was the wrong column to test it with</h3>
+  <div class="callout amber">
+    <p>First attempt used <code>select id from combined</code> against the same <code>orders o join order_items oi
+    on o.id = oi.order_id</code>. That still resolved to <code>inferred</code>, not <code>guessed</code> &mdash;
+    because <code>o.id</code> in the join's <code>ON</code> clause <em>is</em> a qualification in the same scope,
+    so rule 2 claims it first. Getting a genuine zero-evidence case meant picking a column that appears
+    nowhere else in the query at all.</p>
+  </div>
+  <pre class="code"><span class="cm">with combined as (
+  select * from orders o join order_items oi on o.id = oi.order_id
+)
+select notes from combined</span>
+
+resolve(cte:combined, <span class="str">'notes'</span>)
+    [star-over-join] cte:combined column=<span class="str">'notes'</span> candidates=['table:orders', 'table:order_items'] -> chosen=<span class="fl">table:orders</span> confidence=<span class="pill guessed" style="font-size:12px">guessed</span>
+  resolve(table:orders, <span class="str">'notes'</span>)
+  -> status=resolved confidence=explicit nodes=['table:orders.notes']
+-> status=resolved confidence=<span class="fl">guessed</span> nodes=['table:orders.notes']
+
+ambiguities recorded: 1
+  reason=star_over_join resolution=attributed chosen=table:orders confidence=guessed line=3</pre>
+
+  <h3><code>star_over_join_behavior="error"</code>, same query</h3>
+  <pre class="code">StarOverJoinAbort raised:
+<span class="fl">star over join is ambiguous</span>: nothing proves which of [orders, order_items] column
+<span class="str">"notes"</span> in cte:combined comes from at line 3 (star_over_join_behavior = "error")
+    SELECT
+      *
+    FROM orders AS o
+    JOIN order_items AS oi
+      ON o.id = oi.order_id</pre>
+  <p>Analysis aborts the whole statement rather than silently attributing a guess &mdash; useful when
+  downstream consumers (schema inference, constraint extraction) can't tolerate a coin-flip.</p>
+</section>
+
+<section id="memo">
+  <h2><span class="num">07</span> Memoization &amp; cycles</h2>
+  <p class="lede"><code>resolve()</code> is the public, memoized wrapper; <code>_resolve()</code> is the raw
+  recursive step it caches (lineage.py:137&ndash;153).</p>
+  <pre class="code"><span class="cm"># lineage.py:137-153</span>
+<span class="kw">def</span> resolve(self, ref: RelationRef, column: str) -> Resolution:
+    key = (ref, column.lower())
+    cached = self._memo.get(key)
+    <span class="kw">if</span> cached <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+        <span class="fl">return cached</span>
+    <span class="kw">if</span> key <span class="kw">in</span> self._active:
+        <span class="fl">return UNRESOLVED</span>  <span class="cm"># recursive CTE / unwindable cycle</span>
+
+    self._active.add(key)
+    <span class="kw">try</span>:
+        result = self._resolve(ref, column)
+    <span class="kw">finally</span>:
+        self._active.discard(key)
+
+    self._memo[key] = result
+    <span class="kw">return</span> result</pre>
+  <p>Two safety nets here: a <strong>memo cache</strong> keyed on <code>(relation, lowercased column)</code>
+  so a fanned-out chain (e.g. eight columns in <code>projected</code> all touching <code>dedupped</code>)
+  never re-walks the same subgraph twice, and an <strong>active set</strong> that turns a recursive cycle
+  (a CTE that references itself) into a clean <code>UNRESOLVED</code> instead of infinite recursion.</p>
+  <p>Traced live below: resolving <code>name</code> straight from <code>cte:dedupped</code> re-triggers the
+  star-over-join pick (that part isn't memoized independently &mdash; <code>_pick_star_source</code> has
+  its own <code>_star_memo</code>), but the underlying <code>table:person.name</code> hit is fresh here since
+  it wasn't resolved earlier in the run.</p>
+</section>
+
+<section id="trace">
+  <h2><span class="num">08</span> Full trace: person.sql</h2>
+  <p class="lede">Same query as the first walkthrough. This time every <code>resolve()</code> call prints
+  itself on entry and exit, indented by recursion depth, plus a line for every <code>bind_alias</code> and
+  star-source pick along the way.</p>
+
+  <h3>resolve(cte:projected, 'id')</h3>
+  <pre class="code">resolve(cte:projected, <span class="str">'id'</span>)
+    [bind_alias] cte:projected alias=<span class="str">'b'</span> column=<span class="str">'id'</span> -> cte:dedupped (explicit)
+  resolve(cte:dedupped, <span class="str">'id'</span>)
+      [star-over-join] cte:dedupped column=<span class="str">'id'</span> candidates=['table:mydatabase.myschema.person']
+        -> chosen=table:mydatabase.myschema.person confidence=<span class="fl">inferred</span>
+    resolve(table:mydatabase.myschema.person, <span class="str">'id'</span>)
+    -> status=resolved confidence=explicit nodes=['table:...person.id']
+  -> status=resolved confidence=<span class="fl">inferred</span> nodes=['table:...person.id']
+-> status=resolved confidence=<span class="fl">inferred</span> nodes=['table:...person.id']</pre>
+  <p class="cap">Three hops: projected &rarr; dedupped (alias bind) &rarr; person (single star source, so
+  automatically <code>inferred</code> &mdash; <code>_pick_star_source</code>'s <code>len(candidates)==1</code>
+  branch never even calls <code>_guess_star_source</code>, lineage.py:345&ndash;348). Confidence degrades once,
+  from explicit to inferred, and stays there &mdash; <code>weakest()</code> never recovers it.</p>
+
+  <h3>resolve(cte:projected, 'rn') &mdash; explicit all the way</h3>
+  <pre class="code">resolve(cte:projected, <span class="str">'rn'</span>)
+    [bind_alias] cte:projected alias=<span class="str">'b'</span> column=<span class="str">'rn'</span> -> cte:dedupped (explicit)
+  resolve(cte:dedupped, <span class="str">'rn'</span>)
+  -> status=resolved confidence=<span class="fl">explicit</span> nodes=['cte:dedupped.rn']
+-> status=resolved confidence=<span class="fl">explicit</span> nodes=['cte:dedupped.rn']</pre>
+  <p class="cap"><code>rn</code> is <code>row_number() over (...)</code> &mdash; a <em>derived</em> output in
+  <code>dedupped</code>. Case 2 in <code>_resolve</code> fires and stops immediately: no star lookup, no
+  descent into the window function's own <code>id</code>/<code>modified_at</code> inputs. That's the
+  "facts stop at derived columns" rule from &sect;1 made concrete.</p>
+
+  <h3>resolve(cte:projected, 'street') &mdash; the join side</h3>
+  <pre class="code">resolve(cte:projected, <span class="str">'street'</span>)
+    [bind_alias] cte:projected alias=<span class="str">'a'</span> column=<span class="str">'street'</span> -> table:mydatabase.myschema.address (explicit)
+  resolve(table:mydatabase.myschema.address, <span class="str">'street'</span>)
+  -> status=resolved confidence=<span class="fl">explicit</span> nodes=['table:...address.street']
+-> status=resolved confidence=<span class="fl">explicit</span> nodes=['table:...address.street']</pre>
+  <p class="cap">One hop, fully explicit &mdash; <code>a.street</code> is qualified and named, so <code>bind_alias</code>
+  hits its very first rule and there's nothing left to infer.</p>
+
+  <h3>Everything at once: the assembled sources</h3>
+  <p>Run through <code>_build_sources</code>, the confidences above roll up into exactly what the person.sql
+  walkthrough showed at the end &mdash; <code>person</code> is a mix of explicit (<code>age</code>,
+  <code>modified_at</code>) and inferred (<code>name</code>, <code>email</code>, <code>id</code> lands
+  explicit too, from the WHERE predicate) columns, <code>address</code> is entirely explicit:</p>
+  <table class="confidence">
+    <tr><th>Table</th><th>Column</th><th>Confidence</th><th>Why</th></tr>
+    <tr><td><code>person</code></td><td>age</td><td><span class="pill explicit">explicit</span></td><td>WHERE age &gt; 20, qualified against the table directly</td></tr>
+    <tr><td><code>person</code></td><td>id, name, email, modified_at</td><td><span class="pill inferred">inferred</span></td><td>reached only through dedupped's single-source star</td></tr>
+    <tr><td><code>address</code></td><td>street, city, person_id</td><td><span class="pill explicit">explicit</span></td><td>every reference is <code>a.&lt;col&gt;</code>, qualified</td></tr>
+  </table>
+</section>
+
+<section id="takeaways">
+  <h2><span class="num">09</span> Takeaways</h2>
+  <ul>
+    <li><strong>Direction is the whole design.</strong> Resolving backward from a reference to its source
+    sidesteps ever needing a real schema catalog.</li>
+    <li><strong>Confidence is a floor, not a score.</strong> <code>weakest()</code> means one guessed hop
+    anywhere in a chain caps the whole chain at <code>guessed</code> &mdash; it only ever goes down.</li>
+    <li><strong>Guessing is scoped tightly.</strong> Named-column collisions (<code>bind_alias</code> step 5)
+    are never guessed, only reported as ambiguous and dropped. Only an unresolvable <code>*</code> over a
+    join falls back to leftmost-wins.</li>
+    <li><strong>Join conditions are evidence.</strong> <code>on o.id = oi.order_id</code> silently resolves
+    what looks like it should need a guess &mdash; this is rule 2, and it's easy to underestimate how often
+    it fires in real SQL.</li>
+    <li><strong>Memoization is per-(relation, column), not global</strong> &mdash; safe for diamond-shaped
+    graphs, and the active-set guard makes self-referencing CTEs degrade to <code>UNRESOLVED</code> instead
+    of a stack overflow.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+</div>
+
+<footer class="end">
+  Traced with an instrumented Resolver wrapper (no changes to lineage.py) against
+  examples/bunch_of_sql_files/project/person.sql and three hand-written star-over-join cases.
+</footer>
+
+</body>
+</html>
