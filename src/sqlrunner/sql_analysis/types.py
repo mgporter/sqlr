@@ -7,7 +7,9 @@ flat fact lists by node rather than reading nested structures.
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from sqlrunner.source import SourceDoc, SourceSpan
 
 RelationKind = Literal["table", "cte", "derived", "subquery", "root"]
 """Where a relation comes from. `table` relations are external and terminal."""
@@ -27,12 +29,15 @@ CONFIDENCE_RANK: dict[Confidence, int] = {"explicit": 3, "inferred": 2, "guessed
 
 UsageKind = Literal[
     "compared_to_number",
+    "compared_to_string",
     "in_list_strings",
     "in_list_numbers",
     "like",
     "boolean_context",
     "arithmetic",
     "date_function",
+    "string_function",
+    "numeric_function",
     "cast",
     "coalesce_default",
 ]
@@ -98,6 +103,8 @@ class ColumnNode(BaseModel, frozen=True):
 class ColumnOrigin(BaseModel):
     node: ColumnNode
     confidence: Confidence
+    span: SourceSpan | None = None
+    """Where the reference that produced this origin was written."""
 
 
 class OutputColumn(BaseModel):
@@ -115,6 +122,9 @@ class OutputColumn(BaseModel):
     origins: list[ColumnOrigin] = []
     star_sources: list[RelationRef] = []
     """For `star` columns, the relations the `*` covers."""
+    span: SourceSpan | None = None
+    """The whole SELECT item, alias included."""
+    alias_span: SourceSpan | None = None
 
 
 class Relation(BaseModel):
@@ -123,11 +133,16 @@ class Relation(BaseModel):
     depends_on: list[RelationRef] = []
     outputs: list[OutputColumn] = []
     star_sources: list[RelationRef] = []
+    span: SourceSpan | None = None
+    """The relation's body - for a CTE, everything between its parentheses."""
+    name_span: SourceSpan | None = None
 
 
 class SourceColumn(BaseModel):
     name: str
     confidence: Confidence
+    references: list[SourceSpan] = []
+    """Every place the statement mentions this column, in first-seen order."""
 
 
 class SourceTable(BaseModel):
@@ -151,41 +166,66 @@ class ProjectedColumn(BaseModel):
     origins: list[ColumnOrigin] = []
     star_of: list[RelationRef] = []
     """Set when the column is an unexpandable `*` over these relations."""
+    span: SourceSpan | None = None
+    alias_span: SourceSpan | None = None
 
 
-class UsageFact(BaseModel):
+class Fact(BaseModel):
+    """Common shape of everything the analyser observed about a column.
+
+    `span` is the reference itself - what to highlight when naming the column. Both are
+    optional because sqlglot only positions tokens it actually parsed; anything it
+    synthesised has no location at all.
+    """
+
+    span: SourceSpan | None = None
+    context_span: SourceSpan | None = None
+    """The expression the reference sits in - `amount > 20`, not just `amount`.
+
+    This is what a diagnostic underlines: the comparison is the evidence, the bare column
+    name is not.
+    """
+
+
+class UsageFact(Fact):
     node: ColumnNode
     kind: UsageKind
     detail: str | None = None
 
 
-class PredicateFact(BaseModel):
+class PredicateFact(Fact):
     """A filter predicate applied to a column. Raw material for constraint extraction."""
 
     node: ColumnNode
     operator: PredicateOperator
     values: list[str] = []
     literal_kind: LiteralKind | None = None
+    value_spans: list[SourceSpan | None] = []
+    """Positions of `values`, parallel to it."""
 
 
-class JoinFact(BaseModel):
+class JoinFact(Fact):
     """An equi-join between two columns. Raw material for relationship inference."""
 
     left: ColumnNode
     right: ColumnNode
     join_type: str
     operator: str = "="
+    left_span: SourceSpan | None = None
+    right_span: SourceSpan | None = None
 
 
-class NullabilityFact(BaseModel):
+class NullabilityFact(Fact):
     node: ColumnNode
     nullable: bool
     reason: NullabilityReason
 
 
-class CardinalityFact(BaseModel):
+class CardinalityFact(Fact):
     nodes: list[ColumnNode]
     kind: CardinalityKind
+    spans: list[SourceSpan | None] = []
+    """Positions of `nodes`, parallel to it."""
 
 
 class Ambiguity(BaseModel):
@@ -196,10 +236,16 @@ class Ambiguity(BaseModel):
     resolution: AmbiguityResolution
     chosen: RelationRef | None = None
     confidence: Confidence | None = None
-    line: int | None = None
+    span: SourceSpan | None = None
+
+    @property
+    def line(self) -> int | None:
+        """1-based line, for messages meant to be read by a human."""
+        return None if self.span is None else self.span.start_line + 1
 
 
 class SqlAnalysisResult(BaseModel):
+    source: SourceDoc = Field(default_factory=SourceDoc)
     relations: list[Relation] = []
     sources: list[SourceTable] = []
     projection: list[ProjectedColumn] = []
@@ -219,3 +265,7 @@ class SqlAnalysisResult(BaseModel):
     @property
     def cte_names(self) -> list[str]:
         return [r.ref.name for r in self.relations if r.ref.kind == "cte"]
+
+    def snippet(self, span: SourceSpan | None) -> str | None:
+        """The source text a span covers. Snippets live here, not on the facts."""
+        return self.source.slice(span)

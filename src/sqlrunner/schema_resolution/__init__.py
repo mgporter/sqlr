@@ -7,23 +7,35 @@ can produce overlapping values instead of a join that returns nothing.
 Evidence that does not name a type resolves to a family rather than a guess - see
 `ResolvedType`. Two pieces of evidence of equal weight are widened together, which is also
 how a join group with conflicting member types is unified.
+
+**Collection and choice are separate**, and collection never discards. `_collect_evidence`
+gathers everything a column's usage implies; `_choose` decides which of it wins. Both the
+winner and the losers reach the caller, because "this column is a string" is a much weaker
+thing to hand a user than "this column is a string, because of these three comparisons,
+at these three places in the file".
 """
 
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Literal
 
 from sqlrunner.schema_resolution.types import (
     ColumnSchema,
+    EvidenceKind,
+    JoinGroup,
+    NullabilityResolution,
     ProjectedColumnSchema,
     ResolvedType,
     StatementSchema,
     TableSchema,
-    TypeSource,
+    TypeEvidence,
     ValueConstraint,
 )
+from sqlrunner.source import SourceSpan
 from sqlrunner.sql_analysis.types import (
     ColumnNode,
+    JoinFact,
     LiteralKind,
     NullabilityFact,
     OutputColumn,
@@ -33,30 +45,9 @@ from sqlrunner.sql_analysis.types import (
     SqlAnalysisResult,
     UsageFact,
 )
+from sqlrunner.typemap import TYPE_COVER, WIDENING_ORDER, resolve_type_name, widen
 
-CAST_TYPE_MAP: dict[str, ResolvedType] = {
-    "INT": "integer",
-    "INTEGER": "integer",
-    "BIGINT": "integer",
-    "SMALLINT": "integer",
-    "TINYINT": "integer",
-    "DECIMAL": "decimal",
-    "NUMERIC": "decimal",
-    "FLOAT": "float",
-    "DOUBLE": "float",
-    "REAL": "float",
-    "VARCHAR": "string",
-    "TEXT": "string",
-    "CHAR": "string",
-    "STRING": "string",
-    "NVARCHAR": "string",
-    "DATE": "date",
-    "TIMESTAMP": "timestamp",
-    "TIMESTAMPTZ": "timestamp",
-    "DATETIME": "timestamp",
-    "BOOLEAN": "boolean",
-    "BOOL": "boolean",
-}
+__all__ = ["resolve_schema", "widen", "TYPE_COVER", "WIDENING_ORDER"]
 
 # Higher confidence wins when a column has conflicting evidence. `cast` is absent on
 # purpose: `cast(x as decimal)` fixes the type of the *result*, not of `x`, which could
@@ -67,7 +58,10 @@ USAGE_TYPE_WEIGHT: dict[str, int] = {
     "coalesce_default": 65,
     "in_list_strings": 60,
     "like": 60,
+    "string_function": 60,
+    "numeric_function": 60,
     "compared_to_number": 50,
+    "compared_to_string": 50,
     "in_list_numbers": 50,
     "arithmetic": 10,
 }
@@ -112,34 +106,6 @@ FUNCTION_TYPE_MAP: dict[str, ResolvedType] = {
 # the column beside it. `Case` is absent: its branch values are not direct arguments.
 TYPE_TRANSPARENT_FUNCTIONS = {"Coalesce", "Nullif", "Greatest", "Least", "If"}
 
-# The concrete types each `ResolvedType` covers. Widening picks the narrowest entry whose
-# cover is a superset of both inputs, so `integer` and `decimal` meet at `number`.
-TYPE_COVER: dict[ResolvedType, frozenset[str]] = {
-    "integer": frozenset({"integer"}),
-    "decimal": frozenset({"decimal"}),
-    "float": frozenset({"float"}),
-    "number": frozenset({"integer", "decimal"}),
-    "numeric": frozenset({"integer", "decimal", "float"}),
-    "string": frozenset({"string"}),
-    "date": frozenset({"date"}),
-    "timestamp": frozenset({"timestamp"}),
-    "boolean": frozenset({"boolean"}),
-    "unknown": frozenset(),
-}
-
-# Narrowest first, so the first superset found is the least upper bound.
-WIDENING_ORDER: list[ResolvedType] = [
-    "integer",
-    "decimal",
-    "float",
-    "string",
-    "date",
-    "timestamp",
-    "boolean",
-    "number",
-    "numeric",
-]
-
 # A literal proves its neighbour holds a number, never which kind of number.
 LITERAL_KIND_TYPE: dict[LiteralKind, ResolvedType] = {
     "int": "numeric",
@@ -147,85 +113,127 @@ LITERAL_KIND_TYPE: dict[LiteralKind, ResolvedType] = {
     "string": "string",
 }
 
-
-def widen(left: ResolvedType, right: ResolvedType) -> ResolvedType:
-    """The narrowest type covering both. `unknown` when nothing does."""
-    if left == right:
-        return left
-    if left == "unknown" or right == "unknown":
-        return "unknown"
-    covered = TYPE_COVER[left] | TYPE_COVER[right]
-    for candidate in WIDENING_ORDER:
-        if covered <= TYPE_COVER[candidate]:
-            return candidate
-    return "unknown"
-
-
 NULLABILITY_WEIGHT: dict[str, int] = {
     "is_null_predicate": 3,
     "is_not_null_predicate": 3,
     "coalesce_argument": 2,
     "inner_join_key": 1,
     # `outer_join_padded` describes the join result, not the stored column, so it does
-    # not decide source nullability. It stays available on the analysis result.
+    # not decide source nullability. It stays available on the resolution's fact list.
 }
 
+NAME_PATTERNS: list[tuple[Literal["prefix", "suffix"], str, ResolvedType]] = [
+    ("prefix", "is_", "boolean"),
+    ("suffix", "_at", "timestamp"),
+    ("suffix", "_timestamp", "timestamp"),
+    ("suffix", "_ts", "timestamp"),
+    ("suffix", "_date", "date"),
+    ("suffix", "_name", "string"),
+    ("suffix", "_amount", "numeric"),
+]
 
-@dataclass
-class _TypeEvidence:
-    resolved_type: ResolvedType
-    weight: int
-    source: TypeSource
-    evidence: str | None = None
+
+# ---- evidence collection -------------------------------------------------------------
 
 
-def _type_from_usage(usage: UsageFact) -> tuple[ResolvedType, int] | None:
+def _usage_evidence(usage: UsageFact) -> TypeEvidence | None:
+    """Type evidence carried by the syntactic context a column appeared in."""
     weight = USAGE_TYPE_WEIGHT.get(usage.kind)
     if weight is None:
         return None
 
+    resolved: ResolvedType | None
     if usage.kind == "boolean_context":
-        return ("boolean", weight)
-    if usage.kind == "date_function":
-        return ("date", weight)
-    if usage.kind in ("in_list_strings", "like"):
-        return ("string", weight)
-    if usage.kind in ("compared_to_number", "in_list_numbers", "arithmetic"):
-        return ("numeric", weight)
-    if usage.kind == "coalesce_default":
+        resolved = "boolean"
+    elif usage.kind == "date_function":
+        resolved = "date"
+    elif usage.kind in (
+        "in_list_strings",
+        "like",
+        "compared_to_string",
+        "string_function",
+    ):
+        resolved = "string"
+    elif usage.kind in (
+        "compared_to_number",
+        "in_list_numbers",
+        "arithmetic",
+        "numeric_function",
+    ):
+        resolved = "numeric"
+    elif usage.kind == "coalesce_default":
         resolved = LITERAL_KIND_TYPE.get(usage.detail or "")  # type: ignore[arg-type]
-        return (resolved, weight) if resolved is not None else None
-    return None
+    else:
+        resolved = None
+
+    if resolved is None:
+        return None
+
+    return TypeEvidence(
+        node=usage.node,
+        resolved_type=resolved,
+        weight=weight,
+        source="usage",
+        kind="usage",
+        detail=usage.kind,
+        span=usage.span,
+        context_span=usage.context_span,
+    )
 
 
-def _type_from_expression(
-    output: OutputColumn | ProjectedColumn,
-) -> _TypeEvidence | None:
+def _expression_evidence(
+    node: ColumnNode, output: OutputColumn | ProjectedColumn
+) -> TypeEvidence | None:
     """Type evidence carried by the expression that produced a derived column.
 
     The resolver stops at derived columns, so nothing else can type them.
     """
+    kind: EvidenceKind
+    resolved: ResolvedType | None = None
+    detail: str | None = None
+    weight = 0
+
     if output.cast_type:
-        resolved = CAST_TYPE_MAP.get(output.cast_type)
-        if resolved is not None:
-            return _TypeEvidence(
-                resolved, CAST_WEIGHT, "expression", f"cast to {output.cast_type}"
+        resolved = resolve_type_name(output.cast_type)
+        if resolved != "unknown":
+            kind, weight = "cast", CAST_WEIGHT
+            detail = f"cast to {output.cast_type}"
+            return TypeEvidence(
+                node=node,
+                resolved_type=resolved,
+                weight=weight,
+                source="expression",
+                kind=kind,
+                detail=detail,
+                span=output.span,
+                context_span=output.span,
             )
 
     from_function = FUNCTION_TYPE_MAP.get(output.function or "")
     if from_function is not None:
-        return _TypeEvidence(
-            from_function, EXPRESSION_WEIGHT, "expression", output.function
+        return TypeEvidence(
+            node=node,
+            resolved_type=from_function,
+            weight=EXPRESSION_WEIGHT,
+            source="expression",
+            kind="function",
+            detail=output.function,
+            span=output.span,
+            context_span=output.span,
         )
 
     if output.function in TYPE_TRANSPARENT_FUNCTIONS:
         from_literals = _type_from_literal_kinds(output.literal_kinds)
         if from_literals is not None:
-            return _TypeEvidence(
-                from_literals,
-                LITERAL_ARGUMENT_WEIGHT,
-                "expression",
-                f"{output.function} literal",
+            return TypeEvidence(
+                node=node,
+                resolved_type=from_literals,
+                weight=LITERAL_ARGUMENT_WEIGHT,
+                source="expression",
+                kind="literal_argument",
+                detail=f"{output.function} literal",
+                span=output.span,
+                context_span=output.span,
             )
 
     return None
@@ -241,21 +249,114 @@ def _type_from_literal_kinds(kinds: list[LiteralKind]) -> ResolvedType | None:
     return resolved if resolved != "unknown" else None
 
 
-def _type_from_name(column: str) -> tuple[ResolvedType, str] | None:
-    lower = column.lower()
-    if lower.startswith("is_"):
-        return ("boolean", "is_*")
-    if lower.endswith("_at"):
-        return ("timestamp", "*_at")
-    if lower.endswith("_timestamp"):
-        return ("timestamp", "*_timestamp")
-    if lower.endswith("_ts"):
-        return ("timestamp", "*_ts")
-    if lower.endswith("_name"):
-        return ("string", "*_name")
-    if lower.endswith("_amount"):
-        return ("numeric", "*_amount")
+def _name_evidence(node: ColumnNode, references: list[SourceSpan]) -> TypeEvidence | None:
+    """The weakest evidence there is: what the column is called.
+
+    Collected unconditionally rather than only as a fallback. At weight 5 it loses to
+    every other kind, so the outcome is unchanged - but a user reading a diagnostic gets
+    to see that the name agreed, or did not.
+    """
+    lower = node.column.lower()
+    for position, affix, resolved in NAME_PATTERNS:
+        matches = (
+            lower.startswith(affix) if position == "prefix" else lower.endswith(affix)
+        )
+        if not matches:
+            continue
+        pattern = f"{affix}*" if position == "prefix" else f"*{affix}"
+        return TypeEvidence(
+            node=node,
+            resolved_type=resolved,
+            weight=NAME_PATTERN_WEIGHT,
+            source="name_pattern",
+            kind="name_pattern",
+            detail=pattern,
+            span=references[0] if references else None,
+            context_span=references[0] if references else None,
+        )
     return None
+
+
+def _collect_evidence(
+    node: ColumnNode,
+    usages: list[UsageFact],
+    derived_outputs: Mapping[ColumnNode, OutputColumn],
+    references: list[SourceSpan],
+) -> list[TypeEvidence]:
+    """Everything that says anything about this column's type. Discards nothing."""
+    evidence: list[TypeEvidence] = []
+
+    for usage in usages:
+        candidate = _usage_evidence(usage)
+        if candidate is not None:
+            evidence.append(candidate)
+
+    output = derived_outputs.get(node)
+    if output is not None:
+        from_expression = _expression_evidence(node, output)
+        if from_expression is not None:
+            evidence.append(from_expression)
+
+    from_name = _name_evidence(node, references)
+    if from_name is not None:
+        evidence.append(from_name)
+
+    return evidence
+
+
+# ---- choosing a winner ---------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _Choice:
+    """The outcome of weighing one column's evidence.
+
+    Annotated at class level rather than only on `__init__`: a type checker widens the
+    type it *infers* for an attribute, so `ResolvedType` assigned in a constructor body
+    comes back out as a bare `str` and every downstream use loses the literal.
+    """
+
+    resolved_type: ResolvedType
+    chosen: TypeEvidence | None
+    widened_from: list[ResolvedType]
+
+
+def _choose(evidence: list[TypeEvidence]) -> _Choice:
+    """Heaviest evidence wins; equally heavy evidence that disagrees is widened.
+
+    Widening the top tier can land on `unknown` - `boolean` and `date` have nothing in
+    common. Rather than report `unknown` while weaker but usable evidence exists, the
+    next tier down is tried.
+    """
+    usable = [item for item in evidence if item.resolved_type != "unknown"]
+    if not usable:
+        return _Choice("unknown", None, [])
+
+    for weight in sorted({item.weight for item in usable}, reverse=True):
+        tier = [item for item in usable if item.weight == weight]
+
+        resolved = tier[0].resolved_type
+        for item in tier[1:]:
+            resolved = widen(resolved, item.resolved_type)
+        if resolved == "unknown":
+            continue
+
+        distinct: list[ResolvedType] = list(
+            dict.fromkeys(item.resolved_type for item in tier)
+        )
+        widened_from: list[ResolvedType] = distinct if len(distinct) > 1 else []
+        # The first entry of the tier is the winner by declaration order, which follows
+        # the order the evidence was written in the SQL.
+        return _Choice(resolved, tier[0], widened_from)
+
+    return _Choice("unknown", None, [])
+
+
+def _sorted_evidence(evidence: list[TypeEvidence]) -> list[TypeEvidence]:
+    return sorted(evidence, key=lambda item: -item.weight)
+
+
+# ---- join groups ---------------------------------------------------------------------
 
 
 class _JoinGroups:
@@ -285,9 +386,74 @@ class _JoinGroups:
         members: dict[ColumnNode, list[ColumnNode]] = defaultdict(list)
         for node in self._parent:
             members[self.find(node)].append(node)
-        return [
-            sorted(group, key=str) for group in members.values() if len(group) > 1
+        return [sorted(group, key=str) for group in members.values() if len(group) > 1]
+
+
+def _unify_join_groups(
+    groups: list[list[ColumnNode]],
+    evidence: dict[ColumnNode, list[TypeEvidence]],
+    choices: dict[ColumnNode, _Choice],
+) -> list[ResolvedType]:
+    """Propagate one type across each join group, without erasing member evidence.
+
+    Members of a join group have to share one value domain, so a group holding both an
+    `integer` and a `decimal` becomes `number` throughout rather than picking one and
+    generating values the other side can never match.
+
+    The unified type arrives as an *additional* piece of evidence on each member, at the
+    weight of the member that justified it. Nothing already on the member is removed, so
+    a diagnostic can still explain why the group settled where it did.
+    """
+    unified_types: list[ResolvedType] = []
+
+    for group in groups:
+        # Annotated because a tuple built inside a comprehension has no expected type to
+        # check against, so the literal union widens back to `str` without one.
+        known: list[tuple[ResolvedType, TypeEvidence | None, ColumnNode]] = [
+            (choices[node].resolved_type, choices[node].chosen, node)
+            for node in group
+            if node in choices and choices[node].resolved_type != "unknown"
         ]
+        if not known:
+            unified_types.append("unknown")
+            continue
+
+        best_weight = max(
+            chosen.weight for _, chosen, _ in known if chosen is not None
+        )
+        best_node = next(
+            node
+            for _, chosen, node in known
+            if chosen is not None and chosen.weight == best_weight
+        )
+
+        unified: ResolvedType = known[0][0]
+        for resolved, _, _ in known[1:]:
+            unified = widen(unified, resolved)
+        unified_types.append(unified)
+
+        for node in group:
+            current = choices.get(node)
+            if current is not None and current.resolved_type == unified:
+                # Already agrees; leave its own evidence to speak for it.
+                continue
+            evidence.setdefault(node, []).append(
+                TypeEvidence(
+                    node=node,
+                    resolved_type=unified,
+                    weight=best_weight,
+                    source="join_group",
+                    kind="join_group",
+                    detail=f"joined to {best_node}",
+                    via=best_node,
+                )
+            )
+            choices[node] = _choose(evidence[node])
+
+    return unified_types
+
+
+# ---- entry point ---------------------------------------------------------------------
 
 
 def resolve_schema(analysis: SqlAnalysisResult) -> StatementSchema:
@@ -303,6 +469,8 @@ def resolve_schema(analysis: SqlAnalysisResult) -> StatementSchema:
     for fact in analysis.nullability:
         nullability_by_node[fact.node].append(fact)
 
+    references_by_node = _references_by_node(analysis)
+
     derived_outputs = {
         ColumnNode(relation=relation.ref, column=output.name): output
         for relation in analysis.relations
@@ -311,9 +479,18 @@ def resolve_schema(analysis: SqlAnalysisResult) -> StatementSchema:
     }
 
     nodes = _all_nodes(analysis, usages_by_node, predicates_by_node, derived_outputs)
-    evidence = {
-        node: _initial_evidence(node, usages_by_node.get(node, []), derived_outputs)
+
+    evidence: dict[ColumnNode, list[TypeEvidence]] = {
+        node: _collect_evidence(
+            node,
+            usages_by_node.get(node, []),
+            derived_outputs,
+            references_by_node.get(node, []),
+        )
         for node in nodes
+    }
+    choices: dict[ColumnNode, _Choice] = {
+        node: _choose(items) for node, items in evidence.items()
     }
 
     join_groups = _JoinGroups()
@@ -321,26 +498,43 @@ def resolve_schema(analysis: SqlAnalysisResult) -> StatementSchema:
         join_groups.union(join.left, join.right)
     groups = join_groups.groups()
 
-    _unify_join_groups(groups, evidence)
+    unified_types = _unify_join_groups(groups, evidence, choices)
 
-    group_index = {
-        node: index for index, group in enumerate(groups) for node in group
-    }
+    group_index = {node: index for index, group in enumerate(groups) for node in group}
+    join_group_models = _build_join_groups(
+        groups, unified_types, analysis.joins, join_groups
+    )
 
     tables = _build_tables(
         analysis,
         evidence,
+        choices,
         predicates_by_node,
         nullability_by_node,
+        references_by_node,
         group_index,
     )
-    projection = _build_projection(analysis, evidence)
+    projection = _build_projection(analysis, evidence, choices)
 
     return StatementSchema(
+        source=analysis.source,
         tables=tables,
         projection=projection,
-        join_groups=[[str(node) for node in group] for group in groups],
+        join_groups=join_group_models,
     )
+
+
+def _references_by_node(
+    analysis: SqlAnalysisResult,
+) -> dict[ColumnNode, list[SourceSpan]]:
+    references: dict[ColumnNode, list[SourceSpan]] = {}
+    for source in analysis.sources:
+        ref = _table_ref(source.name)
+        for column in source.columns:
+            references[ColumnNode(relation=ref, column=column.name)] = list(
+                column.references
+            )
+    return references
 
 
 def _all_nodes(
@@ -353,11 +547,7 @@ def _all_nodes(
     nodes |= set(derived_outputs)
     for source in analysis.sources:
         for column in source.columns:
-            nodes.add(
-                ColumnNode(
-                    relation=_table_ref(source.name), column=column.name
-                )
-            )
+            nodes.add(ColumnNode(relation=_table_ref(source.name), column=column.name))
     for join in analysis.joins:
         nodes.add(join.left)
         nodes.add(join.right)
@@ -371,84 +561,38 @@ def _table_ref(name: str) -> RelationRef:
     return RelationRef(kind="table", name=name)
 
 
-def _initial_evidence(
-    node: ColumnNode,
-    usages: list[UsageFact],
-    derived_outputs: Mapping[ColumnNode, OutputColumn],
-) -> _TypeEvidence:
-    best: _TypeEvidence | None = None
-    for usage in usages:
-        candidate = _type_from_usage(usage)
-        if candidate is None:
-            continue
-        resolved, weight = candidate
-        if best is None or weight > best.weight:
-            best = _TypeEvidence(resolved, weight, "usage", usage.kind)
-        elif weight == best.weight and resolved != best.resolved_type:
-            # Two equally good pieces of evidence disagree; keep what both allow.
-            best = _TypeEvidence(
-                widen(best.resolved_type, resolved),
-                weight,
-                "usage",
-                f"{best.evidence}+{usage.kind}",
-            )
+def _build_join_groups(
+    groups: list[list[ColumnNode]],
+    unified_types: list[ResolvedType],
+    joins: list[JoinFact],
+    union_find: _JoinGroups,
+) -> list[JoinGroup]:
+    """Attach the joins that linked each group, so the grouping can explain itself."""
+    root_to_index = {union_find.find(group[0]): index for index, group in enumerate(groups)}
 
-    output = derived_outputs.get(node)
-    if output is not None:
-        from_expression = _type_from_expression(output)
-        if from_expression is not None and (
-            best is None or from_expression.weight > best.weight
-        ):
-            best = from_expression
+    facts_by_group: dict[int, list[JoinFact]] = defaultdict(list)
+    for join in joins:
+        index = root_to_index.get(union_find.find(join.left))
+        if index is not None:
+            facts_by_group[index].append(join)
 
-    if best is not None and best.resolved_type != "unknown":
-        return best
-
-    name_match = _type_from_name(node.column)
-    if name_match is not None:
-        resolved, pattern = name_match
-        return _TypeEvidence(resolved, NAME_PATTERN_WEIGHT, "name_pattern", pattern)
-
-    return _TypeEvidence("unknown", 0, "unknown", None)
-
-
-def _unify_join_groups(
-    groups: list[list[ColumnNode]], evidence: dict[ColumnNode, _TypeEvidence]
-) -> None:
-    for group in groups:
-        known = [
-            (evidence[node].weight, node)
-            for node in group
-            if node in evidence and evidence[node].resolved_type != "unknown"
-        ]
-        if not known:
-            continue
-        best_weight, best_node = max(known, key=lambda item: item[0])
-
-        # Members of a join group have to share one value domain, so a group holding both
-        # an `integer` and a `decimal` becomes `number` throughout rather than picking one
-        # and generating values the other side can never match.
-        unified = evidence[best_node].resolved_type
-        for _, node in known:
-            unified = widen(unified, evidence[node].resolved_type)
-
-        for node in group:
-            current = evidence.get(node)
-            if current is not None and current.resolved_type == unified:
-                continue
-            evidence[node] = _TypeEvidence(
-                unified,
-                best_weight,
-                "join_group",
-                f"joined to {best_node}",
-            )
+    return [
+        JoinGroup(
+            members=group,
+            unified_type=unified_types[index],
+            facts=facts_by_group.get(index, []),
+        )
+        for index, group in enumerate(groups)
+    ]
 
 
 def _build_tables(
     analysis: SqlAnalysisResult,
-    evidence: dict[ColumnNode, _TypeEvidence],
+    evidence: dict[ColumnNode, list[TypeEvidence]],
+    choices: dict[ColumnNode, _Choice],
     predicates_by_node: dict[ColumnNode, list[PredicateFact]],
     nullability_by_node: dict[ColumnNode, list[NullabilityFact]],
+    references_by_node: dict[ColumnNode, list[SourceSpan]],
     group_index: dict[ColumnNode, int],
 ) -> list[TableSchema]:
     tables: list[TableSchema] = []
@@ -457,16 +601,18 @@ def _build_tables(
         columns: list[ColumnSchema] = []
         for column in source.columns:
             node = ColumnNode(relation=ref, column=column.name)
-            resolved = evidence.get(node) or _TypeEvidence("unknown", 0, "unknown", None)
+            choice = choices.get(node) or _Choice("unknown", None, [])
             columns.append(
                 ColumnSchema(
                     name=column.name,
-                    resolved_type=resolved.resolved_type,
-                    source=resolved.source,
-                    evidence=resolved.evidence,
+                    resolved_type=choice.resolved_type,
+                    chosen=choice.chosen,
+                    evidence=_sorted_evidence(evidence.get(node, [])),
+                    widened_from=choice.widened_from,
                     confidence=column.confidence,
-                    nullable=_nullability(nullability_by_node.get(node, [])),
+                    nullability=_nullability(nullability_by_node.get(node, [])),
                     constraints=_constraints(predicates_by_node.get(node, [])),
+                    references=references_by_node.get(node, []),
                     join_group=group_index.get(node),
                 )
             )
@@ -480,55 +626,99 @@ def _build_tables(
     return tables
 
 
-def _nullability(facts: list[NullabilityFact]) -> bool | None:
+def _nullability(facts: list[NullabilityFact]) -> NullabilityResolution:
     best_weight = 0
-    result: bool | None = None
+    chosen: NullabilityFact | None = None
     for fact in facts:
         weight = NULLABILITY_WEIGHT.get(fact.reason, 0)
         if weight > best_weight:
             best_weight = weight
-            result = fact.nullable
-    return result
+            chosen = fact
+    return NullabilityResolution(
+        nullable=None if chosen is None else chosen.nullable,
+        chosen=chosen,
+        facts=facts,
+    )
 
 
 def _constraints(facts: list[PredicateFact]) -> list[ValueConstraint]:
-    seen: set[tuple[str, tuple[str, ...]]] = set()
+    # Deduped by position as well as by content: the same predicate written twice in two
+    # places is two things to underline, and two hints about the data to generate.
+    seen: set[tuple[str, tuple[str, ...], int | None]] = set()
     constraints: list[ValueConstraint] = []
     for fact in facts:
-        key = (fact.operator, tuple(fact.values))
+        key = (
+            fact.operator,
+            tuple(fact.values),
+            None if fact.context_span is None else fact.context_span.start,
+        )
         if key in seen:
             continue
         seen.add(key)
-        constraints.append(ValueConstraint(operator=fact.operator, values=fact.values))
+        constraints.append(
+            ValueConstraint(
+                operator=fact.operator,
+                values=fact.values,
+                literal_kind=fact.literal_kind,
+                span=fact.span,
+                context_span=fact.context_span,
+                value_spans=fact.value_spans,
+            )
+        )
     return constraints
 
 
 def _build_projection(
-    analysis: SqlAnalysisResult, evidence: dict[ColumnNode, _TypeEvidence]
+    analysis: SqlAnalysisResult,
+    evidence: dict[ColumnNode, list[TypeEvidence]],
+    choices: dict[ColumnNode, _Choice],
 ) -> list[ProjectedColumnSchema]:
     projection: list[ProjectedColumnSchema] = []
     for projected in analysis.projection:
-        resolved_type: ResolvedType = "unknown"
-        source: TypeSource = "unknown"
+        node = ColumnNode(
+            relation=RelationRef(kind="root", name=""),
+            column=projected.name or f"_col_{projected.ordinal}",
+        )
 
-        from_expression = _type_from_expression(projected)
-        if from_expression is not None:
-            resolved_type, source = from_expression.resolved_type, from_expression.source
+        collected: list[TypeEvidence] = []
 
-        if resolved_type == "unknown":
+        # A passthrough column is whatever its origin is. Every origin contributes, so a
+        # set-operation column that unions two differently-typed branches shows both.
+        #
+        # A *derived* column resolves to itself, and that node was already typed from its
+        # own expression when the source columns were collected. Deriving the expression
+        # evidence again here would produce the same observation a second time - the same
+        # `upper(...)` seen from two directions - so the origins are asked first and the
+        # expression is only consulted when they had nothing to say.
+        for origin in projected.origins:
+            collected.extend(evidence.get(origin.node, []))
+
+        if not collected:
+            from_expression = _expression_evidence(node, projected)
+            if from_expression is not None:
+                collected.append(from_expression)
+
+        choice = _choose(collected)
+        if choice.resolved_type == "unknown":
+            # Fall back to the origins' own resolved types, which include anything a join
+            # group propagated onto them after their own evidence was collected.
             for origin in projected.origins:
-                candidate = evidence.get(origin.node)
-                if candidate is not None and candidate.resolved_type != "unknown":
-                    resolved_type, source = candidate.resolved_type, candidate.source
+                origin_choice = choices.get(origin.node)
+                if origin_choice is not None and origin_choice.resolved_type != "unknown":
+                    choice = origin_choice
                     break
 
         projection.append(
             ProjectedColumnSchema(
                 name=projected.name,
                 ordinal=projected.ordinal,
-                resolved_type=resolved_type,
-                source=source,
-                origins=[str(origin.node) for origin in projected.origins],
+                resolved_type=choice.resolved_type,
+                chosen=choice.chosen,
+                evidence=_sorted_evidence(collected),
+                widened_from=choice.widened_from,
+                origins=[origin.node for origin in projected.origins],
+                span=projected.span,
+                alias_span=projected.alias_span,
             )
         )
     return projection

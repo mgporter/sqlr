@@ -69,18 +69,6 @@ def qualified_name(table: exp.Table) -> str:
     return ".".join(parts)
 
 
-def line_of(expression: exp.Expr) -> int | None:
-    """Best-effort source line. sqlglot only records position on leaf tokens."""
-    line = expression.meta.get("line")
-    if isinstance(line, int):
-        return line
-    for node in expression.walk():
-        line = node.meta.get("line")
-        if isinstance(line, int):
-            return line
-    return None
-
-
 @dataclass(frozen=True)
 class InputRef:
     """One input of an output column, before resolution.
@@ -135,6 +123,10 @@ class OutputCol:
 
     expression: exp.Expr | None = None
 
+    # The alias identifier, when the output column was explicitly named. Carried
+    # separately so a diagnostic can point at `as total` rather than the whole item.
+    alias_expression: exp.Expr | None = None
+
 
 @dataclass
 class RelationInfo:
@@ -148,6 +140,10 @@ class RelationInfo:
     # The scope the relation came from
     scope: Scope | None = None
     expression: exp.Expr | None = None
+
+    # The identifier that named this relation - a CTE's alias, a derived table's alias.
+    # None for the root and for anonymous subqueries.
+    name_expression: exp.Expr | None = None
 
     # set operations
     is_setop: bool = False
@@ -358,6 +354,14 @@ class _GraphBuilder:
         alias = getattr(parent, "alias", "") or f"_subquery_{self._next_anon()}"
         return self._unique("subquery", alias)
 
+    def _name_expression(self, scope: Scope) -> exp.Expr | None:
+        """The identifier that named this scope, for a `name_span`."""
+        parent = scope.expression.parent
+        if parent is None:
+            return None
+        alias = parent.args.get("alias")
+        return alias if isinstance(alias, exp.Expr) else None
+
     def _table_ref(self, table: exp.Table) -> RelationRef:
         ref = RelationRef(kind="table", name=qualified_name(table))
         if ref not in self.graph.relations:
@@ -382,7 +386,12 @@ class _GraphBuilder:
 
     def _build_relation(self, scope: Scope) -> None:
         ref = self.ref_by_scope_id[id(scope)]
-        info = RelationInfo(ref=ref, scope=scope, expression=scope.expression)
+        info = RelationInfo(
+            ref=ref,
+            scope=scope,
+            expression=scope.expression,
+            name_expression=self._name_expression(scope),
+        )
         # `Scope.columns` leaks columns belonging to nested subqueries, which would
         # otherwise be attributed to this scope's sources.
         info.own_columns = [
@@ -541,6 +550,9 @@ class _GraphBuilder:
             )
 
         name = select.alias_or_name or f"_col_{ordinal}"
+        alias_expression = (
+            select.args.get("alias") if isinstance(select, exp.Alias) else None
+        )
         inner = select.this if isinstance(select, exp.Alias) else select
         while isinstance(inner, exp.Paren):
             inner = inner.this
@@ -552,6 +564,7 @@ class _GraphBuilder:
                 kind="passthrough",
                 inputs=[InputRef(column=inner.name, alias=inner.table or None)],
                 expression=select,
+                alias_expression=alias_expression,
             )
 
         inputs = [
@@ -569,6 +582,7 @@ class _GraphBuilder:
             cast_type=_cast_type(producer),
             literal_kinds=_literal_kinds(producer),
             expression=select,
+            alias_expression=alias_expression,
         )
 
     def _order_by_binding(

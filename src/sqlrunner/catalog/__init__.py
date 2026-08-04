@@ -22,7 +22,33 @@ def _hash_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+DEFAULT_YAML_GLOBS = ["**/*.yml", "**/*.yaml"]
+
+
 def find_sql_files(
+    project_root: Path,
+    include_globs: list[str],
+    exclude_globs: list[str] | None = None,
+) -> FileInventory:
+    return find_files(project_root, include_globs, exclude_globs)
+
+
+def find_yaml_files(
+    project_root: Path,
+    include_globs: list[str] | None = None,
+    exclude_globs: list[str] | None = None,
+) -> FileInventory:
+    """Every yml in the project. Deciding which ones *mean* anything is not our job.
+
+    Discovery is kept separate from interpretation so that a dbt project's existing
+    `schema.yml` files and a hand-written one are found by the same code.
+    """
+    return find_files(
+        project_root, include_globs or DEFAULT_YAML_GLOBS, exclude_globs
+    )
+
+
+def find_files(
     project_root: Path,
     include_globs: list[str],
     exclude_globs: list[str] | None = None,

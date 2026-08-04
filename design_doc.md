@@ -31,24 +31,101 @@ These fall out of decisions already made, and should be used to settle ambiguity
 
 ```
 config ──┐
-         ├─> project catalog ──> sql analysis ──┬──> schema resolution ──┐
-         │                                      ├──> relationship inference ──> constraint set
-         │                                      └──> constraint extraction ──┘
-         │                                                                    │
-         │                                                                    v
+         ├─> project catalog ──┬─> sql analysis ──┬──> schema resolution ──┐
+         │                     │                  ├──> relationship inference ──> constraint set
+         │                     │                  └──> constraint extraction ──┘
+         │                     │                                               │
+         │                     └─> declared schemas ──┐                        │
+         │                                            v                        │
+         │                                        diagnostics <────────────────┤
+         │                                                                     │
+         │                                                                     v
          │                                              generation planner (DAG + fingerprints)
-         │                                                                    │
-         │                                          ┌─────────────────────────┤
-         │                                          v                         v
+         │                                                                     │
+         │                                          ┌──────────────────────────┤
+         │                                          v                          v
          │                                     providers ──> scenarios ──> fixture store
-         │                                                                    │
-         │                                                                    v
+         │                                                                     │
+         │                                                                     v
          └──────────────────────────────────────────────────> execution ──> output
 ```
+
+`diagnostics` sits deliberately off the main line. It is a sink, not a stage: everything
+upstream of generation writes findings into it, and nothing downstream depends on it.
+
+## Built so far
+
+`config`, `catalog`, `source`, `typemap`, `sql_analysis`, `schema_resolution`, `declared`,
+`diagnostics`, and a thin `cli`. Everything from `relationship_inference` onwards is still
+design.
+
+The **Basic / Extended** split below is a scoping tier, not a status: plenty of Basic
+bullets in the unbuilt modules do not exist yet, and a few Extended ones in the built
+modules already do.
 
 ---
 
 # Layer 1 — Foundation
+
+## Module: `source`
+
+Character ranges, and the text they index into. Depends on nothing; everything that
+reports anything depends on it.
+
+Design principle 5 — *everything explains itself* — is only worth anything if an
+explanation can point somewhere. A resolved type that says "numeric" is weak next to one
+that says "numeric, because of `amount > 20`, at line 14, column 9". That pointer is a
+`SourceSpan`, and it has to be attachable to any fact any module derives.
+
+**Basic**
+- `SourceSpan`: half-open character range plus 0-based line/column at both ends.
+- `SourceDoc`: the text plus its path; slices snippets on demand.
+- `Positions`: a per-document index resolving a sqlglot expression to a span.
+
+**Design notes**
+- sqlglot records positions only on **leaf tokens** — `Identifier`, `Literal`, and the
+  name token of some functions. `Column`, `EQ`, `Where`, `Select` carry nothing. The span
+  of a composite expression is therefore the hull of the positioned leaves beneath it.
+- sqlglot's own `line`/`col` are ignored. `col` is 1-based *and points at the token's last
+  character*, which no editor wants. Both are recomputed from character offsets, 0-based,
+  so a span converts to an LSP `Range` without arithmetic.
+- Offsets are absolute across a whole file, so one index per document stays valid across
+  every statement in it. `.copy()` and `qualify_tables()` both preserve the metadata.
+- **Two limits follow from the hull approach, and callers must expect them.** Bare
+  keywords are invisible: `shipped_on is null` spans only `shipped_on`, because no token
+  is emitted for `IS NULL`. Punctuation is invisible too, but that one is repaired —
+  an unbalanced hull is grown back over the brackets its leaves left behind, so
+  `x in ('a','b')` does not lose its closing paren.
+- **Every span is optional.** Anything sqlglot synthesised rather than parsed — an alias
+  invented by `qualify_tables` — has no location at all. A missing span is normal, not
+  exceptional, and no renderer may assume one.
+
+**Extended**
+- UTF-16 column offsets, which is what LSP actually specifies; the current 0-based
+  character columns diverge on non-BMP characters.
+- Span arithmetic (contains, overlaps) for mapping an editor cursor back to a fact.
+
+## Module: `typemap`
+
+The type lattice, and the mapping of written type names onto it. Shared by
+`schema_resolution` (which reads type names out of casts) and `declared` (which reads them
+out of yml), because the two have to agree — a `cast(x as varchar)` and a
+`data_type: varchar(50)` must land on the same type or every comparison between inference
+and declaration is noise.
+
+**Basic**
+- `ResolvedType`: concrete types plus the families `number` and `numeric` (see
+  `schema_resolution` for why families exist).
+- `TYPE_COVER` / `widen`: the lattice, and the least upper bound of two types.
+- `compatible`: whether any concrete type satisfies both — the predicate a divergence
+  check is built on.
+- `normalize_type_name` / `resolve_type_name`: strip parameters and dialect spelling from
+  a written name, so `varchar(50)`, `NUMBER(38,0)` and `timestamp without time zone` all
+  resolve.
+
+**Extended**
+- Precision and scale, which are currently discarded — a generator eventually wants them.
+- Dialect-specific type sets rather than one union of every warehouse's spelling.
 
 ## Module: `config`
 
@@ -77,7 +154,8 @@ Knows what files exist and what kind they are. Pure filesystem knowledge, no par
 **Basic**
 - Walk the project root, find `.sql` files honoring include/exclude globs and `.gitignore`.
 - Detect a dbt project (`dbt_project.yml`) and locate `models/`, `seeds/`, `target/`.
-- Find `schema.yml` / `*.yml` files adjacent to models.
+- Find `*.yml` / `*.yaml` files anywhere in the project. Deciding which of them *mean*
+  anything is not this module's job — see `declared`.
 - Return a file inventory with mtimes and content hashes.
 
 **Extended**
@@ -103,6 +181,17 @@ Everything downstream consumes its output; nothing else parses SQL.
 - Classify every table reference as *internal* (another CTE) or *external* (a real source).
 - Collect column references per table.
 
+**Every fact is located.** Usage, predicates, joins, nullability and cardinality each
+carry two spans:
+
+- `span` — the column reference, for naming the column;
+- `context_span` — the expression that *constitutes* the evidence.
+
+The distinction matters more than it looks. `amount > 20` is the evidence; `amount` alone
+is not. A diagnostic that underlines the bare column name has thrown away the reason it
+had something to say. Predicates additionally locate each literal, and every source
+column keeps the span of every place the statement mentions it.
+
 **Extended**
 - Column-level lineage (which source column feeds which output column).
 - Extract join predicates — the raw material for relationship inference.
@@ -126,14 +215,91 @@ Produces a resolved schema per external table: the definitive column list and ty
 - Infer types from name patterns as a fallback (`*_id`, `*_at`, `is_*`).
 - Emit a warning per inferred column rather than guessing silently.
 - Handle raw sources with no metadata at all — SQL-derived schema only.
+- Nullability inference from `is null` / `coalesce` usage.
+
+### Nothing is discarded
+
+The governing rule of this module. Resolution picks one winner among competing pieces of
+type evidence, but **the losers survive**, each with the range that produced it.
+
+Collection and choice are therefore separate concerns: collection gathers everything a
+column's usage implies and throws none of it away; choice decides which of it wins. This
+is what lets a divergence report say more than "expected numeric" — it can point at the
+comparison that proves it, list the two other places that agree, and underline the yml
+line that disagrees. A single winning type cannot do any of that.
+
+Three consequences worth stating, because each was a real loss before:
+
+- **Join-group unification appends, it does not overwrite.** When `address.person_id`
+  inherits `person.id`'s type, the inherited type arrives as an *additional* piece of
+  evidence. Erasing the member's own evidence would leave nothing able to explain why the
+  group settled where it did.
+- **Name patterns are collected even when they lose.** At the lowest weight they change no
+  outcome, so this costs nothing — but a user reading a report gets to see that the
+  column's name agreed, or did not.
+- **Constraints keep their literals, their kinds and their positions.** `where col > 20`
+  has to survive as *"numeric, and the generated data must straddle 20, and the 20 was
+  written here"*. Collapsing it to `numeric` throws away two thirds of what it said, and
+  the fixture layer needs the other two thirds.
+
+Type evidence is weighted, and the heaviest wins. Evidence that does not name a type
+resolves to a **family** rather than a guess: `x * 12` and `x > 5` are equally true of an
+INT, a DECIMAL and a DOUBLE, so they yield `numeric` rather than a coin flip. Only
+evidence that names a type — a cast, a function with a fixed return type — yields a
+concrete one. Equally-weighted evidence that disagrees is widened together rather than
+arbitrated, and what was widened is recorded.
 
 **Extended**
 - Confidence scoring per column, with a threshold that triggers user prompts.
-- Type reconciliation when sources disagree (yml says string, usage implies date).
 - Emit a reviewable `schema.inferred.yml` so users can correct types once.
 - Warehouse `information_schema` as an authoritative source when a connection exists.
-- Nullability inference from `is null` / `coalesce` usage.
 - Struct/array/nested type support.
+- Evidence weights as configuration rather than constants, once there is field data on
+  which of them are actually load-bearing.
+
+## Module: `declared`
+
+Loads the types the user wrote down, as opposed to the types the analyser inferred.
+
+The format is **dbt's model schema yml, deliberately**. A project that already has
+`schema.yml` files gets checked with no extra authoring, and a project with no dbt at all
+can write the same thing. Only two fields are required of a column — `name` and
+`data_type` — so the cost of adopting it is close to zero.
+
+```yml
+models:
+  - name: orders          # matches orders.sql, by stem, as in dbt
+    columns:
+      - name: revenue
+        data_type: numeric
+```
+
+**Basic**
+- Discover every yml in the project (via `catalog`) and parse the ones with a top-level
+  `models:` list. That key is the discriminator: a yml without it is not ours and is
+  skipped in silence, not warned about.
+- Map each `data_type` onto the lattice via `typemap`; an unrecognised name resolves to
+  `unknown` and is reported rather than quietly ignored.
+- Match a model to a `.sql` file by stem, case-insensitively.
+- Tolerate malformed yml. A broken file is a problem with that file, not a reason to stop
+  analysing the SQL it was meant to describe.
+
+**Discovery is decoupled from interpretation.** `DeclarationProvider` is the seam: this
+module implements it over yml files, and a dbt `manifest.json` / `catalog.json` reader can
+implement it later without a single consumer changing. That separation is the whole point
+of the module existing rather than the yml parsing living inside `schema_resolution`.
+
+**Declarations are located too.** Parsing goes through `yaml.compose` rather than
+`yaml.safe_load`, because the composed node tree carries source marks and the plain loader
+throws them away. Without them a report could say a declaration was contradicted but not
+show where the declaration was written — which is half the information the user needs.
+
+**Extended**
+- dbt `manifest.json` / `catalog.json` as a second provider, ranked above hand-written yml.
+- dbt `sources:` blocks, not just `models:`.
+- Column-level tests (`accepted_values`, `not_null`) as constraint input, feeding
+  `constraints` rather than `diagnostics`.
+- Per-column `description` surfaced into generated fixture documentation.
 
 ## Module: `relationship_inference`
 
@@ -173,6 +339,13 @@ generation directly.
 - Range constraints from comparison predicates on dates and numbers.
 - Null requirements from `is null` / `is not null` filters.
 - Merge with user-declared constraints from config; user wins.
+
+**The raw material is already there.** `schema_resolution` emits a `ValueConstraint` per
+predicate carrying the operator, the literal values, their kind, and the position of each
+— so `where col > 20` arrives as *"numeric, straddle 20, written here"* rather than as
+`numeric`. Two identical predicates written in two places stay two constraints, because
+they are two hints about the data and two places to point at. What is missing is the
+merging and the satisfiability reasoning, not the extraction.
 
 **Extended**
 - Ingest dbt tests when present (`accepted_values`, `not_null`, `unique`,
@@ -322,20 +495,58 @@ Presents results and fixtures.
 ## Module: `diagnostics`
 
 Provenance, warnings, and the explain surface. Cross-cutting; every other module
-writes into it.
+writes into it. One channel, one renderer, one shape.
+
+A `Diagnostic` is deliberately more than a string. It carries a **primary location** to
+underline and a list of **related locations**, because the findings worth reporting are
+the ones with several sites: *"this is declared varchar but used as a number"* is only
+actionable when it can show the declaration and every contradicting use at once. The shape
+is chosen to convert to an LSP diagnostic without loss.
 
 **Basic**
-- Structured warning collection (inferred type, inferred relationship, unresolved column,
-  empty result).
-- `explain <table>.<column>` — print resolved type, constraints, generator, seed, and
-  why each was chosen.
+- Structured finding collection with severity, a stable code, a location and related
+  locations.
+- Adapters folding the analyser's loose `errors` / `warnings` / ambiguities into the same
+  channel, so nothing formats findings by hand.
+- Text rendering with a caret underline for the terminal.
+- `to_lsp` — 0-based LSP `Diagnostic` objects with `relatedInformation`.
 - Human-readable error messages for the common failures.
 
+### Type reconciliation
+
+The first real consumer, and the reason the module exists now rather than later. Two
+comparisons share one rule set:
+
+- the statement's **projection** against the declaration for its own model, since a
+  dbt-shaped `models:` entry describes what a `.sql` file produces;
+- each **source table** against the declaration for the model of that name — which catches
+  the interesting case, where `orders.sql` declares `revenue` a varchar and
+  `revenue_report.sql` writes `where revenue > 1000`.
+
+Rules that keep it quiet enough to be trusted:
+
+- A mismatch is reported **only when declared and inferred types have no concrete type in
+  common**. Declaring `integer` where `number` was inferred is not a disagreement:
+  inference widens to a family when the evidence does not distinguish, and the user's
+  declaration is the more specific of the two. Getting this wrong makes the tool cry wolf
+  on correct code, which is how a checker gets switched off.
+- **Severity scales with the weight of the winning evidence.** A cast contradicting a
+  declaration is an error — a cast names a type outright. A usage pattern is a warning. A
+  name pattern is a hint, because `*_at` losing to an explicit declaration is unremarkable.
+- A `*` suppresses "undeclared column" reports: under a star the attributed column list is
+  a subset of the real one, so absence from it proves nothing.
+- "Declared but not produced" applies only to a file's **own** model. An upstream table
+  declaring columns this file does not select is normal, and reporting it would bury the
+  real findings.
+
 **Extended**
+- `explain <table>.<column>` — print resolved type, constraints, generator, seed, and
+  why each was chosen. The evidence to do this already exists; only the command is missing.
 - `explain relationships` — the full inferred graph with evidence.
-- Map DuckDB binder errors back to source ranges (character offsets already exist from
-  `sql_analysis`), for the extension's diagnostics.
-- Suggested fixes attached to warnings.
+- Map DuckDB binder errors back to source ranges, for the extension's diagnostics.
+- Suggested fixes attached to findings — `data_type: numeric` as a one-click edit is the
+  obvious first one, and the mismatch diagnostic already knows the type it would suggest.
+- Suppression: a `# noqa`-style directive keyed on the diagnostic code.
 - Structured log output for the RPC transport.
 
 ## Module: `cli`
@@ -345,6 +556,8 @@ Command surface and dependency wiring. Deliberately thin.
 **Basic** — `typer`-based.
 - `run <file> [--cte NAME]` — the primary command.
 - `--config`, `--project`, `--seed`, `--rows`, `--scenario`, `--format`.
+- `--format text|json`, where `json` emits the LSP diagnostic shape.
+- `--strict` — exit non-zero when any diagnostic is an error, so the check is usable in CI.
 - `init` — write a starter config and run inference to produce `relationships.yml`.
 
 **Extended**
@@ -369,13 +582,22 @@ Not built initially, but the seam should exist from the start.
 
 A walking skeleton first, then depth:
 
-1. `config` + `catalog` — minimal: find the file, load a config.
-2. `sql_analysis` — CTE list and external table references only.
-3. `schema_resolution` — SQL-derived columns with naive type inference.
+1. ~~`config` + `catalog` — minimal: find the file, load a config.~~ **done**
+2. ~~`sql_analysis` — CTE list and external table references only.~~ **done**, and rather
+   more: full column lineage, located facts, predicate and join extraction.
+3. ~~`schema_resolution` — SQL-derived columns with naive type inference.~~ **done**,
+   with the evidence retained rather than collapsed.
 4. `providers` + `fixture_store` — one legible generator per type, write parquet.
 5. `execution` + `output` — register views, run the CTE, print a table.
 
 That's end-to-end value with no relationships, no constraints, no scenarios, no caching.
+
+`source`, `typemap`, `declared` and `diagnostics` were not in the original order. They
+arrived together, pulled in by one requirement — checking inference against declared types
+and reporting *where* they diverge — which turned out to need character ranges threaded
+through every fact in the pipeline. Doing that early was the right trade: retrofitting
+positions onto a fact model that had been built without them would have touched every
+module twice.
 
 Then, in rough order of payoff:
 
@@ -384,9 +606,12 @@ Then, in rough order of payoff:
 7. `constraints` (filter-aware generation) — the thing that stops results coming back empty.
 8. `generation_planner` fingerprints + column-level caching.
 9. `scenarios`.
-10. `diagnostics` / `explain`.
-11. `rpc` and the extension.
+10. `diagnostics` / `explain` — the collection surface exists; the `explain` commands do not.
+11. `rpc` and the extension. `to_lsp` already produces the shape it needs, which is a
+    deliberate hedge: it keeps the span work honest, because a range that does not slice
+    back to the offending text shows up immediately there.
 
 Steps 6 and 7 are the two that decide whether the tool is trusted or abandoned, and both
 depend on predicate extraction in `sql_analysis` — worth building that extraction well
-even though the walking skeleton doesn't need it.
+even though the walking skeleton doesn't need it. That extraction now also preserves the
+literals and their positions, which is what step 7 will actually generate from.

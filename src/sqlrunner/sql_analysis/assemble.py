@@ -17,6 +17,7 @@ See `__init__.py` for the pipeline as a whole.
 
 from __future__ import annotations
 
+from sqlrunner.source import NO_POSITIONS, Positions, SourceDoc, SourceSpan
 from sqlrunner.sql_analysis.facts import Facts
 from sqlrunner.sql_analysis.resolver import Resolver
 from sqlrunner.sql_analysis.relations import OutputCol, RelationGraph
@@ -35,11 +36,15 @@ from sqlrunner.sql_analysis.types import (
 
 
 def assemble(
-    graph: RelationGraph, resolver: Resolver, facts: Facts
+    graph: RelationGraph,
+    resolver: Resolver,
+    facts: Facts,
+    positions: Positions = NO_POSITIONS,
+    source: SourceDoc | None = None,
 ) -> SqlAnalysisResult:
     """Build the result. May raise `StarOverJoinAbort` via lazy resolution."""
-    relations = _build_relations(graph, resolver)
-    projection, projection_warnings = _build_projection(graph, resolver)
+    relations = _build_relations(graph, resolver, positions)
+    projection, projection_warnings = _build_projection(graph, resolver, positions)
 
     origins: list[ColumnOrigin] = list(facts.observed)
     for relation in relations:
@@ -49,6 +54,7 @@ def assemble(
         origins.extend(projected.origins)
 
     return SqlAnalysisResult(
+        source=source or SourceDoc(),
         relations=relations,
         sources=_build_sources(graph, origins),
         projection=projection,
@@ -65,7 +71,9 @@ def assemble(
 # ---- relations -----------------------------------------------------------------------
 
 
-def _build_relations(graph: RelationGraph, resolver: Resolver) -> list[Relation]:
+def _build_relations(
+    graph: RelationGraph, resolver: Resolver, positions: Positions
+) -> list[Relation]:
     relations: list[Relation] = []
     for ref in graph.order:
         info = graph.relations[ref]
@@ -78,20 +86,24 @@ def _build_relations(graph: RelationGraph, resolver: Resolver) -> list[Relation]
                 is_set_operation=info.is_setop,
                 depends_on=depends_on,
                 outputs=[
-                    _output_column(resolver, ref, output) for output in info.outputs
+                    _output_column(resolver, ref, output, positions)
+                    for output in info.outputs
                 ],
                 star_sources=list(info.star_sources),
+                span=positions.span_of(info.expression),
+                name_span=positions.span_of(info.name_expression),
             )
         )
     return relations
 
 
 def _output_column(
-    resolver: Resolver, ref: RelationRef, output: OutputCol
+    resolver: Resolver, ref: RelationRef, output: OutputCol, positions: Positions
 ) -> OutputColumn:
     origins: list[ColumnOrigin] = []
+    span = positions.span_of(output.expression)
     if output.kind != "star" and output.name is not None:
-        origins = resolver.resolve(ref, output.name).origins
+        origins = resolver.resolve(ref, output.name).at(span).origins
 
     return OutputColumn(
         name=output.name,
@@ -102,6 +114,8 @@ def _output_column(
         literal_kinds=list(output.literal_kinds),
         origins=origins,
         star_sources=list(output.star_sources),
+        span=span,
+        alias_span=positions.span_of(output.alias_expression),
     )
 
 
@@ -109,7 +123,7 @@ def _output_column(
 
 
 def _build_projection(
-    graph: RelationGraph, resolver: Resolver
+    graph: RelationGraph, resolver: Resolver, positions: Positions
 ) -> tuple[list[ProjectedColumn], list[str]]:
     info = graph.get(graph.root)
     if info is None:
@@ -128,8 +142,9 @@ def _build_projection(
     projection: list[ProjectedColumn] = []
     for ordinal, (owner, output) in enumerate(expanded):
         origins: list[ColumnOrigin] = []
+        span = positions.span_of(output.expression)
         if output.kind != "star" and output.name is not None:
-            origins = resolver.resolve(owner, output.name).origins
+            origins = resolver.resolve(owner, output.name).at(span).origins
         projection.append(
             ProjectedColumn(
                 name=output.name,
@@ -140,6 +155,8 @@ def _build_projection(
                 literal_kinds=list(output.literal_kinds),
                 origins=origins,
                 star_of=list(output.star_sources),
+                span=span,
+                alias_span=positions.span_of(output.alias_expression),
             )
         )
     return projection, warnings
@@ -152,6 +169,15 @@ def _build_sources(
     graph: RelationGraph, origins: list[ColumnOrigin]
 ) -> list[SourceTable]:
     columns: dict[str, dict[str, Confidence]] = {}
+    # Every distinct place a column was mentioned, first-seen order. A diagnostic about a
+    # column wants to underline all of them, not just the strongest one.
+    #
+    # Keyed by start offset rather than by whole span: one reference reaches this loop
+    # more than once at different widths - the bare `r.amount` from fact extraction and
+    # the enclosing `r.amount as total` from the SELECT list. They are the same mention,
+    # and the narrower one is the one worth underlining.
+    references: dict[tuple[str, str], dict[int, SourceSpan]] = {}
+
     for origin in origins:
         if origin.node.relation.kind != "table":
             continue
@@ -162,6 +188,14 @@ def _build_sources(
             or CONFIDENCE_RANK[origin.confidence] > CONFIDENCE_RANK[current]
         ):
             table[origin.node.column] = origin.confidence
+
+        if origin.span is not None:
+            seen = references.setdefault(
+                (origin.node.relation.name, origin.node.column), {}
+            )
+            widest = seen.get(origin.span.start)
+            if widest is None or origin.span.end < widest.end:
+                seen[origin.span.start] = origin.span
 
     starred = {
         ref.name
@@ -177,7 +211,16 @@ def _build_sources(
         SourceTable(
             name=name,
             columns=[
-                SourceColumn(name=column, confidence=confidence)
+                SourceColumn(
+                    name=column,
+                    confidence=confidence,
+                    references=[
+                        span
+                        for _, span in sorted(
+                            references.get((name, column), {}).items()
+                        )
+                    ],
+                )
                 for column, confidence in sorted(columns.get(name, {}).items())
             ],
             star_expanded=name in starred,

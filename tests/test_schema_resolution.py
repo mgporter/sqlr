@@ -5,6 +5,7 @@ import pytest
 from sqlrunner.schema_resolution import resolve_schema, widen
 from sqlrunner.schema_resolution.types import ColumnSchema, ResolvedType, StatementSchema
 from sqlrunner.sql_analysis import analyze_file, analyze_sql
+from sqlrunner.sql_analysis.types import ColumnNode, RelationRef
 
 FIXTURES = Path(__file__).parent / "fixtures"
 PERSON_SQL = FIXTURES / "person.sql"
@@ -195,7 +196,12 @@ def test_join_group_propagates_a_type_to_the_untyped_side() -> None:
     person_id = columns_of(schema, "orders")["person_id"]
     assert person_id.resolved_type == "string"
     assert person_id.source == "join_group"
-    assert person_id.evidence is not None and "joined to" in person_id.evidence
+    assert person_id.chosen is not None
+    assert person_id.chosen.detail is not None
+    assert "joined to" in person_id.chosen.detail
+    assert person_id.chosen.via == ColumnNode(
+        relation=RelationRef(kind="table", name="person"), column="id"
+    )
 
 
 def test_join_group_members_share_an_index() -> None:
@@ -231,7 +237,8 @@ def test_join_group_with_conflicting_member_types_is_widened() -> None:
     """
     schema = schema_for(sql)
 
-    assert [group for group in schema.join_groups] == [["cte:a.k", "cte:b.k"]]
+    assert [group.names for group in schema.join_groups] == [["cte:a.k", "cte:b.k"]]
+    assert schema.join_groups[0].unified_type == "number"
     projection = {column.name: column for column in schema.projection}
     assert projection["k"].resolved_type == "number"
 
@@ -292,7 +299,9 @@ def test_projection_types_follow_lineage_to_the_source() -> None:
     projection = {column.name: column for column in schema.projection}
     assert projection["age"].resolved_type == "numeric"
     assert projection["modified_at"].resolved_type == "timestamp"
-    assert projection["age"].origins == ["table:mydatabase.myschema.person.age"]
+    assert [str(origin) for origin in projection["age"].origins] == [
+        "table:mydatabase.myschema.person.age"
+    ]
 
 
 def test_derived_projection_type_comes_from_the_expression() -> None:
@@ -360,3 +369,249 @@ def test_datediff_projection_is_an_integer() -> None:
     projection = {column.name: column for column in schema.projection}
     assert projection["tenure"].resolved_type == "integer"
     assert projection["tenure"].source == "expression"
+
+
+# ---- evidence is kept, not just the winner -----------------------------------------
+#
+# The point of the refactor: inference still picks one type, but everything that argued
+# for a different one survives, located, so a divergence can be explained rather than
+# merely asserted.
+
+
+def test_losing_evidence_is_retained_and_ordered() -> None:
+    schema = schema_for(
+        "select id from orders\nwhere revenue > 1000 and revenue in ('a', 'b')"
+    )
+
+    revenue = columns_of(schema, "orders")["revenue"]
+    assert revenue.resolved_type == "string"
+    assert [(e.resolved_type, e.weight) for e in revenue.evidence] == [
+        ("string", 60),
+        ("numeric", 50),
+    ]
+    assert revenue.chosen is not None and revenue.chosen.resolved_type == "string"
+
+
+def test_evidence_carries_the_source_range_that_produced_it() -> None:
+    schema = schema_for("select id from orders\nwhere revenue > 1000")
+
+    revenue = columns_of(schema, "orders")["revenue"]
+    assert revenue.chosen is not None
+    assert schema.snippet(revenue.chosen.context_span) == "revenue > 1000"
+    assert schema.snippet(revenue.chosen.span) == "revenue"
+
+
+def test_name_pattern_is_collected_even_when_it_loses() -> None:
+    schema = schema_for("select id from orders where total_amount in ('a', 'b')")
+
+    column = columns_of(schema, "orders")["total_amount"]
+    assert column.resolved_type == "string"
+    kinds = {(e.kind, e.resolved_type) for e in column.evidence}
+    assert ("name_pattern", "numeric") in kinds
+    assert ("usage", "string") in kinds
+
+
+def test_join_group_unification_does_not_erase_member_evidence() -> None:
+    # The regression this refactor exists to prevent: unification used to overwrite the
+    # member's own evidence, so nothing could explain why the group settled where it did.
+    sql = """
+    select o.id
+    from orders o
+    join person p on p.id = o.person_id
+    where p.id in ('x', 'y')
+    """
+    schema = schema_for(sql)
+
+    person_id = columns_of(schema, "person")["id"]
+    assert person_id.resolved_type == "string"
+    assert any(e.kind == "usage" for e in person_id.evidence)
+
+    propagated = columns_of(schema, "orders")["person_id"]
+    assert propagated.resolved_type == "string"
+    assert any(e.kind == "join_group" for e in propagated.evidence)
+
+
+def test_equal_weight_disagreement_records_what_was_widened() -> None:
+    schema = schema_for(
+        "with a as (select cast(k as int) as k from t1),\n"
+        "     b as (select cast(k as decimal) as k from t2)\n"
+        "select a.k from a join b on a.k = b.k"
+    )
+
+    assert schema.join_groups[0].unified_type == "number"
+    assert schema.join_groups[0].facts, "the joins that linked the group are kept"
+
+
+def test_join_group_facts_are_located() -> None:
+    schema = schema_for(
+        "select o.id from orders o join person p on p.id = o.person_id"
+    )
+
+    [group] = schema.join_groups
+    [fact] = group.facts
+    assert schema.snippet(fact.context_span) == "p.id = o.person_id"
+
+
+# ---- constraints keep what a generator needs ---------------------------------------
+
+
+def test_constraints_keep_the_literal_kind() -> None:
+    schema = schema_for("select id from orders where qty > 20")
+
+    [constraint] = columns_of(schema, "orders")["qty"].constraints
+    assert (constraint.operator, constraint.values) == (">", ["20"])
+    assert constraint.literal_kind == "int"
+
+
+def test_constraints_are_located_for_every_literal() -> None:
+    schema = schema_for("select id from orders where status in ('a', 'b')")
+
+    [constraint] = columns_of(schema, "orders")["status"].constraints
+    assert schema.snippet(constraint.context_span) == "status in ('a', 'b')"
+    assert [schema.snippet(s) for s in constraint.value_spans] == ["'a'", "'b'"]
+
+
+def test_the_same_predicate_written_twice_is_kept_twice() -> None:
+    # Two places to underline, and two hints about the data to generate.
+    schema = schema_for("select id from orders where qty > 20 or qty > 20")
+
+    constraints = columns_of(schema, "orders")["qty"].constraints
+    assert len(constraints) == 2
+    assert constraints[0].context_span != constraints[1].context_span
+
+
+def test_an_identical_predicate_at_one_place_is_kept_once() -> None:
+    schema = schema_for("select id from orders where qty > 20")
+
+    assert len(columns_of(schema, "orders")["qty"].constraints) == 1
+
+
+# ---- nullability keeps its losing facts ---------------------------------------------
+
+
+def test_nullability_keeps_every_fact_including_the_ones_that_lost() -> None:
+    schema = resolve_schema(analyze_file(PERSON_SQL))
+
+    street = columns_of(schema, "mydatabase.myschema.address")["street"]
+    assert street.nullable is None
+    # `outer_join_padded` describes the join result, not the stored column, so it does
+    # not decide - but it is still available to anything that wants it.
+    assert [f.reason for f in street.nullability.facts] == ["outer_join_padded"]
+
+
+def test_the_deciding_nullability_fact_is_identified() -> None:
+    schema = schema_for("select id from orders where shipped_on is not null")
+
+    resolution = columns_of(schema, "orders")["shipped_on"].nullability
+    assert resolution.nullable is False
+    assert resolution.chosen is not None
+    assert resolution.chosen.reason == "is_not_null_predicate"
+
+
+# ---- column references and lookups --------------------------------------------------
+
+
+def test_columns_carry_every_reference() -> None:
+    schema = schema_for("select amount\nfrom orders\nwhere amount > 20")
+
+    amount = columns_of(schema, "orders")["amount"]
+    assert [schema.snippet(span) for span in amount.references] == ["amount", "amount"]
+
+
+def test_schema_lookup_helpers() -> None:
+    schema = schema_for("select id from orders where qty > 1")
+
+    assert schema.table("ORDERS") is not None
+    assert schema.column("orders", "QTY") is not None
+    assert schema.column("orders", "nope") is None
+
+
+def test_the_schema_carries_its_source() -> None:
+    schema = resolve_schema(analyze_file(PERSON_SQL))
+
+    assert schema.source.path == PERSON_SQL
+
+
+# ---- inferring input column types --------------------------------------------------
+#
+# These columns feed fixture generation, so leaving them `unknown` means there is nothing
+# to generate from. Each case below was previously untyped.
+
+
+def test_equality_with_a_string_literal_types_the_column() -> None:
+    cols = _columns_by_name("select id from orders where country = 'US'")
+
+    assert cols["country"] == ("string", "usage")
+
+
+def test_string_concatenation_types_its_operands() -> None:
+    schema = schema_for("select street || ', ' || city as full_address from address")
+
+    columns = columns_of(schema, "address")
+    assert columns["street"].resolved_type == "string"
+    assert columns["city"].resolved_type == "string"
+
+
+def test_a_string_function_types_its_input_column() -> None:
+    cols = _columns_by_name("select upper(code) as code from orders")
+
+    assert cols["code"] == ("string", "usage")
+
+
+def test_a_numeric_function_types_its_input_column() -> None:
+    cols = _columns_by_name("select round(rate, 2) as rate from orders")
+
+    assert cols["rate"] == ("numeric", "usage")
+
+
+def test_a_string_function_and_a_name_pattern_are_both_kept() -> None:
+    # The user should see that both agreed, not just that the answer was `string`.
+    schema = schema_for("select upper(department_name) as department_name from d")
+
+    column = columns_of(schema, "d")["department_name"]
+    assert column.resolved_type == "string"
+    assert [(e.kind, e.detail) for e in column.evidence] == [
+        ("usage", "string_function"),
+        ("name_pattern", "*_name"),
+    ]
+
+
+def test_usage_evidence_outranks_the_name_pattern_that_agrees_with_it() -> None:
+    schema = schema_for("select upper(department_name) as department_name from d")
+
+    column = columns_of(schema, "d")["department_name"]
+    assert column.chosen is not None
+    assert column.chosen.kind == "usage"
+
+
+# ---- no duplicate evidence ----------------------------------------------------------
+
+
+def test_a_derived_projection_carries_its_expression_evidence_once() -> None:
+    # The derived column is typed once as its relation's output; the projection resolves
+    # to that same node. Deriving the expression evidence a second time here would report
+    # one `upper(...)` as two independent observations.
+    schema = schema_for("select upper(name) as name from t")
+
+    [projected] = [p for p in schema.projection if p.name == "name"]
+    functions = [e for e in projected.evidence if e.kind == "function"]
+    assert len(functions) == 1
+    assert functions[0].detail == "Upper"
+
+
+def test_a_cast_projection_carries_its_evidence_once() -> None:
+    schema = schema_for("select cast(salary as decimal(10, 2)) as salary from t")
+
+    [projected] = [p for p in schema.projection if p.name == "salary"]
+    assert len([e for e in projected.evidence if e.kind == "cast"]) == 1
+    assert projected.resolved_type == "decimal"
+
+
+def test_two_separate_uses_of_one_kind_are_both_kept() -> None:
+    # Deduplication must not collapse genuinely distinct observations.
+    schema = schema_for("select id from orders\nwhere qty > 1 and qty > 5")
+
+    column = columns_of(schema, "orders")["qty"]
+    numeric = [e for e in column.evidence if e.detail == "compared_to_number"]
+    assert len(numeric) == 2
+    assert numeric[0].span != numeric[1].span

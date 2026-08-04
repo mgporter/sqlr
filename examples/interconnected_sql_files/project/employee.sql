@@ -13,7 +13,7 @@ current_employee as (
     lower(email) as email,
     cast(salary as decimal(10, 2)) as salary,
     salary * 12 as annual_salary,
-    coalesce(bonus, 0) as bonus,
+    ifnull(bonus, 0) as bonus,
     hire_date,
     datediff(year, hire_date, current_date()) as tenure_years
   from deduped

@@ -33,6 +33,7 @@ import sqlglot
 from sqlglot.errors import ParseError, SqlglotError
 from sqlglot.optimizer.qualify_tables import qualify_tables
 
+from sqlrunner.source import Positions, SourceDoc
 from sqlrunner.sql_analysis.assemble import assemble
 from sqlrunner.sql_analysis.facts import extract_facts
 from sqlrunner.sql_analysis.resolver import (
@@ -59,6 +60,7 @@ def analyze_file(
         Path(path).read_text(),
         dialect=dialect,
         star_over_join_behavior=star_over_join_behavior,
+        path=Path(path),
     )
 
 
@@ -66,67 +68,79 @@ def analyze_sql(
     sql: str,
     dialect: str | None = None,
     star_over_join_behavior: StarOverJoinBehavior = DEFAULT_STAR_OVER_JOIN_BEHAVIOR,
+    path: Path | None = None,
 ) -> SqlAnalysisResult:
+    source = SourceDoc(path=path, text=sql)
+
+    # One index for the whole document: sqlglot's character offsets are absolute, so they
+    # stay valid across every statement in the file.
+    positions = Positions(sql)
+
     # Step 1: parse.
     try:
         statements = sqlglot.parse(sql, read=dialect)
     except ParseError as e:
-        return SqlAnalysisResult(errors=[str(e)])
+        return SqlAnalysisResult(source=source, errors=[str(e)])
 
     sqlAnalysisResults: list[SqlAnalysisResult] = []
 
     for statement in statements:
-        if statement is None: 
+        if statement is None:
             continue
 
         try:
-            # qualify table names.
+            # qualify table names. `.copy()` and `qualify_tables` both preserve the
+            # position metadata on leaf tokens, so spans survive this.
             qualified = qualify_tables(statement.copy())
 
             # Step 2: build the relation graph.
             graph = build_graph(qualified)
 
         except SqlglotError as e:
-            return SqlAnalysisResult(errors=[str(e)])
+            return SqlAnalysisResult(source=source, errors=[str(e)])
 
         # Step 3: build the resolver. Nothing is resolved yet; steps 4 and 5 query it.
         resolver = Resolver(
             graph,
             star_over_join_behavior=star_over_join_behavior,
             dialect=dialect,
+            positions=positions,
         )
 
         sqlAnalysisResult: SqlAnalysisResult
 
         try:
             # Step 4 - extract the facts
-            facts = extract_facts(graph, resolver)
+            facts = extract_facts(graph, resolver, positions)
 
             # Step 5 - assemble the result
-            sqlAnalysisResult = assemble(graph, resolver, facts)
+            sqlAnalysisResult = assemble(graph, resolver, facts, positions, source)
         except StarOverJoinAbort as e:
-            sqlAnalysisResult = SqlAnalysisResult(errors=[str(e)])
+            sqlAnalysisResult = SqlAnalysisResult(source=source, errors=[str(e)])
 
         sqlAnalysisResults.append(sqlAnalysisResult)
 
     # Step 6: merge and return.
-    return _merge(sqlAnalysisResults)
+    return _merge(sqlAnalysisResults, source)
 
 
 
 # ---- step 6: merge -------------------------------------------------------------------
 
 
-def _merge(results: list[SqlAnalysisResult]) -> SqlAnalysisResult:
+def _merge(
+    results: list[SqlAnalysisResult], source: SourceDoc
+) -> SqlAnalysisResult:
     if not results:
-        return SqlAnalysisResult()
+        return SqlAnalysisResult(source=source)
     if len(results) == 1:
         return results[0]
 
     merged = SqlAnalysisResult(
+        source=source,
         warnings=[
             "file contains multiple statements; projection reflects the last statement"
-        ]
+        ],
     )
     sources: dict[str, SourceTable] = {}
 
@@ -143,22 +157,28 @@ def _merge(results: list[SqlAnalysisResult]) -> SqlAnalysisResult:
         if result.projection:
             merged.projection = result.projection
 
-        for source in result.sources:
-            existing = sources.get(source.name)
+        for table in result.sources:
+            existing = sources.get(table.name)
             if existing is None:
-                sources[source.name] = source.model_copy(deep=True)
+                sources[table.name] = table.model_copy(deep=True)
                 continue
-            existing.star_expanded = existing.star_expanded or source.star_expanded
+            existing.star_expanded = existing.star_expanded or table.star_expanded
             by_name = {column.name: column for column in existing.columns}
-            for column in source.columns:
+            for column in table.columns:
                 current = by_name.get(column.name)
                 if current is None:
-                    by_name[column.name] = column.model_copy()
-                elif (
+                    by_name[column.name] = column.model_copy(deep=True)
+                    continue
+                if (
                     CONFIDENCE_RANK[column.confidence]
                     > CONFIDENCE_RANK[current.confidence]
                 ):
                     current.confidence = column.confidence
+                # Offsets are absolute across the file, so references from a later
+                # statement are directly comparable with earlier ones.
+                current.references.extend(
+                    span for span in column.references if span not in current.references
+                )
             existing.columns = [by_name[name] for name in sorted(by_name)]
 
     merged.sources = [sources[name] for name in sorted(sources)]

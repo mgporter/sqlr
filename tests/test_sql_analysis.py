@@ -600,3 +600,250 @@ def test_person_example_is_clean_under_both_behaviors(behavior: str) -> None:
 
     assert result.errors == []
     assert len(result.projection) == 7
+
+
+# ---- source spans ------------------------------------------------------------------
+#
+# Every fact has to be pointable back at the SQL that produced it, or the divergence
+# diagnostics downstream have nothing to underline. These assert by round-trip: a span
+# is right when slicing the source with it returns what the span claims to cover.
+
+
+def test_the_result_carries_its_source() -> None:
+    result = analyze_file(PERSON_SQL)
+
+    assert result.source.path == PERSON_SQL
+    assert result.source.text.startswith("with")
+
+
+def test_analyze_sql_has_no_path_but_keeps_the_text() -> None:
+    result = analyze_sql("select a from t")
+
+    assert result.source.path is None
+    assert result.source.text == "select a from t"
+
+
+def test_predicate_spans_cover_the_reference_and_the_comparison() -> None:
+    result = analyze_sql("select id\nfrom orders\nwhere amount > 20")
+
+    [predicate] = [p for p in result.predicates if p.node.column == "amount"]
+    assert result.snippet(predicate.span) == "amount"
+    assert result.snippet(predicate.context_span) == "amount > 20"
+    assert [result.snippet(s) for s in predicate.value_spans] == ["20"]
+
+
+def test_predicate_value_spans_locate_every_literal() -> None:
+    result = analyze_sql("select id from orders where status in ('a', 'b')")
+
+    [predicate] = [p for p in result.predicates if p.node.column == "status"]
+    assert [result.snippet(s) for s in predicate.value_spans] == ["'a'", "'b'"]
+
+
+def test_usage_context_span_is_the_expression_not_the_column() -> None:
+    result = analyze_sql("select salary * 12 as annual from staff")
+
+    [usage] = [u for u in result.usages if u.node.column == "salary"]
+    assert result.snippet(usage.span) == "salary"
+    assert result.snippet(usage.context_span) == "salary * 12"
+
+
+def test_join_fact_locates_both_sides_and_the_equality() -> None:
+    result = analyze_sql(
+        "select o.id from orders o join person p on p.id = o.person_id"
+    )
+
+    [join] = result.joins
+    assert result.snippet(join.left_span) == "p.id"
+    assert result.snippet(join.right_span) == "o.person_id"
+    assert result.snippet(join.context_span) == "p.id = o.person_id"
+
+
+def test_nullability_fact_is_located() -> None:
+    result = analyze_sql("select id from orders where shipped_on is null")
+
+    [fact] = [f for f in result.nullability if f.reason == "is_null_predicate"]
+    assert result.snippet(fact.span) == "shipped_on"
+    # `IS NULL` is bare keywords - sqlglot positions no token for them, so the hull of
+    # the predicate is just the column. The location is still correct, only narrower
+    # than the text a reader would call "the predicate".
+    assert result.snippet(fact.context_span) == "shipped_on"
+
+
+def test_outer_join_nullability_points_at_the_join() -> None:
+    result = analyze_sql(
+        "select p.id, a.street from person p left join address a on a.person_id = p.id"
+    )
+
+    [fact] = [
+        f
+        for f in result.nullability
+        if f.reason == "outer_join_padded" and f.node.column == "street"
+    ]
+    assert result.snippet(fact.span) == "a.street"
+    # The context is the join that does the padding. The `LEFT JOIN` keywords carry no
+    # position, so the span starts at the first token that does.
+    assert result.snippet(fact.context_span) == "address a on a.person_id = p.id"
+
+
+def test_cardinality_spans_are_parallel_to_the_nodes() -> None:
+    result = analyze_sql("select region, count(*) from sales group by region")
+
+    [fact] = [f for f in result.cardinality if f.kind == "group_by"]
+    assert len(fact.spans) == len(fact.nodes)
+    assert [result.snippet(s) for s in fact.spans] == ["region"]
+
+
+def test_source_column_records_every_mention() -> None:
+    result = analyze_sql(
+        "select amount\nfrom orders\nwhere amount > 20 and amount < 90"
+    )
+
+    [column] = [c for c in result.sources[0].columns if c.name == "amount"]
+    assert [result.snippet(span) for span in column.references] == [
+        "amount",
+        "amount",
+        "amount",
+    ]
+    # Distinct positions, not the same one recorded three times.
+    assert len({span.start for span in column.references}) == 3
+
+
+def test_a_mention_is_recorded_once_at_its_narrowest() -> None:
+    # `r.amount` arrives both bare from fact extraction and wrapped as
+    # `r.amount as total` from the SELECT list. That is one mention, not two.
+    result = analyze_sql(
+        "with r as (select amount from orders) select r.amount as total from r"
+    )
+
+    [column] = [c for c in result.sources[0].columns if c.name == "amount"]
+    assert [result.snippet(span) for span in column.references] == [
+        "amount",
+        "r.amount",
+    ]
+
+
+def test_relation_span_covers_the_cte_body() -> None:
+    result = analyze_sql(
+        "with recent as (\n  select id from orders\n)\nselect id from recent"
+    )
+
+    [cte] = [r for r in result.relations if r.ref.kind == "cte"]
+    assert result.snippet(cte.name_span) == "recent"
+    assert "from orders" in (result.snippet(cte.span) or "")
+
+
+def test_output_column_spans_cover_the_select_item_and_its_alias() -> None:
+    result = analyze_sql("select sum(amount) as total from orders")
+
+    [projected] = [p for p in result.projection if p.name == "total"]
+    assert result.snippet(projected.span) == "sum(amount) as total"
+    assert result.snippet(projected.alias_span) == "total"
+
+
+def test_ambiguity_is_located() -> None:
+    result = analyze_sql(
+        "with j as (select * from a join b on a.id = b.a_id) select city from j"
+    )
+
+    [ambiguity] = [a for a in result.ambiguities if a.column == "city"]
+    assert ambiguity.span is not None
+    assert ambiguity.line == 1
+
+
+def test_offsets_stay_absolute_across_multiple_statements() -> None:
+    sql = "select a from t1 where a > 1;\nselect b from t2 where b > 2;"
+    result = analyze_sql(sql)
+
+    for predicate in result.predicates:
+        # The whole file is one coordinate space, so every span slices correctly.
+        assert result.snippet(predicate.span) == predicate.node.column
+
+    [second] = [p for p in result.predicates if p.node.column == "b"]
+    assert second.span is not None and second.span.start_line == 1
+
+
+# ---- usage classification ------------------------------------------------------------
+
+
+def test_comparison_to_a_string_literal_is_string_evidence() -> None:
+    # The mirror of `compared_to_number`, and of `in ('a','b')` which was always
+    # string evidence. Its absence left equality-filtered columns untyped.
+    result = analyze_sql("select id from orders where country = 'US'")
+
+    [usage] = [u for u in result.usages if u.node.column == "country"]
+    assert usage.kind == "compared_to_string"
+    assert result.snippet(usage.context_span) == "country = 'US'"
+
+
+def test_comparison_to_a_string_literal_works_reversed() -> None:
+    result = analyze_sql("select id from orders where 'US' = country")
+
+    [usage] = [u for u in result.usages if u.node.column == "country"]
+    assert usage.kind == "compared_to_string"
+
+
+def test_comparison_to_a_column_is_not_type_evidence() -> None:
+    result = analyze_sql("select id from orders o join p on o.a = p.b")
+
+    assert [u for u in result.usages if u.kind == "compared_to_string"] == []
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select upper(name) from t",
+        "select lower(name) from t",
+        "select trim(name) from t",
+        "select length(name) from t",
+        "select name || 'x' from t",
+    ],
+)
+def test_a_string_function_types_its_argument(sql: str) -> None:
+    # `FUNCTION_TYPE_MAP` types what a call *returns*. This is the other direction: what
+    # the call requires of what goes in. Nothing else can type these columns, because
+    # the resolver stops at the derived column the call produces.
+    result = analyze_sql(sql)
+
+    [usage] = [u for u in result.usages if u.node.column == "name"]
+    assert usage.kind == "string_function"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select abs(qty) from t",
+        "select floor(qty) from t",
+        "select sqrt(qty) from t",
+        "select round(qty, 2) from t",
+    ],
+)
+def test_a_numeric_function_types_its_argument(sql: str) -> None:
+    result = analyze_sql(sql)
+
+    [usage] = [u for u in result.usages if u.node.column == "qty"]
+    assert usage.kind == "numeric_function"
+
+
+def test_only_the_first_argument_of_substring_is_a_string() -> None:
+    # The others are offsets. Typing them string would be worse than saying nothing.
+    result = analyze_sql("select substring(name, start_pos, run_length) from t")
+
+    kinds = {u.node.column: u.kind for u in result.usages}
+    assert kinds.get("name") == "string_function"
+    assert "start_pos" not in kinds
+    assert "run_length" not in kinds
+
+
+def test_only_the_first_argument_of_round_is_numeric() -> None:
+    result = analyze_sql("select round(amount, places) from t")
+
+    kinds = {u.node.column: u.kind for u in result.usages}
+    assert kinds.get("amount") == "numeric_function"
+    assert "places" not in kinds
+
+
+def test_a_date_function_still_wins_over_the_argument_rules() -> None:
+    result = analyze_sql("select date_trunc('day', created) from t")
+
+    [usage] = [u for u in result.usages if u.node.column == "created"]
+    assert usage.kind == "date_function"

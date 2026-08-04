@@ -20,11 +20,11 @@ from typing import Literal
 
 from sqlglot import exp
 
+from sqlrunner.source import NO_POSITIONS, Positions, SourceSpan
 from sqlrunner.sql_analysis.relations import (
     InputRef,
     RelationGraph,
     RelationInfo,
-    line_of,
     ordered_dedupe,
 )
 from sqlrunner.sql_analysis.types import (
@@ -56,13 +56,14 @@ class StarOverJoinAbort(Exception):
         column: str,
         candidates: list[RelationRef],
         snippet: str,
-        line: int | None,
+        span: SourceSpan | None,
     ) -> None:
         self.relation = relation
         self.column = column
         self.candidates = candidates
         self.snippet = snippet
-        self.line = line
+        self.span = span
+        line = None if span is None else span.start_line + 1
         location = f" at line {line}" if line is not None else ""
         names = ", ".join(candidate.name for candidate in candidates)
         super().__init__(
@@ -82,6 +83,12 @@ class Resolution:
     nodes: list[ColumnNode] = field(default_factory=list[ColumnNode])
     confidence: Confidence = "explicit"
     status: ResolutionStatus = "resolved"
+    span: SourceSpan | None = None
+    """Where the reference being resolved was written, when a caller supplied one.
+
+    Memoised resolutions are shared between call sites, so this is never cached - it is
+    attached by `at()` after the fact.
+    """
 
     @property
     def resolved(self) -> bool:
@@ -90,8 +97,13 @@ class Resolution:
     @property
     def origins(self) -> list[ColumnOrigin]:
         return [
-            ColumnOrigin(node=node, confidence=self.confidence) for node in self.nodes
+            ColumnOrigin(node=node, confidence=self.confidence, span=self.span)
+            for node in self.nodes
         ]
+
+    def at(self, span: SourceSpan | None) -> Resolution:
+        """A copy located at `span`. Never mutates, because `_memo` shares instances."""
+        return Resolution(self.nodes, self.confidence, self.status, span)
 
 
 UNRESOLVED = Resolution(nodes=[], confidence="explicit", status="unresolved")
@@ -103,10 +115,12 @@ class Resolver:
         graph: RelationGraph,
         star_over_join_behavior: StarOverJoinBehavior = "guess",
         dialect: str | None = None,
+        positions: Positions = NO_POSITIONS,
     ) -> None:
         self.graph = graph
         self.behavior = star_over_join_behavior
         self.dialect = dialect
+        self.positions = positions
         self.ambiguities: list[Ambiguity] = []
         self._memo: dict[tuple[RelationRef, str], Resolution] = {}
         self._active: set[tuple[RelationRef, str]] = set()
@@ -121,13 +135,14 @@ class Resolver:
         self, info: RelationInfo, column: exp.Column
     ) -> Resolution:
         """Resolve a column reference written inside `info`'s scope."""
+        span = self.positions.span_of(column)
         bound = self.bind_alias(info, column.table or None, column.name, column)
         if bound is None:
-            return UNRESOLVED
+            return UNRESOLVED.at(span)
         ref, confidence = bound
         result = self.resolve(ref, column.name)
         return Resolution(
-            result.nodes, weakest(confidence, result.confidence), result.status
+            result.nodes, weakest(confidence, result.confidence), result.status, span
         )
 
     def resolve(self, ref: RelationRef, column: str) -> Resolution:
@@ -357,7 +372,7 @@ class Resolver:
                 column=column,
                 candidates=candidates,
                 snippet=self._snippet(info),
-                line=self._star_line(info),
+                span=self._star_span(info),
             )
 
         self._record(
@@ -401,13 +416,14 @@ class Resolver:
             lines = lines[:SNIPPET_MAX_LINES] + ["  ..."]
         return "\n".join(f"    {line}" for line in lines)
 
-    def _star_line(self, info: RelationInfo) -> int | None:
+    def _star_span(self, info: RelationInfo) -> SourceSpan | None:
+        """The `*` that forced the guess, falling back to the whole relation."""
         for output in info.outputs:
-            if output.kind == "star" and output.expression is not None:
-                line = line_of(output.expression)
-                if line is not None:
-                    return line
-        return line_of(info.expression) if info.expression is not None else None
+            if output.kind == "star":
+                span = self.positions.span_of(output.expression)
+                if span is not None:
+                    return span
+        return self.positions.span_of(info.expression)
 
     # ---- diagnostics ----------------------------------------------------------
 
@@ -427,9 +443,9 @@ class Resolver:
             return
         self._recorded.add(key)
 
-        line = line_of(expression) if expression is not None else None
-        if line is None and reason == "star_over_join":
-            line = self._star_line(info)
+        span = self.positions.span_of(expression)
+        if span is None and reason == "star_over_join":
+            span = self._star_span(info)
 
         self.ambiguities.append(
             Ambiguity(
@@ -440,6 +456,6 @@ class Resolver:
                 resolution=resolution,
                 chosen=chosen,
                 confidence=confidence,
-                line=line,
+                span=span,
             )
         )

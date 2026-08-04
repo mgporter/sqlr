@@ -12,7 +12,7 @@ current_address as (
     city,
     state,
     zip,
-    street || ', ' || city || ', ' || state || ' ' || zip as full_address
+    cast(street as varchar) || ', ' || city || ', ' || state || ' ' || zip as full_address
   from ranked
   where rn = 1
 )
