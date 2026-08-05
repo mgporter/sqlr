@@ -18,18 +18,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sqlrunner.declared.types import DeclaredColumn, DeclaredModel, DeclaredSchemas
-from sqlrunner.diagnostics import codes
-from sqlrunner.diagnostics.types import Diagnostic, Location, Related, Severity
-from sqlrunner.schema_resolution.types import (
+from sqlr.declared.types import DeclaredColumn, DeclaredModel, DeclaredSchemas
+from sqlr.diagnostics import codes
+from sqlr.diagnostics.types import Diagnostic, Location, Related, Severity
+from sqlr.schema_resolution.types import (
     ColumnSchema,
     ResolvedType,
     StatementSchema,
     TypeEvidence,
 )
-from sqlrunner.source import SourceDoc, SourceSpan
-from sqlrunner.sql_analysis.types import Ambiguity
-from sqlrunner.typemap import compatible
+from sqlr.source import SourceDoc, SourceSpan
+from sqlr.sql_analysis.types import Ambiguity
+from sqlr.typemap import compatible
 
 # Above this, the evidence names a type outright - a cast, or a function whose return
 # type the dialect fixes. Contradicting one of those is a real error.
@@ -99,7 +99,7 @@ def _check_table(
                 declaration=declaration,
                 table=table,
                 name=column.name,
-                resolved=column.type,
+                resolved=column.resolved_type,
                 location=column.location,
             )
         )
@@ -123,7 +123,7 @@ def _check_projection(
                 declaration=declaration,
                 table=model.name,
                 name=column.name,
-                resolved=column.type,
+                resolved=column.resolved_type,
                 location=column.location,
             )
         )
@@ -146,7 +146,7 @@ def _compare(
                 severity="warning",
                 message=(
                     f"{table}.{name} is declared {declaration.written_type!r}, which is not "
-                    f"a type sqlrunner recognises; it cannot be checked or generated"
+                    f"a type sqlr recognises; it cannot be checked or generated"
                 ),
                 location=Location.of(model.source, declaration.type_span),
                 table=table,
@@ -361,7 +361,7 @@ def unresolved_types(
     for table in schema.tables:
         model = declared.for_model(_model_name(table.name))
         for column in table.columns:
-            if column.type.type_name != "unknown":
+            if column.resolved_type.type_name != "unknown":
                 continue
             if model is not None and model.column(column.name) is not None:
                 # Declared, so it is typed after all - just not by the SQL.

@@ -4,10 +4,10 @@ from pathlib import Path
 
 import typer
 
-from sqlrunner import config as config_module
-from sqlrunner.catalog import find_sql_files, find_yaml_files
-from sqlrunner.declared import load_declared_schemas
-from sqlrunner.diagnostics import (
+from sqlr import config as config_module
+from sqlr.catalog import find_sql_files, find_yaml_files
+from sqlr.declared import load_declared_schemas
+from sqlr.diagnostics import (
     DiagnosticReport,
     check_schema,
     codes,
@@ -16,12 +16,12 @@ from sqlrunner.diagnostics import (
     to_lsp,
     unresolved_types,
 )
-from sqlrunner.diagnostics.types import Diagnostic, Location
-from sqlrunner.schema_resolution import resolve_schema
-from sqlrunner.sql_analysis import analyze_file
+from sqlr.diagnostics.types import Diagnostic, Location
+from sqlr.schema_resolution import resolve_schema
+from sqlr.sql_analysis import analyze_file
 
 app = typer.Typer()
-logger = logging.getLogger("sqlrunner")
+logger = logging.getLogger("sqlr")
 
 
 def _configure_logging(verbose: bool) -> None:

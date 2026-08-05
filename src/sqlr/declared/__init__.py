@@ -29,10 +29,10 @@ from typing import Protocol, cast
 
 import yaml
 
-from sqlrunner.catalog.types import FileInventory
-from sqlrunner.declared.types import DeclaredColumn, DeclaredModel, DeclaredSchemas
-from sqlrunner.source import Positions, SourceDoc, SourceSpan
-from sqlrunner.typemap import resolve_type_name
+from sqlr.catalog.types import FileInventory
+from sqlr.declared.types import DeclaredColumn, DeclaredModel, DeclaredSchemas
+from sqlr.source import Positions, SourceDoc, SourceSpan
+from sqlr.typemap import resolve_type_name
 
 MODELS_KEY = "models"
 """The discriminator. A yml without it is not ours and is skipped in silence."""

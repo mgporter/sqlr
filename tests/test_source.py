@@ -6,7 +6,7 @@ span was supposed to cover.
 import sqlglot
 from sqlglot import exp
 
-from sqlrunner.source import NO_POSITIONS, Positions, SourceDoc
+from sqlr.source import NO_POSITIONS, Positions, SourceDoc
 
 
 def _column(sql: str, name: str) -> exp.Column:

@@ -2,7 +2,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from sqlrunner.config.defaults import (
+from sqlr.config.defaults import (
     DEFAULT_FIXTURE_DIRECTORY,
     DEFAULT_ROW_COUNT,
     DEFAULT_SEED,
@@ -33,6 +33,6 @@ class GeneralConfig(BaseModel):
     star_over_join_behavior: StarOverJoinBehavior = DEFAULT_STAR_OVER_JOIN_BEHAVIOR  # type: ignore[assignment]
 
 
-class SQLRunnerConfig(BaseModel):
+class SqlrConfig(BaseModel):
     version: int = DEFAULT_VERSION
     general: GeneralConfig = Field(default_factory=GeneralConfig)

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sqlrunner.catalog import find_sql_files
+from sqlr.catalog import find_sql_files
 
 
 def _write(path: Path, content: str = "select 1") -> None:

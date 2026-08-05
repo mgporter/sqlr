@@ -13,8 +13,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from sqlrunner.source import SourceDoc, SourceSpan
-from sqlrunner.sql_analysis.types import (
+from sqlr.source import SourceDoc, SourceSpan
+from sqlr.sql_analysis.types import (
     ColumnNode,
     Confidence,
     JoinFact,
@@ -22,7 +22,7 @@ from sqlrunner.sql_analysis.types import (
     NullabilityFact,
     PredicateOperator,
 )
-from sqlrunner.typemap import ResolvedTypeName
+from sqlr.typemap import ResolvedTypeName
 
 __all__ = [
     "ColumnSchema",
@@ -135,7 +135,7 @@ class NullabilityResolution(BaseModel):
 
 class ColumnSchema(BaseModel):
     name: str
-    type: ResolvedType = Field(default_factory=ResolvedType)
+    resolved_type: ResolvedType = Field(default_factory=ResolvedType)
     confidence: Confidence = "explicit"
     """How confidently the column was attributed to this table, not to its type."""
     nullability: NullabilityResolution = Field(default_factory=NullabilityResolution)
@@ -152,8 +152,8 @@ class ColumnSchema(BaseModel):
     @property
     def location(self) -> SourceSpan | None:
         """Best single place to point at when reporting about this column."""
-        if self.type.location is not None:
-            return self.type.location
+        if self.resolved_type.location is not None:
+            return self.resolved_type.location
         return self.references[0] if self.references else None
 
 
@@ -171,7 +171,7 @@ class ProjectionSchema(BaseModel):
     name: str | None
     """None for a projected column with no alias sqlglot could name."""
     ordinal: int
-    type: ResolvedType = Field(default_factory=ResolvedType)
+    resolved_type: ResolvedType = Field(default_factory=ResolvedType)
     origins: list[ColumnNode] = []
     span: SourceSpan | None = None
     alias_span: SourceSpan | None = None
@@ -179,7 +179,7 @@ class ProjectionSchema(BaseModel):
     @property
     def location(self) -> SourceSpan | None:
         """Best single place to point at when reporting about this column."""
-        return self.type.location or self.span
+        return self.resolved_type.location or self.span
 
 
 class JoinGroup(BaseModel):

@@ -20,14 +20,14 @@ from typing import Literal
 
 from sqlglot import exp
 
-from sqlrunner.source import NO_POSITIONS, Positions, SourceSpan
-from sqlrunner.sql_analysis.relations import (
+from sqlr.source import NO_POSITIONS, Positions, SourceSpan
+from sqlr.sql_analysis.relations import (
     InputRef,
     RelationGraph,
     RelationInfo,
     ordered_dedupe,
 )
-from sqlrunner.sql_analysis.types import (
+from sqlr.sql_analysis.types import (
     CONFIDENCE_RANK,
     Ambiguity,
     AmbiguityReason,

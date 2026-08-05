@@ -1,4 +1,4 @@
-# sqlrunner — High-Level Design
+# sqlr — High-Level Design
 
 A CLI that runs an individual CTE (or a whole `.sql` file) locally in DuckDB against
 automatically generated, deterministic, human-inspectable fixture data.
@@ -133,8 +133,8 @@ Loads and merges layered configuration; owns the project root.
 
 **Basic**
 - Resolve project root: explicit `--project` flag, else path from a config file, else
-  nearest ancestor containing a marker (`.git`, `dbt_project.yml`, `sqlrunner.yml`).
-- Load a single `sqlrunner.yml`, validate with Pydantic, produce a typed config object.
+  nearest ancestor containing a marker (`.git`, `dbt_project.yml`, `sqlr.yml`).
+- Load a single `sqlr.yml`, validate with Pydantic, produce a typed config object.
 - Accept an explicit config path from the CLI.
 - Basic settings: default row count, seed, fixture directory, sql file globs.
 
@@ -313,7 +313,7 @@ cannot be assumed.
   presence of a uniqueness signal, `group by` usage).
 - Name-convention fallback for tables never joined in visible SQL
   (`<singular>_id` → `<table>.<pk>`), using `inflect` for pluralization.
-- Emit `.sqlrunner/relationships.yml` with each relationship, its confidence, and its
+- Emit `.sqlr/relationships.yml` with each relationship, its confidence, and its
   evidence; merge user edits back on subsequent runs and never overwrite them.
 
 **Extended**
@@ -404,7 +404,7 @@ Produces column values. Registry of named generators plus the RNG discipline.
   which siblings they read; the declaration feeds the fingerprint. Undeclared reads
   are not permitted.
 - Python provider registry via decorator, loaded from a conventional
-  `sqlrunner_providers.py`, receiving RNG, row count, and already-generated siblings.
+  `sqlr_providers.py`, receiving RNG, row count, and already-generated siblings.
 - Faker / Mimesis providers as opt-in for columns where realism is visible.
 - Semantic providers keyed on column name (email, address, currency code).
 - Distribution controls (skew, lognormal amounts) for when realism matters more than legibility.

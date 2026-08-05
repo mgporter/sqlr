@@ -15,7 +15,7 @@
   <code>select *</code> into a chain of column origins &mdash; with real traced output from
   <code>person.sql</code> and three hand-built star-over-join cases.</p>
   <div class="meta-row">
-    <span class="meta-chip">src/sqlrunner/sql_analysis/lineage.py</span>
+    <span class="meta-chip">src/sqlr/sql_analysis/lineage.py</span>
     <span class="meta-chip">no catalog required</span>
     <span class="meta-chip">memoized, cycle-safe</span>
   </div>
@@ -43,7 +43,7 @@
 
 <section id="why">
   <h2><span class="num">01</span> Why a resolver</h2>
-  <p class="lede">There is no schema catalog anywhere in sqlrunner. When a SELECT reads <code>b.id</code>,
+  <p class="lede">There is no schema catalog anywhere in sqlr. When a SELECT reads <code>b.id</code>,
   nothing on disk says what table <code>id</code> ultimately comes from &mdash; that has to be worked out
   purely from the SQL text.</p>
   <p>The trick is direction. Instead of expanding <code>*</code> forward (which requires knowing a table's
@@ -161,7 +161,7 @@
   </ol>
   <p>Step 5 is worth dwelling on: it's stricter than the star case. If two <em>explicit, named</em> columns
   collide, that's a real authoring ambiguity in the SQL and the Resolver refuses to guess. Guessing is
-  reserved entirely for <code>*</code>, where sqlrunner has decided a best-effort attribution is more useful
+  reserved entirely for <code>*</code>, where sqlr has decided a best-effort attribution is more useful
   than refusing outright.</p>
 </section>
 

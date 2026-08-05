@@ -13,7 +13,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from sqlrunner.source import SourceDoc, SourceSpan
+from sqlr.source import SourceDoc, SourceSpan
 
 Severity = Literal["error", "warning", "info", "hint"]
 

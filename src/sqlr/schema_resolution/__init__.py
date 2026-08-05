@@ -19,7 +19,7 @@ from collections import defaultdict
 from collections.abc import Mapping
 from typing import Literal
 
-from sqlrunner.schema_resolution.types import (
+from sqlr.schema_resolution.types import (
     ColumnSchema,
     EvidenceKind,
     JoinGroup,
@@ -32,8 +32,8 @@ from sqlrunner.schema_resolution.types import (
     TypeEvidence,
     ValueConstraint,
 )
-from sqlrunner.source import SourceSpan
-from sqlrunner.sql_analysis.types import (
+from sqlr.source import SourceSpan
+from sqlr.sql_analysis.types import (
     ColumnNode,
     JoinFact,
     LiteralKind,
@@ -45,7 +45,7 @@ from sqlrunner.sql_analysis.types import (
     SqlAnalysisResult,
     UsageFact,
 )
-from sqlrunner.typemap import TYPE_COVER, WIDENING_ORDER, resolve_type_name, widen
+from sqlr.typemap import TYPE_COVER, WIDENING_ORDER, resolve_type_name, widen
 
 __all__ = ["resolve_schema", "widen", "TYPE_COVER", "WIDENING_ORDER"]
 
@@ -595,7 +595,7 @@ def _build_tables(
             columns.append(
                 ColumnSchema(
                     name=column.name,
-                    type=choices.get(node) or ResolvedType(),
+                    resolved_type=choices.get(node) or ResolvedType(),
                     confidence=column.confidence,
                     nullability=_nullability(nullability_by_node.get(node, [])),
                     constraints=_constraints(predicates_by_node.get(node, [])),
@@ -703,7 +703,7 @@ def _build_projection(
             ProjectionSchema(
                 name=projected.name,
                 ordinal=projected.ordinal,
-                type=resolved,
+                resolved_type=resolved,
                 origins=[origin.node for origin in projected.origins],
                 span=projected.span,
                 alias_span=projected.alias_span,

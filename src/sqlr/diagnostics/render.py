@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlrunner.diagnostics.types import (
+from sqlr.diagnostics.types import (
     LSP_SEVERITY,
     Diagnostic,
     DiagnosticReport,
@@ -77,7 +77,7 @@ def _to_lsp_one(diagnostic: Diagnostic) -> dict[str, Any]:
         "code": diagnostic.code,
         "severity": LSP_SEVERITY[diagnostic.severity],
         "message": diagnostic.message,
-        "source": "sqlrunner",
+        "source": "sqlr",
         "range": _range(diagnostic.location),
     }
     if diagnostic.location.path is not None:

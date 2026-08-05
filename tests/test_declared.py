@@ -7,8 +7,8 @@ whole directory, so each test owns a directory.
 
 from pathlib import Path
 
-from sqlrunner.catalog import find_yaml_files
-from sqlrunner.declared import load_declared_schemas
+from sqlr.catalog import find_yaml_files
+from sqlr.declared import load_declared_schemas
 
 
 def _project(tmp_path: Path, **files: str) -> Path:

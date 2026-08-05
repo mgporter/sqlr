@@ -2,14 +2,14 @@ from pathlib import Path
 
 import pytest
 
-from sqlrunner.schema_resolution import resolve_schema, widen
-from sqlrunner.schema_resolution.types import (
+from sqlr.schema_resolution import resolve_schema, widen
+from sqlr.schema_resolution.types import (
     ColumnSchema,
     ResolvedTypeName,
     StatementSchema,
 )
-from sqlrunner.sql_analysis import analyze_file, analyze_sql
-from sqlrunner.sql_analysis.types import ColumnNode, RelationRef
+from sqlr.sql_analysis import analyze_file, analyze_sql
+from sqlr.sql_analysis.types import ColumnNode, RelationRef
 
 FIXTURES = Path(__file__).parent / "fixtures"
 PERSON_SQL = FIXTURES / "person.sql"
@@ -29,7 +29,7 @@ def columns_of(schema: StatementSchema, table: str) -> dict[str, ColumnSchema]:
 def _columns_by_name(sql: str) -> dict[str, tuple[str, str]]:
     schema = schema_for(sql)
     [table] = schema.tables
-    return {c.name: (c.type.type_name, c.type.source) for c in table.columns}
+    return {c.name: (c.resolved_type.type_name, c.resolved_type.source) for c in table.columns}
 
 
 # ---- type inference ----------------------------------------------------------------
@@ -157,8 +157,8 @@ def test_multiple_tables_resolved_independently() -> None:
     """
     schema = schema_for(sql)
 
-    assert columns_of(schema, "orders")["amount"].type.type_name == "numeric"
-    assert columns_of(schema, "person")["nickname"].type.type_name == "string"
+    assert columns_of(schema, "orders")["amount"].resolved_type.type_name == "numeric"
+    assert columns_of(schema, "person")["nickname"].resolved_type.type_name == "string"
 
 
 # ---- type families -----------------------------------------------------------------
@@ -198,12 +198,12 @@ def test_join_group_propagates_a_type_to_the_untyped_side() -> None:
     schema = schema_for(sql)
 
     person_id = columns_of(schema, "orders")["person_id"]
-    assert person_id.type.type_name == "string"
-    assert person_id.type.source == "join_group"
-    assert person_id.type.chosen is not None
-    assert person_id.type.chosen.detail is not None
-    assert "joined to" in person_id.type.chosen.detail
-    assert person_id.type.chosen.via == ColumnNode(
+    assert person_id.resolved_type.type_name == "string"
+    assert person_id.resolved_type.source == "join_group"
+    assert person_id.resolved_type.chosen is not None
+    assert person_id.resolved_type.chosen.detail is not None
+    assert "joined to" in person_id.resolved_type.chosen.detail
+    assert person_id.resolved_type.chosen.via == ColumnNode(
         relation=RelationRef(kind="table", name="person"), column="id"
     )
 
@@ -229,8 +229,8 @@ def test_stronger_evidence_survives_join_group_unification() -> None:
     schema = schema_for(sql)
 
     person_id = columns_of(schema, "orders")["person_id"]
-    assert person_id.type.type_name == "string"
-    assert person_id.type.source == "usage"
+    assert person_id.resolved_type.type_name == "string"
+    assert person_id.resolved_type.source == "usage"
 
 
 def test_join_group_with_conflicting_member_types_is_widened() -> None:
@@ -244,7 +244,7 @@ def test_join_group_with_conflicting_member_types_is_widened() -> None:
     assert [group.names for group in schema.join_groups] == [["cte:a.k", "cte:b.k"]]
     assert schema.join_groups[0].unified_type == "number"
     projection = {column.name: column for column in schema.projection}
-    assert projection["k"].type.type_name == "number"
+    assert projection["k"].resolved_type.type_name == "number"
 
 
 def test_a_widened_type_is_carried_by_no_single_piece_of_evidence() -> None:
@@ -258,10 +258,10 @@ def test_a_widened_type_is_carried_by_no_single_piece_of_evidence() -> None:
     """
     [column] = schema_for(sql).projection
 
-    assert column.type.type_name == "number"
-    assert column.type.widened_from == ["integer", "decimal"]
-    assert column.type.chosen is not None
-    assert column.type.chosen.type_name == "integer"
+    assert column.resolved_type.type_name == "number"
+    assert column.resolved_type.widened_from == ["integer", "decimal"]
+    assert column.resolved_type.chosen is not None
+    assert column.resolved_type.chosen.type_name == "integer"
 
 
 # ---- constraints, nullability, confidence ------------------------------------------
@@ -318,8 +318,8 @@ def test_projection_types_follow_lineage_to_the_source() -> None:
     schema = resolve_schema(analyze_file(PERSON_SQL))
 
     projection = {column.name: column for column in schema.projection}
-    assert projection["age"].type.type_name == "numeric"
-    assert projection["modified_at"].type.type_name == "timestamp"
+    assert projection["age"].resolved_type.type_name == "numeric"
+    assert projection["modified_at"].resolved_type.type_name == "timestamp"
     assert [str(origin) for origin in projection["age"].origins] == [
         "table:mydatabase.myschema.person.age"
     ]
@@ -329,31 +329,31 @@ def test_derived_projection_type_comes_from_the_expression() -> None:
     schema = schema_for("select row_number() over (order by id) as rn from orders")
 
     projection = {column.name: column for column in schema.projection}
-    assert projection["rn"].type.type_name == "integer"
-    assert projection["rn"].type.source == "expression"
+    assert projection["rn"].resolved_type.type_name == "integer"
+    assert projection["rn"].resolved_type.source == "expression"
 
 
 def test_aggregate_projection_type_comes_from_the_expression() -> None:
     schema = schema_for("select person_id, sum(amount) as total from orders group by person_id")
 
     projection = {column.name: column for column in schema.projection}
-    assert projection["total"].type.type_name == "numeric"
-    assert projection["total"].type.source == "expression"
+    assert projection["total"].resolved_type.type_name == "numeric"
+    assert projection["total"].resolved_type.source == "expression"
 
 
 def test_cast_types_the_column_it_produces() -> None:
     schema = schema_for("select cast(salary as decimal(10, 2)) as salary from orders")
 
     projection = {column.name: column for column in schema.projection}
-    assert projection["salary"].type.type_name == "decimal"
-    assert projection["salary"].type.source == "expression"
+    assert projection["salary"].resolved_type.type_name == "decimal"
+    assert projection["salary"].resolved_type.source == "expression"
 
 
 def test_cast_to_a_float_type_is_not_a_decimal() -> None:
     schema = schema_for("select cast(ratio as double) as ratio from orders")
 
     projection = {column.name: column for column in schema.projection}
-    assert projection["ratio"].type.type_name == "float"
+    assert projection["ratio"].resolved_type.type_name == "float"
 
 
 def test_cast_through_a_cte_reaches_the_final_projection() -> None:
@@ -364,22 +364,22 @@ def test_cast_through_a_cte_reaches_the_final_projection() -> None:
     schema = schema_for(sql)
 
     projection = {column.name: column for column in schema.projection}
-    assert projection["salary"].type.type_name == "decimal"
+    assert projection["salary"].resolved_type.type_name == "decimal"
 
 
 def test_coalesce_literal_types_the_column_it_produces() -> None:
     schema = schema_for("select coalesce(bonus, 0) as bonus from orders")
 
     projection = {column.name: column for column in schema.projection}
-    assert projection["bonus"].type.type_name == "numeric"
-    assert projection["bonus"].type.source == "expression"
+    assert projection["bonus"].resolved_type.type_name == "numeric"
+    assert projection["bonus"].resolved_type.source == "expression"
 
 
 def test_coalesce_of_two_columns_stays_unknown() -> None:
     schema = schema_for("select coalesce(bonus, fallback) as bonus from orders")
 
     projection = {column.name: column for column in schema.projection}
-    assert projection["bonus"].type.type_name == "unknown"
+    assert projection["bonus"].resolved_type.type_name == "unknown"
 
 
 def test_datediff_projection_is_an_integer() -> None:
@@ -388,8 +388,8 @@ def test_datediff_projection_is_an_integer() -> None:
     )
 
     projection = {column.name: column for column in schema.projection}
-    assert projection["tenure"].type.type_name == "integer"
-    assert projection["tenure"].type.source == "expression"
+    assert projection["tenure"].resolved_type.type_name == "integer"
+    assert projection["tenure"].resolved_type.source == "expression"
 
 
 # ---- evidence is kept, not just the winner -----------------------------------------
@@ -405,29 +405,29 @@ def test_losing_evidence_is_retained_and_ordered() -> None:
     )
 
     revenue = columns_of(schema, "orders")["revenue"]
-    assert revenue.type.type_name == "string"
-    assert [(e.type_name, e.weight) for e in revenue.type.evidence] == [
+    assert revenue.resolved_type.type_name == "string"
+    assert [(e.type_name, e.weight) for e in revenue.resolved_type.evidence] == [
         ("string", 60),
         ("numeric", 50),
     ]
-    assert revenue.type.chosen is not None and revenue.type.chosen.type_name == "string"
+    assert revenue.resolved_type.chosen is not None and revenue.resolved_type.chosen.type_name == "string"
 
 
 def test_evidence_carries_the_source_range_that_produced_it() -> None:
     schema = schema_for("select id from orders\nwhere revenue > 1000")
 
     revenue = columns_of(schema, "orders")["revenue"]
-    assert revenue.type.chosen is not None
-    assert schema.snippet(revenue.type.chosen.context_span) == "revenue > 1000"
-    assert schema.snippet(revenue.type.chosen.span) == "revenue"
+    assert revenue.resolved_type.chosen is not None
+    assert schema.snippet(revenue.resolved_type.chosen.context_span) == "revenue > 1000"
+    assert schema.snippet(revenue.resolved_type.chosen.span) == "revenue"
 
 
 def test_name_pattern_is_collected_even_when_it_loses() -> None:
     schema = schema_for("select id from orders where total_amount in ('a', 'b')")
 
     column = columns_of(schema, "orders")["total_amount"]
-    assert column.type.type_name == "string"
-    kinds = {(e.kind, e.type_name) for e in column.type.evidence}
+    assert column.resolved_type.type_name == "string"
+    kinds = {(e.kind, e.type_name) for e in column.resolved_type.evidence}
     assert ("name_pattern", "numeric") in kinds
     assert ("usage", "string") in kinds
 
@@ -444,12 +444,12 @@ def test_join_group_unification_does_not_erase_member_evidence() -> None:
     schema = schema_for(sql)
 
     person_id = columns_of(schema, "person")["id"]
-    assert person_id.type.type_name == "string"
-    assert any(e.kind == "usage" for e in person_id.type.evidence)
+    assert person_id.resolved_type.type_name == "string"
+    assert any(e.kind == "usage" for e in person_id.resolved_type.evidence)
 
     propagated = columns_of(schema, "orders")["person_id"]
-    assert propagated.type.type_name == "string"
-    assert any(e.kind == "join_group" for e in propagated.type.evidence)
+    assert propagated.resolved_type.type_name == "string"
+    assert any(e.kind == "join_group" for e in propagated.resolved_type.evidence)
 
 
 def test_equal_weight_disagreement_records_what_was_widened() -> None:
@@ -569,8 +569,8 @@ def test_string_concatenation_types_its_operands() -> None:
     schema = schema_for("select street || ', ' || city as full_address from address")
 
     columns = columns_of(schema, "address")
-    assert columns["street"].type.type_name == "string"
-    assert columns["city"].type.type_name == "string"
+    assert columns["street"].resolved_type.type_name == "string"
+    assert columns["city"].resolved_type.type_name == "string"
 
 
 def test_a_string_function_types_its_input_column() -> None:
@@ -590,8 +590,8 @@ def test_a_string_function_and_a_name_pattern_are_both_kept() -> None:
     schema = schema_for("select upper(department_name) as department_name from d")
 
     column = columns_of(schema, "d")["department_name"]
-    assert column.type.type_name == "string"
-    assert [(e.kind, e.detail) for e in column.type.evidence] == [
+    assert column.resolved_type.type_name == "string"
+    assert [(e.kind, e.detail) for e in column.resolved_type.evidence] == [
         ("usage", "string_function"),
         ("name_pattern", "*_name"),
     ]
@@ -601,8 +601,8 @@ def test_usage_evidence_outranks_the_name_pattern_that_agrees_with_it() -> None:
     schema = schema_for("select upper(department_name) as department_name from d")
 
     column = columns_of(schema, "d")["department_name"]
-    assert column.type.chosen is not None
-    assert column.type.chosen.kind == "usage"
+    assert column.resolved_type.chosen is not None
+    assert column.resolved_type.chosen.kind == "usage"
 
 
 # ---- no duplicate evidence ----------------------------------------------------------
@@ -615,7 +615,7 @@ def test_a_derived_projection_carries_its_expression_evidence_once() -> None:
     schema = schema_for("select upper(name) as name from t")
 
     [projected] = [p for p in schema.projection if p.name == "name"]
-    functions = [e for e in projected.type.evidence if e.kind == "function"]
+    functions = [e for e in projected.resolved_type.evidence if e.kind == "function"]
     assert len(functions) == 1
     assert functions[0].detail == "Upper"
 
@@ -624,8 +624,8 @@ def test_a_cast_projection_carries_its_evidence_once() -> None:
     schema = schema_for("select cast(salary as decimal(10, 2)) as salary from t")
 
     [projected] = [p for p in schema.projection if p.name == "salary"]
-    assert len([e for e in projected.type.evidence if e.kind == "cast"]) == 1
-    assert projected.type.type_name == "decimal"
+    assert len([e for e in projected.resolved_type.evidence if e.kind == "cast"]) == 1
+    assert projected.resolved_type.type_name == "decimal"
 
 
 def test_two_separate_uses_of_one_kind_are_both_kept() -> None:
@@ -633,6 +633,6 @@ def test_two_separate_uses_of_one_kind_are_both_kept() -> None:
     schema = schema_for("select id from orders\nwhere qty > 1 and qty > 5")
 
     column = columns_of(schema, "orders")["qty"]
-    numeric = [e for e in column.type.evidence if e.detail == "compared_to_number"]
+    numeric = [e for e in column.resolved_type.evidence if e.detail == "compared_to_number"]
     assert len(numeric) == 2
     assert numeric[0].span != numeric[1].span

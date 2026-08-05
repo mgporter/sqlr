@@ -17,11 +17,11 @@ See `__init__.py` for the pipeline as a whole.
 
 from __future__ import annotations
 
-from sqlrunner.source import NO_POSITIONS, Positions, SourceDoc, SourceSpan
-from sqlrunner.sql_analysis.facts import Facts
-from sqlrunner.sql_analysis.resolver import Resolver
-from sqlrunner.sql_analysis.relations import OutputCol, RelationGraph
-from sqlrunner.sql_analysis.types import (
+from sqlr.source import NO_POSITIONS, Positions, SourceDoc, SourceSpan
+from sqlr.sql_analysis.facts import Facts
+from sqlr.sql_analysis.resolver import Resolver
+from sqlr.sql_analysis.relations import OutputCol, RelationGraph
+from sqlr.sql_analysis.types import (
     CONFIDENCE_RANK,
     ColumnOrigin,
     Confidence,

@@ -17,15 +17,15 @@ from pydantic import BaseModel
 
 from sqlglot import exp
 
-from sqlrunner.source import NO_POSITIONS, Positions, SourceSpan
-from sqlrunner.sql_analysis.resolver import Resolver
-from sqlrunner.sql_analysis.relations import (
+from sqlr.source import NO_POSITIONS, Positions, SourceSpan
+from sqlr.sql_analysis.resolver import Resolver
+from sqlr.sql_analysis.relations import (
     RelationGraph,
     RelationInfo,
     literal_kind,
     number_shape,
 )
-from sqlrunner.sql_analysis.types import (
+from sqlr.sql_analysis.types import (
     CardinalityFact,
     ColumnNode,
     ColumnOrigin,

@@ -29,7 +29,7 @@ pinned to a source range.**
 
 ---
 
-## Part 0 — `src/sqlrunner/source.py` (new, foundation)
+## Part 0 — `src/sqlr/source.py` (new, foundation)
 
 Everything else depends on this. Ships alone, testable alone.
 
@@ -227,7 +227,7 @@ only guarantees the data reaches it losslessly.
 
 ---
 
-## Part 3 — declared schemas (new `src/sqlrunner/declared/`)
+## Part 3 — declared schemas (new `src/sqlr/declared/`)
 
 Discovery and consumption are **decoupled**, per the requirement that dbt artifacts can
 later feed the same consumer.
@@ -285,7 +285,7 @@ class DeclaredSchemas(BaseModel):
     warnings: list[str]
 ```
 
-### Shared type map — `src/sqlrunner/typemap.py` (new)
+### Shared type map — `src/sqlr/typemap.py` (new)
 
 `CAST_TYPE_MAP` currently lives in `schema_resolution/__init__.py` and is keyed on bare
 uppercase names. Move it out and give it a normalizer, since declared types arrive as
@@ -302,7 +302,7 @@ treated as `unknown`.
 
 ---
 
-## Part 4 — `src/sqlrunner/diagnostics/` (new)
+## Part 4 — `src/sqlr/diagnostics/` (new)
 
 The design doc's Layer 5 module, built now because requirement 2 needs it. Cross-cutting:
 `constraints`, `relationship_inference`, and `execution` all get to write into it later.

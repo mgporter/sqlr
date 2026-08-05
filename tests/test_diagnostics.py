@@ -7,10 +7,10 @@ wrong range is worse than useless.
 
 from pathlib import Path
 
-from sqlrunner.declared import load_declared_schemas
-from sqlrunner.declared.types import DeclaredSchemas
-from sqlrunner.catalog import find_yaml_files
-from sqlrunner.diagnostics import (
+from sqlr.declared import load_declared_schemas
+from sqlr.declared.types import DeclaredSchemas
+from sqlr.catalog import find_yaml_files
+from sqlr.diagnostics import (
     Diagnostic,
     DiagnosticReport,
     check_schema,
@@ -19,8 +19,8 @@ from sqlrunner.diagnostics import (
     to_lsp,
     unresolved_types,
 )
-from sqlrunner.schema_resolution import resolve_schema
-from sqlrunner.sql_analysis import analyze_file
+from sqlr.schema_resolution import resolve_schema
+from sqlr.sql_analysis import analyze_file
 
 
 def _project(tmp_path: Path, sql: str, yml: str) -> tuple[Path, DeclaredSchemas]:
@@ -318,7 +318,7 @@ def test_lsp_carries_related_information(tmp_path: Path) -> None:
 
 
 def test_reports_sort_the_worst_problem_first() -> None:
-    from sqlrunner.diagnostics.types import Diagnostic
+    from sqlr.diagnostics.types import Diagnostic
 
     report = DiagnosticReport(
         diagnostics=[

@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from sqlglot import exp
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
-from sqlrunner.sql_analysis.types import LiteralKind, RelationRef
+from sqlr.sql_analysis.types import LiteralKind, RelationRef
 
 _SET_OPERATION_BASE = getattr(exp, "SetOperation", None)
 SET_OPERATION_CLASSES: tuple[type[exp.Expr], ...] = (

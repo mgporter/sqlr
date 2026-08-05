@@ -5,14 +5,14 @@ extraction, relationship inference and execution will write theirs here later. O
 channel, one renderer, one shape that converts to an editor diagnostic.
 """
 
-from sqlrunner.diagnostics import codes
-from sqlrunner.diagnostics.check import (
+from sqlr.diagnostics import codes
+from sqlr.diagnostics.check import (
     check_schema,
     from_analysis,
     unresolved_types,
 )
-from sqlrunner.diagnostics.render import render_text, to_lsp
-from sqlrunner.diagnostics.types import (
+from sqlr.diagnostics.render import render_text, to_lsp
+from sqlr.diagnostics.types import (
     Diagnostic,
     DiagnosticReport,
     Location,

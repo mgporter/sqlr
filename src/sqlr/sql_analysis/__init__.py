@@ -33,16 +33,16 @@ import sqlglot
 from sqlglot.errors import ParseError, SqlglotError
 from sqlglot.optimizer.qualify_tables import qualify_tables
 
-from sqlrunner.source import Positions, SourceDoc
-from sqlrunner.sql_analysis.assemble import assemble
-from sqlrunner.sql_analysis.facts import extract_facts
-from sqlrunner.sql_analysis.resolver import (
+from sqlr.source import Positions, SourceDoc
+from sqlr.sql_analysis.assemble import assemble
+from sqlr.sql_analysis.facts import extract_facts
+from sqlr.sql_analysis.resolver import (
     Resolver,
     StarOverJoinAbort,
     StarOverJoinBehavior,
 )
-from sqlrunner.sql_analysis.relations import build_graph
-from sqlrunner.sql_analysis.types import (
+from sqlr.sql_analysis.relations import build_graph
+from sqlr.sql_analysis.types import (
     CONFIDENCE_RANK,
     SourceTable,
     SqlAnalysisResult,

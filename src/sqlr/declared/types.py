@@ -4,8 +4,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from sqlrunner.source import SourceDoc, SourceSpan
-from sqlrunner.typemap import ResolvedTypeName
+from sqlr.source import SourceDoc, SourceSpan
+from sqlr.typemap import ResolvedTypeName
 
 
 class DeclaredColumn(BaseModel):

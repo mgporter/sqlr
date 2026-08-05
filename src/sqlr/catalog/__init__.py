@@ -4,7 +4,7 @@ from pathlib import Path
 import pathspec
 from pathspec.patterns.gitignore.basic import GitIgnoreBasicPattern
 
-from sqlrunner.catalog.types import FileInventory, SqlFile
+from sqlr.catalog.types import FileInventory, SqlFile
 
 GITIGNORE_FILENAME = ".gitignore"
 ALWAYS_EXCLUDED_DIRS = {".git"}

@@ -3,8 +3,8 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from sqlrunner.cli import app
-from sqlrunner.config import CONFIG_FILENAME
+from sqlr.cli import app
+from sqlr.config import CONFIG_FILENAME
 
 runner = CliRunner()
 

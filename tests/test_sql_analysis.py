@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from sqlrunner.sql_analysis import analyze_file, analyze_sql
-from sqlrunner.sql_analysis.types import SqlAnalysisResult
+from sqlr.sql_analysis import analyze_file, analyze_sql
+from sqlr.sql_analysis.types import SqlAnalysisResult
 
 FIXTURES = Path(__file__).parent / "fixtures"
 PERSON_SQL = FIXTURES / "person.sql"

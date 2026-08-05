@@ -9,7 +9,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from sqlrunner.source import SourceDoc, SourceSpan
+from sqlr.source import SourceDoc, SourceSpan
 
 RelationKind = Literal["table", "cte", "derived", "subquery", "root"]
 """Where a relation comes from. `table` relations are external and terminal."""

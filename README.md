@@ -1,4 +1,4 @@
-# sqlrunner
+# sqlr
 
 ## Setup
 
@@ -36,5 +36,5 @@ See [tests/README.md](tests/README.md) for the rule on where test fixtures live.
 ## Running the CLI
 
 ```bash
-uv run sqlrunner --project-dir <path>       # -v for debug logging
+uv run sqlr --project-dir <path>       # -v for debug logging
 ```

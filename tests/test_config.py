@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from sqlrunner.config import CONFIG_FILENAME, ConfigError, load, load_config, resolve_project_root
+from sqlr.config import CONFIG_FILENAME, ConfigError, load, load_config, resolve_project_root
 
 MINIMAL_CONFIG = """
 version: 1
