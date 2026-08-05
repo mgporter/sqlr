@@ -5,15 +5,15 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from sqlrunner.source import SourceDoc, SourceSpan
-from sqlrunner.typemap import ResolvedType
+from sqlrunner.typemap import ResolvedTypeName
 
 
 class DeclaredColumn(BaseModel):
     name: str
-    data_type: str
-    """Verbatim, as written - `varchar(50)`, not `string`."""
-    resolved_type: ResolvedType
-    """`data_type` mapped onto the lattice. `unknown` when the name is unrecognised."""
+    written_type: str
+    """The yml's `data_type:`, verbatim - `varchar(50)`, not `string`."""
+    resolved_type_name: ResolvedTypeName
+    """`written_type` mapped onto the lattice. `unknown` when the name is unrecognised."""
     description: str | None = None
     span: SourceSpan | None = None
     """The whole column entry in the yml."""

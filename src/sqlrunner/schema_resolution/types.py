@@ -22,15 +22,16 @@ from sqlrunner.sql_analysis.types import (
     NullabilityFact,
     PredicateOperator,
 )
-from sqlrunner.typemap import ResolvedType
+from sqlrunner.typemap import ResolvedTypeName
 
 __all__ = [
     "ColumnSchema",
     "EvidenceKind",
     "JoinGroup",
     "NullabilityResolution",
-    "ProjectedColumnSchema",
+    "ProjectionSchema",
     "ResolvedType",
+    "ResolvedTypeName",
     "StatementSchema",
     "TableSchema",
     "TypeEvidence",
@@ -57,13 +58,13 @@ Finer-grained than `TypeSource`, which stays as the coarse bucket the CLI prints
 class TypeEvidence(BaseModel):
     """One observation that says something about a column's type.
 
-    A column usually has several, and they need not agree. `ColumnSchema.chosen` is the
+    A column usually has several, and they need not agree. `ResolvedType.chosen` is the
     one that won; the rest are kept because a disagreement with a user's declared type is
     best explained by showing all of them.
     """
 
     node: ColumnNode
-    resolved_type: ResolvedType
+    type_name: ResolvedTypeName
     weight: int
     source: TypeSource
     kind: EvidenceKind
@@ -97,6 +98,34 @@ class ValueConstraint(BaseModel):
     value_spans: list[SourceSpan | None] = []
 
 
+class ResolvedType(BaseModel):
+    """The type something resolved to, and the whole case for it.
+
+    `type_name` is not `chosen.type_name`: when equally weighted evidence disagrees the
+    tier is widened instead of picked from, and the result can be a family - `number` -
+    that no single piece of evidence carries. `chosen` still names the evidence that led,
+    and `widened_from` the types that were folded together.
+    """
+
+    type_name: ResolvedTypeName = "unknown"
+    chosen: TypeEvidence | None = None
+    """The evidence that decided `type_name`. None when nothing typed it."""
+    evidence: list[TypeEvidence] = []
+    """All of it, strongest first. Includes `chosen`."""
+    widened_from: list[ResolvedTypeName] = []
+    """Set when equally-weighted evidence disagreed and was widened rather than picked."""
+
+    @property
+    def source(self) -> TypeSource:
+        """Coarse bucket of the winning evidence."""
+        return self.chosen.source if self.chosen is not None else "unknown"
+
+    @property
+    def location(self) -> SourceSpan | None:
+        """Where the winning evidence was written."""
+        return self.chosen.location if self.chosen is not None else None
+
+
 class NullabilityResolution(BaseModel):
     nullable: bool | None = None
     chosen: NullabilityFact | None = None
@@ -106,13 +135,7 @@ class NullabilityResolution(BaseModel):
 
 class ColumnSchema(BaseModel):
     name: str
-    resolved_type: ResolvedType
-    chosen: TypeEvidence | None = None
-    """The evidence that decided `resolved_type`. None when nothing typed the column."""
-    evidence: list[TypeEvidence] = []
-    """All of it, strongest first. Includes `chosen`."""
-    widened_from: list[ResolvedType] = []
-    """Set when equally-weighted evidence disagreed and was widened rather than picked."""
+    type: ResolvedType = Field(default_factory=ResolvedType)
     confidence: Confidence = "explicit"
     """How confidently the column was attributed to this table, not to its type."""
     nullability: NullabilityResolution = Field(default_factory=NullabilityResolution)
@@ -123,19 +146,14 @@ class ColumnSchema(BaseModel):
     """Index into `StatementSchema.join_groups`; members share a value domain."""
 
     @property
-    def source(self) -> TypeSource:
-        """Coarse bucket of the winning evidence."""
-        return self.chosen.source if self.chosen is not None else "unknown"
-
-    @property
     def nullable(self) -> bool | None:
         return self.nullability.nullable
 
     @property
     def location(self) -> SourceSpan | None:
         """Best single place to point at when reporting about this column."""
-        if self.chosen is not None and self.chosen.location is not None:
-            return self.chosen.location
+        if self.type.location is not None:
+            return self.type.location
         return self.references[0] if self.references else None
 
 
@@ -149,20 +167,19 @@ class TableSchema(BaseModel):
         return next((c for c in self.columns if c.name.lower() == lowered), None)
 
 
-class ProjectedColumnSchema(BaseModel):
+class ProjectionSchema(BaseModel):
     name: str | None
+    """None for a projected column with no alias sqlglot could name."""
     ordinal: int
-    resolved_type: ResolvedType
-    chosen: TypeEvidence | None = None
-    evidence: list[TypeEvidence] = []
-    widened_from: list[ResolvedType] = []
+    type: ResolvedType = Field(default_factory=ResolvedType)
     origins: list[ColumnNode] = []
     span: SourceSpan | None = None
     alias_span: SourceSpan | None = None
 
     @property
-    def source(self) -> TypeSource:
-        return self.chosen.source if self.chosen is not None else "unknown"
+    def location(self) -> SourceSpan | None:
+        """Best single place to point at when reporting about this column."""
+        return self.type.location or self.span
 
 
 class JoinGroup(BaseModel):
@@ -173,7 +190,7 @@ class JoinGroup(BaseModel):
     """
 
     members: list[ColumnNode] = []
-    unified_type: ResolvedType = "unknown"
+    unified_type: ResolvedTypeName = "unknown"
     facts: list[JoinFact] = []
     """The joins that linked the members, with their source ranges."""
 
@@ -185,7 +202,7 @@ class JoinGroup(BaseModel):
 class StatementSchema(BaseModel):
     source: SourceDoc = Field(default_factory=SourceDoc)
     tables: list[TableSchema] = []
-    projection: list[ProjectedColumnSchema] = []
+    projection: list[ProjectionSchema] = []
     join_groups: list[JoinGroup] = []
 
     def table(self, name: str) -> TableSchema | None:

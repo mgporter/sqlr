@@ -162,7 +162,7 @@ def classify_usage(column: exp.Column) -> list[tuple[str, str | None]]:
             if isinstance(argument, exp.Literal)
         ]
         if siblings:
-            return [("coalesce_default", literal_kind(siblings))]
+            return [("function_argument", literal_kind(siblings))]
         return []
 
     if type(parent).__name__ in DATE_FUNCTION_CLASSES:

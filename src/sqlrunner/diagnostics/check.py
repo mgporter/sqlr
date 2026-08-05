@@ -23,12 +23,13 @@ from sqlrunner.diagnostics import codes
 from sqlrunner.diagnostics.types import Diagnostic, Location, Related, Severity
 from sqlrunner.schema_resolution.types import (
     ColumnSchema,
+    ResolvedType,
     StatementSchema,
     TypeEvidence,
 )
 from sqlrunner.source import SourceDoc, SourceSpan
 from sqlrunner.sql_analysis.types import Ambiguity
-from sqlrunner.typemap import ResolvedType, compatible
+from sqlrunner.typemap import compatible
 
 # Above this, the evidence names a type outright - a cast, or a function whose return
 # type the dialect fixes. Contradicting one of those is a real error.
@@ -98,10 +99,8 @@ def _check_table(
                 declaration=declaration,
                 table=table,
                 name=column.name,
-                inferred=column.resolved_type,
-                chosen=column.chosen,
-                evidence=column.evidence,
-                fallback=column.references[0] if column.references else None,
+                resolved=column.type,
+                location=column.location,
             )
         )
     return diagnostics
@@ -124,10 +123,8 @@ def _check_projection(
                 declaration=declaration,
                 table=model.name,
                 name=column.name,
-                inferred=column.resolved_type,
-                chosen=column.chosen,
-                evidence=column.evidence,
-                fallback=column.span,
+                resolved=column.type,
+                location=column.location,
             )
         )
     return diagnostics
@@ -139,18 +136,16 @@ def _compare(
     declaration: DeclaredColumn,
     table: str,
     name: str,
-    inferred: ResolvedType,
-    chosen: TypeEvidence | None,
-    evidence: list[TypeEvidence],
-    fallback: SourceSpan | None,
+    resolved: ResolvedType,
+    location: SourceSpan | None,
 ) -> list[Diagnostic]:
-    if declaration.resolved_type == "unknown":
+    if declaration.resolved_type_name == "unknown":
         return [
             Diagnostic(
                 code=codes.UNKNOWN_DECLARED_TYPE,
                 severity="warning",
                 message=(
-                    f"{table}.{name} is declared {declaration.data_type!r}, which is not "
+                    f"{table}.{name} is declared {declaration.written_type!r}, which is not "
                     f"a type sqlrunner recognises; it cannot be checked or generated"
                 ),
                 location=Location.of(model.source, declaration.type_span),
@@ -159,20 +154,20 @@ def _compare(
             )
         ]
 
-    if inferred == "unknown" or compatible(declaration.resolved_type, inferred):
+    inferred = resolved.type_name
+    if inferred == "unknown" or compatible(declaration.resolved_type_name, inferred):
         return []
 
-    location = chosen.location if chosen is not None else None
     return [
         Diagnostic(
             code=codes.TYPE_MISMATCH,
-            severity=_severity(chosen),
+            severity=_severity(resolved.chosen),
             message=(
-                f"{table}.{name} is declared {declaration.data_type} "
-                f"({declaration.resolved_type}) but the SQL uses it as {inferred}"
+                f"{table}.{name} is declared {declaration.written_type} "
+                f"({declaration.resolved_type_name}) but the SQL uses it as {inferred}"
             ),
-            location=Location.of(schema.source, location or fallback),
-            related=_related(schema, model, declaration, chosen, evidence),
+            location=Location.of(schema.source, location),
+            related=_related(schema, model, declaration, resolved),
             table=table,
             column=name,
         )
@@ -198,8 +193,7 @@ def _related(
     schema: StatementSchema,
     model: DeclaredModel,
     declaration: DeclaredColumn,
-    chosen: TypeEvidence | None,
-    evidence: list[TypeEvidence],
+    resolved: ResolvedType,
 ) -> list[Related]:
     """Every other place that bears on the mismatch.
 
@@ -218,14 +212,15 @@ def _related(
         return (
             span.start if span is not None else -1,
             span.end if span is not None else -1,
-            item.resolved_type,
+            item.type_name,
             item.detail or "",
         )
 
     # Annotated because the empty-set branch has nothing to infer an element type from.
+    chosen = resolved.chosen
     seen: set[_EvidenceKey] = {key(chosen)} if chosen is not None else set()
 
-    for item in evidence:
+    for item in resolved.evidence:
         if item.location is None:
             continue
         item_key = key(item)
@@ -236,7 +231,7 @@ def _related(
             Related.at(
                 schema.source,
                 item.location,
-                f"also used as {item.resolved_type} here ({item.detail})",
+                f"also used as {item.type_name} here ({item.detail})",
             )
         )
 
@@ -244,7 +239,7 @@ def _related(
         Related.at(
             model.source,
             declaration.type_span or declaration.span,
-            f"declared as {declaration.data_type} here",
+            f"declared as {declaration.written_type} here",
         )
     )
     return related
@@ -366,7 +361,7 @@ def unresolved_types(
     for table in schema.tables:
         model = declared.for_model(_model_name(table.name))
         for column in table.columns:
-            if column.resolved_type != "unknown":
+            if column.type.type_name != "unknown":
                 continue
             if model is not None and model.column(column.name) is not None:
                 # Declared, so it is typed after all - just not by the SQL.

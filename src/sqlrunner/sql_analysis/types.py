@@ -39,7 +39,7 @@ UsageKind = Literal[
     "string_function",
     "numeric_function",
     "cast",
-    "coalesce_default",
+    "function_argument",
 ]
 
 PredicateOperator = Literal[

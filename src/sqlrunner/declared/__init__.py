@@ -138,16 +138,16 @@ class YamlModelSchemaProvider:
             return None
 
         type_node = _entry(node, "data_type")
-        data_type = _scalar(type_node)
-        if not data_type:
+        written_type = _scalar(type_node)
+        if not written_type:
             # A documented column with no declared type is normal in dbt and simply has
             # nothing to check against. Not a warning.
             return None
 
         return DeclaredColumn(
             name=name,
-            data_type=data_type,
-            resolved_type=resolve_type_name(data_type),
+            written_type=written_type,
+            resolved_type_name=resolve_type_name(written_type),
             description=_scalar(_entry(node, "description")),
             span=_span(positions, node),
             name_span=_span(positions, name_node),

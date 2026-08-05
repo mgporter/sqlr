@@ -96,9 +96,9 @@ def test_data_types_are_mapped_onto_the_lattice(tmp_path: Path) -> None:
 
     assert model is not None
     assert model.column("revenue") is not None
-    assert model.column("revenue").data_type == "varchar(50)"  # type: ignore[union-attr]
-    assert model.column("revenue").resolved_type == "string"  # type: ignore[union-attr]
-    assert model.column("qty").resolved_type == "integer"  # type: ignore[union-attr]
+    assert model.column("revenue").written_type == "varchar(50)"  # type: ignore[union-attr]
+    assert model.column("revenue").resolved_type_name == "string"  # type: ignore[union-attr]
+    assert model.column("qty").resolved_type_name == "integer"  # type: ignore[union-attr]
 
 
 def test_an_unrecognised_data_type_resolves_to_unknown(tmp_path: Path) -> None:
@@ -113,7 +113,7 @@ def test_an_unrecognised_data_type_resolves_to_unknown(tmp_path: Path) -> None:
     model = load_declared_schemas(find_yaml_files(root)).for_model("t")
 
     assert model is not None
-    assert model.column("c").resolved_type == "unknown"  # type: ignore[union-attr]
+    assert model.column("c").resolved_type_name == "unknown"  # type: ignore[union-attr]
 
 
 def test_a_column_without_a_data_type_is_skipped_silently(tmp_path: Path) -> None:

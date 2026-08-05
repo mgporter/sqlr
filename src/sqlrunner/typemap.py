@@ -2,13 +2,13 @@
 
 Shared by `schema_resolution` (which reads type names out of casts) and `declared`
 (which reads them out of yml), because the two have to agree: a `cast(x as varchar)` and
-a `data_type: varchar(50)` must land on the same `ResolvedType` or every comparison
+a `data_type: varchar(50)` must land on the same `ResolvedTypeName` or every comparison
 between inference and declaration is noise.
 """
 
 from typing import Literal
 
-ResolvedType = Literal[
+ResolvedTypeName = Literal[
     "integer",
     "decimal",
     "float",
@@ -33,9 +33,9 @@ Only evidence that names a type - a cast, or a function with a fixed return type
 a concrete one.
 """
 
-# The concrete types each `ResolvedType` covers. Widening picks the narrowest entry whose
-# cover is a superset of both inputs, so `integer` and `decimal` meet at `number`.
-TYPE_COVER: dict[ResolvedType, frozenset[str]] = {
+# The concrete types each `ResolvedTypeName` covers. Widening picks the narrowest entry
+# whose cover is a superset of both inputs, so `integer` and `decimal` meet at `number`.
+TYPE_COVER: dict[ResolvedTypeName, frozenset[str]] = {
     "integer": frozenset({"integer"}),
     "decimal": frozenset({"decimal"}),
     "float": frozenset({"float"}),
@@ -49,7 +49,7 @@ TYPE_COVER: dict[ResolvedType, frozenset[str]] = {
 }
 
 # Narrowest first, so the first superset found is the least upper bound.
-WIDENING_ORDER: list[ResolvedType] = [
+WIDENING_ORDER: list[ResolvedTypeName] = [
     "integer",
     "decimal",
     "float",
@@ -62,7 +62,7 @@ WIDENING_ORDER: list[ResolvedType] = [
 ]
 
 
-def widen(left: ResolvedType, right: ResolvedType) -> ResolvedType:
+def widen(left: ResolvedTypeName, right: ResolvedTypeName) -> ResolvedTypeName:
     """The narrowest type covering both. `unknown` when nothing does."""
     if left == right:
         return left
@@ -75,7 +75,7 @@ def widen(left: ResolvedType, right: ResolvedType) -> ResolvedType:
     return "unknown"
 
 
-def compatible(left: ResolvedType, right: ResolvedType) -> bool:
+def compatible(left: ResolvedTypeName, right: ResolvedTypeName) -> bool:
     """True when some concrete type satisfies both.
 
     `integer` and `number` are compatible - an INT is a number. `string` and `numeric`
@@ -85,7 +85,7 @@ def compatible(left: ResolvedType, right: ResolvedType) -> bool:
     return bool(TYPE_COVER[left] & TYPE_COVER[right])
 
 
-TYPE_NAMES: dict[str, ResolvedType] = {
+TYPE_NAMES: dict[str, ResolvedTypeName] = {
     "INT": "integer",
     "INT2": "integer",
     "INT4": "integer",
@@ -153,7 +153,7 @@ def normalize_type_name(raw: str) -> str:
     return name.strip().replace(" ", "_")
 
 
-def resolve_type_name(raw: str | None) -> ResolvedType:
+def resolve_type_name(raw: str | None) -> ResolvedTypeName:
     """Map a written type name onto the lattice. `unknown` when unrecognised."""
     if not raw:
         return "unknown"

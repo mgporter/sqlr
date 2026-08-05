@@ -5,7 +5,7 @@ into one value domain, so `address.person_id` inherits `person.id`'s type and a 
 can produce overlapping values instead of a join that returns nothing.
 
 Evidence that does not name a type resolves to a family rather than a guess - see
-`ResolvedType`. Two pieces of evidence of equal weight are widened together, which is also
+`ResolvedTypeName`. Two pieces of evidence of equal weight are widened together, which is also
 how a join group with conflicting member types is unified.
 
 **Collection and choice are separate**, and collection never discards. `_collect_evidence`
@@ -17,7 +17,6 @@ at these three places in the file".
 
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Literal
 
 from sqlrunner.schema_resolution.types import (
@@ -25,8 +24,9 @@ from sqlrunner.schema_resolution.types import (
     EvidenceKind,
     JoinGroup,
     NullabilityResolution,
-    ProjectedColumnSchema,
+    ProjectionSchema,
     ResolvedType,
+    ResolvedTypeName,
     StatementSchema,
     TableSchema,
     TypeEvidence,
@@ -55,7 +55,7 @@ __all__ = ["resolve_schema", "widen", "TYPE_COVER", "WIDENING_ORDER"]
 USAGE_TYPE_WEIGHT: dict[str, int] = {
     "boolean_context": 90,
     "date_function": 70,
-    "coalesce_default": 65,
+    "function_argument": 65,
     "in_list_strings": 60,
     "like": 60,
     "string_function": 60,
@@ -73,7 +73,7 @@ LITERAL_ARGUMENT_WEIGHT = 55
 
 # Type of a column produced by an expression, keyed by sqlglot class name. Only entries
 # with a return type the dialect fixes are concrete; arithmetic follows its operands.
-FUNCTION_TYPE_MAP: dict[str, ResolvedType] = {
+FUNCTION_TYPE_MAP: dict[str, ResolvedTypeName] = {
     "RowNumber": "integer",
     "Rank": "integer",
     "DenseRank": "integer",
@@ -107,7 +107,7 @@ FUNCTION_TYPE_MAP: dict[str, ResolvedType] = {
 TYPE_TRANSPARENT_FUNCTIONS = {"Coalesce", "Nullif", "Greatest", "Least", "If"}
 
 # A literal proves its neighbour holds a number, never which kind of number.
-LITERAL_KIND_TYPE: dict[LiteralKind, ResolvedType] = {
+LITERAL_KIND_TYPE: dict[LiteralKind, ResolvedTypeName] = {
     "int": "numeric",
     "float": "numeric",
     "string": "string",
@@ -122,7 +122,7 @@ NULLABILITY_WEIGHT: dict[str, int] = {
     # not decide source nullability. It stays available on the resolution's fact list.
 }
 
-NAME_PATTERNS: list[tuple[Literal["prefix", "suffix"], str, ResolvedType]] = [
+NAME_PATTERNS: list[tuple[Literal["prefix", "suffix"], str, ResolvedTypeName]] = [
     ("prefix", "is_", "boolean"),
     ("suffix", "_at", "timestamp"),
     ("suffix", "_timestamp", "timestamp"),
@@ -142,7 +142,7 @@ def _usage_evidence(usage: UsageFact) -> TypeEvidence | None:
     if weight is None:
         return None
 
-    resolved: ResolvedType | None
+    resolved: ResolvedTypeName | None
     if usage.kind == "boolean_context":
         resolved = "boolean"
     elif usage.kind == "date_function":
@@ -161,7 +161,7 @@ def _usage_evidence(usage: UsageFact) -> TypeEvidence | None:
         "numeric_function",
     ):
         resolved = "numeric"
-    elif usage.kind == "coalesce_default":
+    elif usage.kind == "function_argument":
         resolved = LITERAL_KIND_TYPE.get(usage.detail or "")  # type: ignore[arg-type]
     else:
         resolved = None
@@ -171,7 +171,7 @@ def _usage_evidence(usage: UsageFact) -> TypeEvidence | None:
 
     return TypeEvidence(
         node=usage.node,
-        resolved_type=resolved,
+        type_name=resolved,
         weight=weight,
         source="usage",
         kind="usage",
@@ -189,7 +189,7 @@ def _expression_evidence(
     The resolver stops at derived columns, so nothing else can type them.
     """
     kind: EvidenceKind
-    resolved: ResolvedType | None = None
+    resolved: ResolvedTypeName | None = None
     detail: str | None = None
     weight = 0
 
@@ -200,7 +200,7 @@ def _expression_evidence(
             detail = f"cast to {output.cast_type}"
             return TypeEvidence(
                 node=node,
-                resolved_type=resolved,
+                type_name=resolved,
                 weight=weight,
                 source="expression",
                 kind=kind,
@@ -213,7 +213,7 @@ def _expression_evidence(
     if from_function is not None:
         return TypeEvidence(
             node=node,
-            resolved_type=from_function,
+            type_name=from_function,
             weight=EXPRESSION_WEIGHT,
             source="expression",
             kind="function",
@@ -227,7 +227,7 @@ def _expression_evidence(
         if from_literals is not None:
             return TypeEvidence(
                 node=node,
-                resolved_type=from_literals,
+                type_name=from_literals,
                 weight=LITERAL_ARGUMENT_WEIGHT,
                 source="expression",
                 kind="literal_argument",
@@ -239,8 +239,8 @@ def _expression_evidence(
     return None
 
 
-def _type_from_literal_kinds(kinds: list[LiteralKind]) -> ResolvedType | None:
-    resolved: ResolvedType | None = None
+def _type_from_literal_kinds(kinds: list[LiteralKind]) -> ResolvedTypeName | None:
+    resolved: ResolvedTypeName | None = None
     for kind in kinds:
         current = LITERAL_KIND_TYPE.get(kind)
         if current is None:
@@ -266,13 +266,12 @@ def _name_evidence(node: ColumnNode, references: list[SourceSpan]) -> TypeEviden
         pattern = f"{affix}*" if position == "prefix" else f"*{affix}"
         return TypeEvidence(
             node=node,
-            resolved_type=resolved,
+            type_name=resolved,
             weight=NAME_PATTERN_WEIGHT,
             source="name_pattern",
             kind="name_pattern",
             detail=pattern,
             span=references[0] if references else None,
-            context_span=references[0] if references else None,
         )
     return None
 
@@ -307,49 +306,43 @@ def _collect_evidence(
 # ---- choosing a winner ---------------------------------------------------------------
 
 
-@dataclass(frozen=True, slots=True)
-class _Choice:
-    """The outcome of weighing one column's evidence.
-
-    Annotated at class level rather than only on `__init__`: a type checker widens the
-    type it *infers* for an attribute, so `ResolvedType` assigned in a constructor body
-    comes back out as a bare `str` and every downstream use loses the literal.
-    """
-
-    resolved_type: ResolvedType
-    chosen: TypeEvidence | None
-    widened_from: list[ResolvedType]
-
-
-def _choose(evidence: list[TypeEvidence]) -> _Choice:
+def _choose(evidence: list[TypeEvidence]) -> ResolvedType:
     """Heaviest evidence wins; equally heavy evidence that disagrees is widened.
 
     Widening the top tier can land on `unknown` - `boolean` and `date` have nothing in
     common. Rather than report `unknown` while weaker but usable evidence exists, the
     next tier down is tried.
+
+    The losers travel with the winner: every piece that was weighed ends up on the
+    returned `ResolvedType`, whatever it decided.
     """
-    usable = [item for item in evidence if item.resolved_type != "unknown"]
+    collected = _sorted_evidence(evidence)
+    usable = [item for item in collected if item.type_name != "unknown"]
     if not usable:
-        return _Choice("unknown", None, [])
+        return ResolvedType(evidence=collected)
 
     for weight in sorted({item.weight for item in usable}, reverse=True):
         tier = [item for item in usable if item.weight == weight]
 
-        resolved = tier[0].resolved_type
+        resolved = tier[0].type_name
         for item in tier[1:]:
-            resolved = widen(resolved, item.resolved_type)
+            resolved = widen(resolved, item.type_name)
         if resolved == "unknown":
             continue
 
-        distinct: list[ResolvedType] = list(
-            dict.fromkeys(item.resolved_type for item in tier)
+        distinct: list[ResolvedTypeName] = list(
+            dict.fromkeys(item.type_name for item in tier)
         )
-        widened_from: list[ResolvedType] = distinct if len(distinct) > 1 else []
         # The first entry of the tier is the winner by declaration order, which follows
         # the order the evidence was written in the SQL.
-        return _Choice(resolved, tier[0], widened_from)
+        return ResolvedType(
+            type_name=resolved,
+            chosen=tier[0],
+            evidence=collected,
+            widened_from=distinct if len(distinct) > 1 else [],
+        )
 
-    return _Choice("unknown", None, [])
+    return ResolvedType(evidence=collected)
 
 
 def _sorted_evidence(evidence: list[TypeEvidence]) -> list[TypeEvidence]:
@@ -392,8 +385,8 @@ class _JoinGroups:
 def _unify_join_groups(
     groups: list[list[ColumnNode]],
     evidence: dict[ColumnNode, list[TypeEvidence]],
-    choices: dict[ColumnNode, _Choice],
-) -> list[ResolvedType]:
+    choices: dict[ColumnNode, ResolvedType],
+) -> list[ResolvedTypeName]:
     """Propagate one type across each join group, without erasing member evidence.
 
     Members of a join group have to share one value domain, so a group holding both an
@@ -404,15 +397,15 @@ def _unify_join_groups(
     weight of the member that justified it. Nothing already on the member is removed, so
     a diagnostic can still explain why the group settled where it did.
     """
-    unified_types: list[ResolvedType] = []
+    unified_types: list[ResolvedTypeName] = []
 
     for group in groups:
         # Annotated because a tuple built inside a comprehension has no expected type to
         # check against, so the literal union widens back to `str` without one.
-        known: list[tuple[ResolvedType, TypeEvidence | None, ColumnNode]] = [
-            (choices[node].resolved_type, choices[node].chosen, node)
+        known: list[tuple[ResolvedTypeName, TypeEvidence | None, ColumnNode]] = [
+            (choices[node].type_name, choices[node].chosen, node)
             for node in group
-            if node in choices and choices[node].resolved_type != "unknown"
+            if node in choices and choices[node].type_name != "unknown"
         ]
         if not known:
             unified_types.append("unknown")
@@ -427,20 +420,20 @@ def _unify_join_groups(
             if chosen is not None and chosen.weight == best_weight
         )
 
-        unified: ResolvedType = known[0][0]
+        unified: ResolvedTypeName = known[0][0]
         for resolved, _, _ in known[1:]:
             unified = widen(unified, resolved)
         unified_types.append(unified)
 
         for node in group:
             current = choices.get(node)
-            if current is not None and current.resolved_type == unified:
+            if current is not None and current.type_name == unified:
                 # Already agrees; leave its own evidence to speak for it.
                 continue
             evidence.setdefault(node, []).append(
                 TypeEvidence(
                     node=node,
-                    resolved_type=unified,
+                    type_name=unified,
                     weight=best_weight,
                     source="join_group",
                     kind="join_group",
@@ -489,7 +482,7 @@ def resolve_schema(analysis: SqlAnalysisResult) -> StatementSchema:
         )
         for node in nodes
     }
-    choices: dict[ColumnNode, _Choice] = {
+    choices: dict[ColumnNode, ResolvedType] = {
         node: _choose(items) for node, items in evidence.items()
     }
 
@@ -507,7 +500,6 @@ def resolve_schema(analysis: SqlAnalysisResult) -> StatementSchema:
 
     tables = _build_tables(
         analysis,
-        evidence,
         choices,
         predicates_by_node,
         nullability_by_node,
@@ -563,7 +555,7 @@ def _table_ref(name: str) -> RelationRef:
 
 def _build_join_groups(
     groups: list[list[ColumnNode]],
-    unified_types: list[ResolvedType],
+    unified_types: list[ResolvedTypeName],
     joins: list[JoinFact],
     union_find: _JoinGroups,
 ) -> list[JoinGroup]:
@@ -588,8 +580,7 @@ def _build_join_groups(
 
 def _build_tables(
     analysis: SqlAnalysisResult,
-    evidence: dict[ColumnNode, list[TypeEvidence]],
-    choices: dict[ColumnNode, _Choice],
+    choices: dict[ColumnNode, ResolvedType],
     predicates_by_node: dict[ColumnNode, list[PredicateFact]],
     nullability_by_node: dict[ColumnNode, list[NullabilityFact]],
     references_by_node: dict[ColumnNode, list[SourceSpan]],
@@ -601,14 +592,10 @@ def _build_tables(
         columns: list[ColumnSchema] = []
         for column in source.columns:
             node = ColumnNode(relation=ref, column=column.name)
-            choice = choices.get(node) or _Choice("unknown", None, [])
             columns.append(
                 ColumnSchema(
                     name=column.name,
-                    resolved_type=choice.resolved_type,
-                    chosen=choice.chosen,
-                    evidence=_sorted_evidence(evidence.get(node, [])),
-                    widened_from=choice.widened_from,
+                    type=choices.get(node) or ResolvedType(),
                     confidence=column.confidence,
                     nullability=_nullability(nullability_by_node.get(node, [])),
                     constraints=_constraints(predicates_by_node.get(node, [])),
@@ -671,9 +658,9 @@ def _constraints(facts: list[PredicateFact]) -> list[ValueConstraint]:
 def _build_projection(
     analysis: SqlAnalysisResult,
     evidence: dict[ColumnNode, list[TypeEvidence]],
-    choices: dict[ColumnNode, _Choice],
-) -> list[ProjectedColumnSchema]:
-    projection: list[ProjectedColumnSchema] = []
+    choices: dict[ColumnNode, ResolvedType],
+) -> list[ProjectionSchema]:
+    projection: list[ProjectionSchema] = []
     for projected in analysis.projection:
         node = ColumnNode(
             relation=RelationRef(kind="root", name=""),
@@ -698,24 +685,25 @@ def _build_projection(
             if from_expression is not None:
                 collected.append(from_expression)
 
-        choice = _choose(collected)
-        if choice.resolved_type == "unknown":
+        resolved = _choose(collected)
+        if resolved.type_name == "unknown":
             # Fall back to the origins' own resolved types, which include anything a join
-            # group propagated onto them after their own evidence was collected.
+            # group propagated onto them after their own evidence was collected. Only the
+            # conclusion carries over; the evidence stays listed against the origin, which
+            # is where the user has to look to change it.
             for origin in projected.origins:
-                origin_choice = choices.get(origin.node)
-                if origin_choice is not None and origin_choice.resolved_type != "unknown":
-                    choice = origin_choice
+                inherited = choices.get(origin.node)
+                if inherited is not None and inherited.type_name != "unknown":
+                    resolved = inherited.model_copy(
+                        update={"evidence": resolved.evidence}
+                    )
                     break
 
         projection.append(
-            ProjectedColumnSchema(
+            ProjectionSchema(
                 name=projected.name,
                 ordinal=projected.ordinal,
-                resolved_type=choice.resolved_type,
-                chosen=choice.chosen,
-                evidence=_sorted_evidence(collected),
-                widened_from=choice.widened_from,
+                type=resolved,
                 origins=[origin.node for origin in projected.origins],
                 span=projected.span,
                 alias_span=projected.alias_span,

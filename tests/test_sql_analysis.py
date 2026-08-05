@@ -189,16 +189,22 @@ def test_usage_arithmetic() -> None:
     assert {u.kind for u in result.usages} == {"arithmetic"}
 
 
-def test_usage_coalesce_default() -> None:
+def test_usage_function_argument() -> None:
     result = analyze_sql("select coalesce(bonus, 0) from person")
 
-    assert ("person", "bonus", "coalesce_default", "int") in usage_tuples(result)
+    assert ("person", "bonus", "function_argument", "int") in usage_tuples(result)
+
+
+def test_function_argument_is_not_only_coalesce() -> None:
+    result = analyze_sql("select greatest(bonus, 0) from person")
+
+    assert ("person", "bonus", "function_argument", "int") in usage_tuples(result)
 
 
 def test_coalesce_of_two_columns_carries_no_literal_evidence() -> None:
     result = analyze_sql("select coalesce(bonus, fallback) from person")
 
-    assert not [u for u in result.usages if u.kind == "coalesce_default"]
+    assert not [u for u in result.usages if u.kind == "function_argument"]
 
 
 def test_date_part_keyword_is_not_a_column() -> None:
