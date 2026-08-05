@@ -127,18 +127,37 @@ class ResolvedType(BaseModel):
 
 
 class NullabilityResolution(BaseModel):
-    nullable: bool | None = None
-    chosen: NullabilityFact | None = None
-    facts: list[NullabilityFact] = []
-    """Every nullability observation, including ones that did not decide the outcome."""
+    """What the statement proved about one column's nullability.
+
+    Only built when something was observed, and everything observed here has standing -
+    so unlike `ResolvedType`, which always exists and may say `unknown`, this either
+    decided or is absent. `ColumnSchema.nullability` is None for a column the statement
+    never said anything about.
+
+    Facts that describe the *join result* rather than the stored column - outer-join
+    padding - are not resolutions about this column and do not appear. They stay on
+    `SqlAnalysisResult.nullability`, located at the join that produced them.
+    """
+
+    nullable: bool
+    chosen: NullabilityFact
+    """The fact that decided. Always present: a fact with no standing never gets here."""
+    facts: list[NullabilityFact] = Field(min_length=1)
+    """Every observation about this column, including ones that lost to `chosen`."""
 
 
 class ColumnSchema(BaseModel):
     name: str
     resolved_type: ResolvedType = Field(default_factory=ResolvedType)
     confidence: Confidence = "explicit"
-    """How confidently the column was attributed to this table, not to its type."""
-    nullability: NullabilityResolution = Field(default_factory=NullabilityResolution)
+    """How confidently the column was attributed to this table."""
+    nullability: NullabilityResolution | None = None
+    """None when the statement said nothing about this column's nullability.
+
+    Unlike `resolved_type`, which always exists because `unknown` is itself an answer,
+    an absent resolution and a resolution that decided nothing are the same thing - so
+    only the former is representable.
+    """
     constraints: list[ValueConstraint] = []
     references: list[SourceSpan] = []
     """Every place the statement mentions this column."""
@@ -147,7 +166,8 @@ class ColumnSchema(BaseModel):
 
     @property
     def nullable(self) -> bool | None:
-        return self.nullability.nullable
+        """None when nothing was observed, not when something was observed and lost."""
+        return self.nullability.nullable if self.nullability is not None else None
 
     @property
     def location(self) -> SourceSpan | None:

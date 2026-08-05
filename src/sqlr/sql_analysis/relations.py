@@ -262,11 +262,24 @@ def number_shape(literals: Sequence[exp.Literal]) -> str:
     return "int"
 
 
-def literal_kind(literals: Sequence[exp.Literal]) -> LiteralKind:
-    if all(lit.is_string for lit in literals):
+def literal_kind(literals: Sequence[exp.Expr]) -> LiteralKind:
+    """The one kind every value shares, or `mixed`.
+
+    Takes `exp.Expr` rather than `exp.Literal` because sqlglot parses `true` and `false`
+    into `exp.Boolean`, which is not a literal node at all.
+    """
+    if not literals:
+        return "mixed"
+    if all(isinstance(lit, exp.Boolean) for lit in literals):
+        return "boolean"
+
+    values = [lit for lit in literals if isinstance(lit, exp.Literal)]
+    if len(values) != len(literals):
+        return "mixed"
+    if all(lit.is_string for lit in values):
         return "string"
-    if all(lit.is_number for lit in literals):
-        return "int" if number_shape(literals) == "int" else "float"
+    if all(lit.is_number for lit in values):
+        return "int" if number_shape(values) == "int" else "float"
     return "mixed"
 
 
@@ -306,7 +319,7 @@ def _literal_kinds(expression: exp.Expr) -> list[LiteralKind]:
     """
     kinds: list[LiteralKind] = []
     for argument in expression.iter_expressions():
-        if isinstance(argument, exp.Literal):
+        if isinstance(argument, (exp.Literal, exp.Boolean)):
             kind = literal_kind([argument])
             if kind not in kinds:
                 kinds.append(kind)

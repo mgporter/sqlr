@@ -11,6 +11,7 @@ See `__init__.py` for the pipeline as a whole.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import NamedTuple
 
 from pydantic import BaseModel
@@ -128,6 +129,10 @@ def classify_usage(column: exp.Column) -> list[tuple[str, str | None]]:
 
     if isinstance(parent, COMPARISON_CLASSES):
         other = parent.right if parent.left is column else parent.left
+        if isinstance(other, exp.Boolean):
+            # `flag = true` is as strong a claim as `where flag` - sqlglot just parses
+            # the keyword into `exp.Boolean` rather than a literal.
+            return [("compared_to_boolean", None)]
         if isinstance(other, exp.Literal):
             if other.is_number:
                 return [("compared_to_number", number_shape([other]))]
@@ -137,8 +142,11 @@ def classify_usage(column: exp.Column) -> list[tuple[str, str | None]]:
         return []
 
     if isinstance(parent, exp.In) and parent.this is column:
-        literals = parent.expressions
-        if literals and all(isinstance(e, exp.Literal) for e in literals):
+        values = parent.expressions
+        if values and all(isinstance(e, exp.Boolean) for e in values):
+            return [("in_list_booleans", None)]
+        literals = [e for e in values if isinstance(e, exp.Literal)]
+        if values and len(literals) == len(values):
             if all(e.is_string for e in literals):
                 return [("in_list_strings", None)]
             if all(e.is_number for e in literals):
@@ -159,7 +167,7 @@ def classify_usage(column: exp.Column) -> list[tuple[str, str | None]]:
         siblings = [
             argument
             for argument in parent.iter_expressions()
-            if isinstance(argument, exp.Literal)
+            if isinstance(argument, (exp.Literal, exp.Boolean))
         ]
         if siblings:
             return [("function_argument", literal_kind(siblings))]
@@ -194,11 +202,22 @@ def _function_argument_usage(
     return None
 
 
+def _value_text(expression: exp.Expr) -> str:
+    """A literal's value as it would be written in SQL.
+
+    `exp.Boolean` holds a Python bool, so `str` on it would yield `True` rather than the
+    `true` a generated fixture has to emit.
+    """
+    if isinstance(expression, exp.Boolean):
+        return "true" if expression.this else "false"
+    return str(expression.this)
+
+
 class _Predicate(NamedTuple):
     operator: PredicateOperator
     values: list[str]
     literal_kind: LiteralKind | None
-    literals: list[exp.Literal]
+    literals: Sequence[exp.Expr]
     """The literal nodes `values` came from, so their positions can be recovered.
 
     Fixture generation needs both halves: `> 20` says the column is a number *and* that
@@ -216,23 +235,25 @@ def _predicate(column: exp.Column) -> _Predicate | None:
 
     if isinstance(parent, COMPARISON_CLASSES):
         other = parent.right if parent.left is column else parent.left
-        if not isinstance(other, exp.Literal):
+        if not isinstance(other, (exp.Literal, exp.Boolean)):
             return None
         operator = COMPARISON_OPERATORS[type(parent)]
         if parent.right is column:
             operator = FLIPPED_OPERATORS[operator]
-        return _Predicate(operator, [str(other.this)], literal_kind([other]), [other])
+        return _Predicate(operator, [_value_text(other)], literal_kind([other]), [other])
 
     if isinstance(parent, exp.In) and parent.this is column:
-        literals = [e for e in parent.expressions if isinstance(e, exp.Literal)]
-        if not literals or len(literals) != len(parent.expressions):
+        values = [
+            e for e in parent.expressions if isinstance(e, (exp.Literal, exp.Boolean))
+        ]
+        if not values or len(values) != len(parent.expressions):
             return None
         operator = "not_in" if isinstance(parent.parent, exp.Not) else "in"
         return _Predicate(
             operator,
-            [str(lit.this) for lit in literals],
-            literal_kind(literals),
-            literals,
+            [_value_text(value) for value in values],
+            literal_kind(values),
+            values,
         )
 
     if isinstance(parent, (exp.Like, exp.ILike)) and parent.this is column:

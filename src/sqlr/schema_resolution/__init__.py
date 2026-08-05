@@ -54,6 +54,8 @@ __all__ = ["resolve_schema", "widen", "TYPE_COVER", "WIDENING_ORDER"]
 # have been anything castable. It types the derived column instead, via `cast_type`.
 USAGE_TYPE_WEIGHT: dict[str, int] = {
     "boolean_context": 90,
+    "compared_to_boolean": 90,
+    "in_list_booleans": 90,
     "date_function": 70,
     "function_argument": 65,
     "in_list_strings": 60,
@@ -111,6 +113,7 @@ LITERAL_KIND_TYPE: dict[LiteralKind, ResolvedTypeName] = {
     "int": "numeric",
     "float": "numeric",
     "string": "string",
+    "boolean": "boolean",
 }
 
 NULLABILITY_WEIGHT: dict[str, int] = {
@@ -118,8 +121,9 @@ NULLABILITY_WEIGHT: dict[str, int] = {
     "is_not_null_predicate": 3,
     "coalesce_argument": 2,
     "inner_join_key": 1,
-    # `outer_join_padded` describes the join result, not the stored column, so it does
-    # not decide source nullability. It stays available on the resolution's fact list.
+    # `outer_join_padded` is absent on purpose, and absence means more than "loses": it
+    # describes the join result rather than the stored column, so `_nullability` drops it
+    # instead of recording it as a fact about the source. See there.
 }
 
 NAME_PATTERNS: list[tuple[Literal["prefix", "suffix"], str, ResolvedTypeName]] = [
@@ -143,7 +147,7 @@ def _usage_evidence(usage: UsageFact) -> TypeEvidence | None:
         return None
 
     resolved: ResolvedTypeName | None
-    if usage.kind == "boolean_context":
+    if usage.kind in ("boolean_context", "compared_to_boolean", "in_list_booleans"):
         resolved = "boolean"
     elif usage.kind == "date_function":
         resolved = "date"
@@ -613,18 +617,27 @@ def _build_tables(
     return tables
 
 
-def _nullability(facts: list[NullabilityFact]) -> NullabilityResolution:
-    best_weight = 0
-    chosen: NullabilityFact | None = None
-    for fact in facts:
-        weight = NULLABILITY_WEIGHT.get(fact.reason, 0)
-        if weight > best_weight:
-            best_weight = weight
-            chosen = fact
+def _nullability(facts: list[NullabilityFact]) -> NullabilityResolution | None:
+    """The nullability of one source column, or None when nothing spoke to it.
+
+    A reason missing from `NULLABILITY_WEIGHT` carries no standing *about the source
+    column* and is dropped rather than kept as a resolution that decides nothing. Today
+    that is `outer_join_padded`, which describes the join result: the padding is real,
+    but it is a property of the query's output, not of the stored column, and attaching
+    it here makes it look otherwise. It stays on `SqlAnalysisResult.nullability`, keyed
+    by reference and located at the join, until the projection can carry it per scope.
+    """
+    weighted = [(NULLABILITY_WEIGHT.get(fact.reason, 0), fact) for fact in facts]
+    standing = [(weight, fact) for weight, fact in weighted if weight > 0]
+    if not standing:
+        return None
+
+    # First maximum wins, so the earliest observation decides a tie.
+    _, chosen = max(standing, key=lambda pair: pair[0])
     return NullabilityResolution(
-        nullable=None if chosen is None else chosen.nullable,
+        nullable=chosen.nullable,
         chosen=chosen,
-        facts=facts,
+        facts=[fact for _, fact in standing],
     )
 
 

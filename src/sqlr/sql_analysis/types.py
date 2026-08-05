@@ -30,8 +30,10 @@ CONFIDENCE_RANK: dict[Confidence, int] = {"explicit": 3, "inferred": 2, "guessed
 UsageKind = Literal[
     "compared_to_number",
     "compared_to_string",
+    "compared_to_boolean",
     "in_list_strings",
     "in_list_numbers",
+    "in_list_booleans",
     "like",
     "boolean_context",
     "arithmetic",
@@ -58,7 +60,7 @@ PredicateOperator = Literal[
     "is_not_null",
 ]
 
-LiteralKind = Literal["int", "float", "string", "mixed"]
+LiteralKind = Literal["int", "float", "string", "boolean", "mixed"]
 
 NullabilityReason = Literal[
     "is_null_predicate",

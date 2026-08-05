@@ -353,6 +353,24 @@ def test_filter_predicate_is_extracted() -> None:
     assert ("amount", ">=", ("5",), "int") in predicates
 
 
+def test_boolean_predicate_is_extracted() -> None:
+    result = analyze_sql("select id from orders where shipped = true and paid in (false)")
+
+    assert {
+        (p.node.column, p.operator, tuple(p.values), p.literal_kind)
+        for p in result.predicates
+    } == {
+        ("shipped", "=", ("true",), "boolean"),
+        ("paid", "in", ("false",), "boolean"),
+    }
+
+
+def test_boolean_comparison_is_reported_as_usage() -> None:
+    result = analyze_sql("select id from orders where shipped = true")
+
+    assert ("orders", "shipped", "compared_to_boolean", None) in usage_tuples(result)
+
+
 def test_reversed_comparison_operator_is_flipped() -> None:
     result = analyze_sql("select id from orders where 100 < amount")
 

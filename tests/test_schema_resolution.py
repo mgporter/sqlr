@@ -66,6 +66,31 @@ def test_in_list_strings_infers_string() -> None:
     assert cols["status"] == ("string", "usage")
 
 
+def test_boolean_comparison_infers_boolean() -> None:
+    # `true` parses to `exp.Boolean`, not `exp.Literal`, so it needs its own arm.
+    cols = _columns_by_name("select id from orders where shipped = true")
+
+    assert cols["shipped"] == ("boolean", "usage")
+
+
+def test_boolean_comparison_beats_a_disagreeing_name_pattern() -> None:
+    cols = _columns_by_name("select id from orders where paid_amount = false")
+
+    assert cols["paid_amount"] == ("boolean", "usage")
+
+
+def test_in_list_booleans_infers_boolean() -> None:
+    cols = _columns_by_name("select id from orders where shipped in (true, false)")
+
+    assert cols["shipped"] == ("boolean", "usage")
+
+
+def test_boolean_literal_argument_types_its_neighbour() -> None:
+    cols = _columns_by_name("select coalesce(shipped, false) as shipped from orders")
+
+    assert cols["shipped"] == ("boolean", "usage")
+
+
 def test_date_function_infers_date() -> None:
     cols = _columns_by_name("select date_trunc('day', created_at) from orders")
 
@@ -289,12 +314,6 @@ def test_is_null_predicate_sets_nullable_true() -> None:
     assert columns_of(schema, "orders")["shipped_on"].nullable is True
 
 
-def test_outer_join_padding_does_not_decide_source_nullability() -> None:
-    schema = resolve_schema(analyze_file(PERSON_SQL))
-
-    assert columns_of(schema, "mydatabase.myschema.address")["street"].nullable is None
-
-
 def test_attribution_confidence_is_carried_through() -> None:
     schema = resolve_schema(analyze_file(PERSON_SQL))
 
@@ -484,6 +503,15 @@ def test_constraints_keep_the_literal_kind() -> None:
     assert constraint.literal_kind == "int"
 
 
+def test_boolean_constraint_keeps_sql_spelling_of_the_value() -> None:
+    # `exp.Boolean` holds a Python bool; a generator has to emit `true`, not `True`.
+    schema = schema_for("select id from orders where shipped = true")
+
+    [constraint] = columns_of(schema, "orders")["shipped"].constraints
+    assert (constraint.operator, constraint.values) == ("=", ["true"])
+    assert constraint.literal_kind == "boolean"
+
+
 def test_constraints_are_located_for_every_literal() -> None:
     schema = schema_for("select id from orders where status in ('a', 'b')")
 
@@ -507,26 +535,57 @@ def test_an_identical_predicate_at_one_place_is_kept_once() -> None:
     assert len(columns_of(schema, "orders")["qty"].constraints) == 1
 
 
-# ---- nullability keeps its losing facts ---------------------------------------------
+# ---- nullability is attached only when something decided it -------------------------
 
 
-def test_nullability_keeps_every_fact_including_the_ones_that_lost() -> None:
+def test_a_column_nothing_was_observed_about_has_no_resolution() -> None:
+    schema = schema_for("select id from orders")
+
+    assert columns_of(schema, "orders")["id"].nullability is None
+
+
+def test_outer_join_padding_produces_no_resolution_at_all() -> None:
+    # The padding is real, but it describes the join result rather than the stored
+    # column, so it must not surface as a resolution about the source.
     schema = resolve_schema(analyze_file(PERSON_SQL))
 
     street = columns_of(schema, "mydatabase.myschema.address")["street"]
+    assert street.nullability is None
     assert street.nullable is None
-    # `outer_join_padded` describes the join result, not the stored column, so it does
-    # not decide - but it is still available to anything that wants it.
-    assert [f.reason for f in street.nullability.facts] == ["outer_join_padded"]
+
+
+def test_outer_join_padding_survives_on_the_analysis_result() -> None:
+    # Dropping it from the schema must not destroy it: the fact is still there, located
+    # at the join, for whatever comes to model per-scope padding later.
+    result = analyze_file(PERSON_SQL)
+
+    assert [f.reason for f in result.nullability if f.node.column == "street"] == [
+        "outer_join_padded"
+    ]
 
 
 def test_the_deciding_nullability_fact_is_identified() -> None:
     schema = schema_for("select id from orders where shipped_on is not null")
 
     resolution = columns_of(schema, "orders")["shipped_on"].nullability
+    assert resolution is not None
     assert resolution.nullable is False
-    assert resolution.chosen is not None
     assert resolution.chosen.reason == "is_not_null_predicate"
+
+
+def test_nullability_keeps_every_fact_including_the_ones_that_lost() -> None:
+    schema = schema_for(
+        "select o.id from orders o join lines l on o.id = l.order_id\nwhere o.id is null"
+    )
+
+    resolution = columns_of(schema, "orders")["id"].nullability
+    assert resolution is not None
+    # `is_null_predicate` outweighs `inner_join_key`, but the loser is still available.
+    assert resolution.chosen.reason == "is_null_predicate"
+    assert sorted(f.reason for f in resolution.facts) == [
+        "inner_join_key",
+        "is_null_predicate",
+    ]
 
 
 # ---- column references and lookups --------------------------------------------------

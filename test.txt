@@ -78,11 +78,7 @@
             "widened_from": []
           },
           "confidence": "inferred",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -175,11 +171,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [
             {
               "operator": "=",
@@ -236,11 +228,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -333,11 +321,7 @@
             "widened_from": []
           },
           "confidence": "inferred",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -368,11 +352,7 @@
             "widened_from": []
           },
           "confidence": "inferred",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -451,11 +431,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -540,11 +516,7 @@
             "widened_from": []
           },
           "confidence": "inferred",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -1015,11 +987,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -1042,11 +1010,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -1069,11 +1033,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -1182,11 +1142,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -1424,11 +1380,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -1455,10 +1407,10 @@
                 "column": "is_active"
               },
               "type_name": "boolean",
-              "weight": 5,
-              "source": "name_pattern",
-              "kind": "name_pattern",
-              "detail": "is_*",
+              "weight": 90,
+              "source": "usage",
+              "kind": "usage",
+              "detail": "compared_to_boolean",
               "span": {
                 "start": 672,
                 "end": 681,
@@ -1467,10 +1419,48 @@
                 "end_line": 23,
                 "end_col": 21
               },
-              "context_span": null,
+              "context_span": {
+                "start": 672,
+                "end": 681,
+                "start_line": 23,
+                "start_col": 12,
+                "end_line": 23,
+                "end_col": 21
+              },
               "via": null
             },
             "evidence": [
+              {
+                "node": {
+                  "relation": {
+                    "kind": "table",
+                    "name": "mydatabase.myschema.raw_department"
+                  },
+                  "column": "is_active"
+                },
+                "type_name": "boolean",
+                "weight": 90,
+                "source": "usage",
+                "kind": "usage",
+                "detail": "compared_to_boolean",
+                "span": {
+                  "start": 672,
+                  "end": 681,
+                  "start_line": 23,
+                  "start_col": 12,
+                  "end_line": 23,
+                  "end_col": 21
+                },
+                "context_span": {
+                  "start": 672,
+                  "end": 681,
+                  "start_line": 23,
+                  "start_col": 12,
+                  "end_line": 23,
+                  "end_col": 21
+                },
+                "via": null
+              },
               {
                 "node": {
                   "relation": {
@@ -1499,12 +1489,35 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
-          "constraints": [],
+          "nullability": null,
+          "constraints": [
+            {
+              "operator": "=",
+              "values": [
+                "true"
+              ],
+              "literal_kind": "boolean",
+              "span": {
+                "start": 672,
+                "end": 681,
+                "start_line": 23,
+                "start_col": 12,
+                "end_line": 23,
+                "end_col": 21
+              },
+              "context_span": {
+                "start": 672,
+                "end": 681,
+                "start_line": 23,
+                "start_col": 12,
+                "end_line": 23,
+                "end_col": 21
+              },
+              "value_spans": [
+                null
+              ]
+            }
+          ],
           "references": [
             {
               "start": 672,
@@ -1675,11 +1688,7 @@
             "widened_from": []
           },
           "confidence": "inferred",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -1772,11 +1781,7 @@
             "widened_from": []
           },
           "confidence": "inferred",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -1799,11 +1804,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -1920,11 +1921,7 @@
             "widened_from": []
           },
           "confidence": "inferred",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -2033,11 +2030,7 @@
             "widened_from": []
           },
           "confidence": "inferred",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -2154,11 +2147,7 @@
             "widened_from": []
           },
           "confidence": "inferred",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -2229,11 +2218,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -2318,11 +2303,7 @@
             "widened_from": []
           },
           "confidence": "inferred",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -2415,11 +2396,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [
             {
               "operator": "in",
@@ -3389,33 +3366,6 @@
                 },
                 "nullable": true,
                 "reason": "coalesce_argument"
-              },
-              {
-                "span": {
-                  "start": 148,
-                  "end": 162,
-                  "start_line": 9,
-                  "start_col": 11,
-                  "end_line": 9,
-                  "end_col": 25
-                },
-                "context_span": {
-                  "start": 455,
-                  "end": 497,
-                  "start_line": 19,
-                  "start_col": 10,
-                  "end_line": 20,
-                  "end_col": 32
-                },
-                "node": {
-                  "relation": {
-                    "kind": "table",
-                    "name": "address"
-                  },
-                  "column": "full_address"
-                },
-                "nullable": true,
-                "reason": "outer_join_padded"
               }
             ]
           },
@@ -3441,39 +3391,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": [
-              {
-                "span": {
-                  "start": 486,
-                  "end": 497,
-                  "start_line": 20,
-                  "start_col": 21,
-                  "end_line": 20,
-                  "end_col": 32
-                },
-                "context_span": {
-                  "start": 455,
-                  "end": 497,
-                  "start_line": 19,
-                  "start_col": 10,
-                  "end_line": 20,
-                  "end_col": 32
-                },
-                "node": {
-                  "relation": {
-                    "kind": "table",
-                    "name": "address"
-                  },
-                  "column": "person_id"
-                },
-                "nullable": true,
-                "reason": "outer_join_padded"
-              }
-            ]
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -3502,39 +3420,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": [
-              {
-                "span": {
-                  "start": 73,
-                  "end": 86,
-                  "start_line": 5,
-                  "start_col": 2,
-                  "end_line": 5,
-                  "end_col": 15
-                },
-                "context_span": {
-                  "start": 393,
-                  "end": 444,
-                  "start_line": 17,
-                  "start_col": 10,
-                  "end_line": 18,
-                  "end_col": 38
-                },
-                "node": {
-                  "relation": {
-                    "kind": "table",
-                    "name": "department"
-                  },
-                  "column": "cost_center"
-                },
-                "nullable": true,
-                "reason": "outer_join_padded"
-              }
-            ]
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -3557,39 +3443,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": [
-              {
-                "span": {
-                  "start": 429,
-                  "end": 444,
-                  "start_line": 18,
-                  "start_col": 23,
-                  "end_line": 18,
-                  "end_col": 38
-                },
-                "context_span": {
-                  "start": 393,
-                  "end": 444,
-                  "start_line": 17,
-                  "start_col": 10,
-                  "end_line": 18,
-                  "end_col": 38
-                },
-                "node": {
-                  "relation": {
-                    "kind": "table",
-                    "name": "department"
-                  },
-                  "column": "department_id"
-                },
-                "nullable": true,
-                "reason": "outer_join_padded"
-              }
-            ]
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -3660,39 +3514,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": [
-              {
-                "span": {
-                  "start": 52,
-                  "end": 69,
-                  "start_line": 4,
-                  "start_col": 2,
-                  "end_line": 4,
-                  "end_col": 19
-                },
-                "context_span": {
-                  "start": 393,
-                  "end": 444,
-                  "start_line": 17,
-                  "start_col": 10,
-                  "end_line": 18,
-                  "end_col": 38
-                },
-                "node": {
-                  "relation": {
-                    "kind": "table",
-                    "name": "department"
-                  },
-                  "column": "department_name"
-                },
-                "nullable": true,
-                "reason": "outer_join_padded"
-              }
-            ]
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -3721,11 +3543,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -3810,11 +3628,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -3837,11 +3651,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -3864,11 +3674,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -3891,11 +3697,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -3982,11 +3784,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -4071,11 +3869,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -4168,11 +3962,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [
             {
               "operator": ">=",
@@ -4291,39 +4081,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": [
-              {
-                "span": {
-                  "start": 228,
-                  "end": 246,
-                  "start_line": 12,
-                  "start_col": 2,
-                  "end_line": 12,
-                  "end_col": 20
-                },
-                "context_span": {
-                  "start": 508,
-                  "end": 550,
-                  "start_line": 21,
-                  "start_col": 10,
-                  "end_line": 22,
-                  "end_col": 34
-                },
-                "node": {
-                  "relation": {
-                    "kind": "table",
-                    "name": "sales"
-                  },
-                  "column": "avg_order_amount"
-                },
-                "nullable": true,
-                "reason": "outer_join_padded"
-              }
-            ]
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -4346,39 +4104,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": [
-              {
-                "span": {
-                  "start": 194,
-                  "end": 207,
-                  "start_line": 10,
-                  "start_col": 2,
-                  "end_line": 10,
-                  "end_col": 15
-                },
-                "context_span": {
-                  "start": 508,
-                  "end": 550,
-                  "start_line": 21,
-                  "start_col": 10,
-                  "end_line": 22,
-                  "end_col": 34
-                },
-                "node": {
-                  "relation": {
-                    "kind": "table",
-                    "name": "sales"
-                  },
-                  "column": "daily_total"
-                },
-                "nullable": true,
-                "reason": "outer_join_padded"
-              }
-            ]
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -4401,39 +4127,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": [
-              {
-                "span": {
-                  "start": 269,
-                  "end": 294,
-                  "start_line": 14,
-                  "start_col": 2,
-                  "end_line": 14,
-                  "end_col": 27
-                },
-                "context_span": {
-                  "start": 508,
-                  "end": 550,
-                  "start_line": 21,
-                  "start_col": 10,
-                  "end_line": 22,
-                  "end_col": 34
-                },
-                "node": {
-                  "relation": {
-                    "kind": "table",
-                    "name": "sales"
-                  },
-                  "column": "distinct_customer_count"
-                },
-                "nullable": true,
-                "reason": "outer_join_padded"
-              }
-            ]
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -4456,39 +4150,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": [
-              {
-                "span": {
-                  "start": 537,
-                  "end": 550,
-                  "start_line": 22,
-                  "start_col": 21,
-                  "end_line": 22,
-                  "end_col": 34
-                },
-                "context_span": {
-                  "start": 508,
-                  "end": 550,
-                  "start_line": 21,
-                  "start_col": 10,
-                  "end_line": 22,
-                  "end_col": 34
-                },
-                "node": {
-                  "relation": {
-                    "kind": "table",
-                    "name": "sales"
-                  },
-                  "column": "employee_id"
-                },
-                "nullable": true,
-                "reason": "outer_join_padded"
-              }
-            ]
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -4511,39 +4173,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": [
-              {
-                "span": {
-                  "start": 211,
-                  "end": 224,
-                  "start_line": 11,
-                  "start_col": 2,
-                  "end_line": 11,
-                  "end_col": 15
-                },
-                "context_span": {
-                  "start": 508,
-                  "end": 550,
-                  "start_line": 21,
-                  "start_col": 10,
-                  "end_line": 22,
-                  "end_col": 34
-                },
-                "node": {
-                  "relation": {
-                    "kind": "table",
-                    "name": "sales"
-                  },
-                  "column": "order_count"
-                },
-                "nullable": true,
-                "reason": "outer_join_padded"
-              }
-            ]
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -4566,39 +4196,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": [
-              {
-                "span": {
-                  "start": 250,
-                  "end": 265,
-                  "start_line": 13,
-                  "start_col": 2,
-                  "end_line": 13,
-                  "end_col": 17
-                },
-                "context_span": {
-                  "start": 508,
-                  "end": 550,
-                  "start_line": 21,
-                  "start_col": 10,
-                  "end_line": 22,
-                  "end_col": 34
-                },
-                "node": {
-                  "relation": {
-                    "kind": "table",
-                    "name": "sales"
-                  },
-                  "column": "running_total"
-                },
-                "nullable": true,
-                "reason": "outer_join_padded"
-              }
-            ]
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -5602,11 +5200,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -5633,10 +5227,10 @@
                 "column": "is_active"
               },
               "type_name": "boolean",
-              "weight": 5,
-              "source": "name_pattern",
-              "kind": "name_pattern",
-              "detail": "is_*",
+              "weight": 90,
+              "source": "usage",
+              "kind": "usage",
+              "detail": "compared_to_boolean",
               "span": {
                 "start": 790,
                 "end": 801,
@@ -5645,10 +5239,48 @@
                 "end_line": 36,
                 "end_col": 21
               },
-              "context_span": null,
+              "context_span": {
+                "start": 790,
+                "end": 801,
+                "start_line": 36,
+                "start_col": 10,
+                "end_line": 36,
+                "end_col": 21
+              },
               "via": null
             },
             "evidence": [
+              {
+                "node": {
+                  "relation": {
+                    "kind": "table",
+                    "name": "mydatabase.myschema.customer"
+                  },
+                  "column": "is_active"
+                },
+                "type_name": "boolean",
+                "weight": 90,
+                "source": "usage",
+                "kind": "usage",
+                "detail": "compared_to_boolean",
+                "span": {
+                  "start": 790,
+                  "end": 801,
+                  "start_line": 36,
+                  "start_col": 10,
+                  "end_line": 36,
+                  "end_col": 21
+                },
+                "context_span": {
+                  "start": 790,
+                  "end": 801,
+                  "start_line": 36,
+                  "start_col": 10,
+                  "end_line": 36,
+                  "end_col": 21
+                },
+                "via": null
+              },
               {
                 "node": {
                   "relation": {
@@ -5677,12 +5309,35 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
-          "constraints": [],
+          "nullability": null,
+          "constraints": [
+            {
+              "operator": "=",
+              "values": [
+                "true"
+              ],
+              "literal_kind": "boolean",
+              "span": {
+                "start": 790,
+                "end": 801,
+                "start_line": 36,
+                "start_col": 10,
+                "end_line": 36,
+                "end_col": 21
+              },
+              "context_span": {
+                "start": 790,
+                "end": 801,
+                "start_line": 36,
+                "start_col": 10,
+                "end_line": 36,
+                "end_col": 21
+              },
+              "value_spans": [
+                null
+              ]
+            }
+          ],
           "references": [
             {
               "start": 790,
@@ -5772,11 +5427,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [
             {
               "operator": ">",
@@ -5873,11 +5524,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -5924,39 +5571,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": [
-              {
-                "span": {
-                  "start": 1593,
-                  "end": 1606,
-                  "start_line": 64,
-                  "start_col": 23,
-                  "end_line": 64,
-                  "end_col": 36
-                },
-                "context_span": {
-                  "start": 1552,
-                  "end": 1606,
-                  "start_line": 63,
-                  "start_col": 12,
-                  "end_line": 64,
-                  "end_col": 36
-                },
-                "node": {
-                  "relation": {
-                    "kind": "table",
-                    "name": "mydatabase.myschema.instore_order"
-                  },
-                  "column": "employee_id"
-                },
-                "nullable": true,
-                "reason": "outer_join_padded"
-              }
-            ]
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -6107,11 +5722,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -6174,11 +5785,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -6277,11 +5884,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [
             {
               "operator": ">",
@@ -6378,11 +5981,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -6429,39 +6028,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": [
-              {
-                "span": {
-                  "start": 1593,
-                  "end": 1606,
-                  "start_line": 64,
-                  "start_col": 23,
-                  "end_line": 64,
-                  "end_col": 36
-                },
-                "context_span": {
-                  "start": 1552,
-                  "end": 1606,
-                  "start_line": 63,
-                  "start_col": 12,
-                  "end_line": 64,
-                  "end_col": 36
-                },
-                "node": {
-                  "relation": {
-                    "kind": "table",
-                    "name": "mydatabase.myschema.online_order"
-                  },
-                  "column": "employee_id"
-                },
-                "nullable": true,
-                "reason": "outer_join_padded"
-              }
-            ]
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -6612,11 +6179,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {
@@ -6679,11 +6242,7 @@
             "widened_from": []
           },
           "confidence": "explicit",
-          "nullability": {
-            "nullable": null,
-            "chosen": null,
-            "facts": []
-          },
+          "nullability": null,
           "constraints": [],
           "references": [
             {

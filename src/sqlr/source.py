@@ -18,7 +18,9 @@ them:
 
 - **Bare keywords are invisible.** `shipped_on is null` spans only `shipped_on`, because
   no token is emitted for `IS NULL`. The location is right, just narrower than a reader
-  would draw it.
+  would draw it. `TRUE` and `FALSE` fall in the same class: sqlglot parses them into
+  `exp.Boolean`, which carries no position, so `is_active = true` spans only `is_active`
+  and the constraint's `value_spans` entry for the `true` is None.
 - **Punctuation is invisible too**, but that one is repairable and is repaired: see
   `_balance_parens`, which grows a hull back over the brackets its leaves left behind.
 """
