@@ -8,3 +8,4 @@ general:
     - "**/*.sql"
   sql_dialect: snowflake
   star_over_join_behavior: guess
+  model_paths: project

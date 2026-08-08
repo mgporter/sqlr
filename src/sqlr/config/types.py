@@ -1,9 +1,10 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from sqlr.config.defaults import (
     DEFAULT_FIXTURE_DIRECTORY,
+    DEFAULT_MODEL_PATHS,
     DEFAULT_ROW_COUNT,
     DEFAULT_SEED,
     DEFAULT_SQL_DIALECT,
@@ -31,6 +32,18 @@ class GeneralConfig(BaseModel):
     sql_file_globs: list[str] = Field(default_factory=lambda: list(DEFAULT_SQL_FILE_GLOBS))
     sql_dialect: str | None = DEFAULT_SQL_DIALECT
     star_over_join_behavior: StarOverJoinBehavior = DEFAULT_STAR_OVER_JOIN_BEHAVIOR  # type: ignore[assignment]
+    model_paths: list[str] | None = DEFAULT_MODEL_PATHS
+    """Directories, relative to the project root, that hold models.
+
+    None - the default - means the whole project is searched. Naming paths narrows model
+    *selection* only: a model can still read a SQL file that lives elsewhere.
+    """
+
+    @field_validator("model_paths", "sql_file_globs", mode="before")
+    @classmethod
+    def _allow_a_bare_string(cls, value: object) -> object:
+        """`model_paths: models` is what a person writes; treat it as a one-item list."""
+        return [value] if isinstance(value, str) else value
 
 
 class SqlrConfig(BaseModel):
