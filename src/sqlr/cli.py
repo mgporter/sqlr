@@ -6,19 +6,9 @@ import typer
 from rich.console import Console
 
 from sqlr import config as config_module
-from sqlr.catalog import find_sql_files, find_yaml_files
+from sqlr.catalog import find_yaml_files
 from sqlr.config.types import SqlrConfig
 from sqlr.declared import load_declared_schemas
-from sqlr.diagnostics import (
-    DiagnosticReport,
-    check_schema,
-    codes,
-    from_analysis,
-    render_text,
-    to_lsp,
-    unresolved_types,
-)
-from sqlr.diagnostics.types import Diagnostic, Location
 from sqlr.schema_resolution import resolve_schema
 from sqlr.schema_resolution.render import render_schema
 from sqlr.schema_resolution.types import StatementSchema
@@ -29,6 +19,8 @@ from sqlr.selection import (
     select_models,
 )
 from sqlr.sql_analysis import analyze_file
+from sqlr.validation import render_errors, render_validation, validate_schema
+from sqlr.validation.types import StatementValidation
 
 app = typer.Typer(no_args_is_help=True)
 logger = logging.getLogger("sqlr")
@@ -37,86 +29,6 @@ logger = logging.getLogger("sqlr")
 def _configure_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
-
-
-@app.command()
-def check(
-    project_dir: Path | None = typer.Option(
-        None, "--project-dir", help="Path to the root of the project."
-    ),
-    verbose: bool = typer.Option(
-        False, "--verbose", "-v", help="Enable debug logging."
-    ),
-    output_format: str = typer.Option(
-        "text", "--format", help="Diagnostic output format: text or json (LSP shape)."
-    ),
-    strict: bool = typer.Option(
-        False, "--strict", help="Exit non-zero when any diagnostic is an error."
-    ),
-) -> None:
-    """Analyse every SQL file in the project and report diagnostics."""
-    _configure_logging(verbose)
-
-    root, cfg = _load_project(project_dir)
-
-    file_inventory = find_sql_files(root, cfg.general.sql_file_globs)
-    logger.info("found %d SQL files in project root %s", len(file_inventory.files), root)
-
-    # Declarations are a project-wide index: a mismatch in one file is usually against a
-    # type declared for a different one, so they are loaded once, before the loop.
-    declared = load_declared_schemas(find_yaml_files(root))
-    logger.info("found %d declared models", len(declared.models))
-
-    report = DiagnosticReport()
-    report.extend(
-        [
-            Diagnostic(
-                code=codes.DECLARATION_WARNING,
-                severity="warning",
-                message=warning,
-                location=Location(),
-            )
-            for warning in declared.warnings
-        ]
-    )
-
-    for sql_file in file_inventory.files:
-        logger.debug("analyzing %s", sql_file.relative_path)
-        result = analyze_file(
-            sql_file.path,
-            dialect=cfg.general.sql_dialect,
-            star_over_join_behavior=cfg.general.star_over_join_behavior,
-        )
-
-        report.extend(
-            from_analysis(
-                result.source, result.errors, result.warnings, result.ambiguities
-            )
-        )
-        if result.errors:
-            continue
-
-        logger.info(
-            "analysis of %s: %d relations, %d external sources, %d projected columns",
-            sql_file.relative_path,
-            len(result.relations),
-            len(result.sources),
-            len(result.projection),
-        )
-
-        schema = resolve_schema(result)
-        report.extend(check_schema(schema, declared, sql_file.path))
-        report.extend(unresolved_types(schema, declared))
-
-    if output_format == "json":
-        typer.echo(json.dumps(to_lsp(report), indent=2))
-    else:
-        rendered = render_text(report)
-        if rendered:
-            typer.echo(rendered)
-
-    if strict and report.has_errors:
-        raise typer.Exit(code=1)
 
 
 @app.command(
@@ -148,28 +60,8 @@ def infer_schema(
     root, cfg = _load_project(project_dir)
     # Click has no variadic option, so `--select a b` leaves `b` in the extra args. They
     # are selectors too; anything starting with `-` still fails as an unknown option.
-    models = _select(root, cfg, [*select, *ctx.args])
-
-    console = Console()
-    schemas: list[StatementSchema] = []
-
-    for model in models:
-        logger.debug("analyzing %s", model.relative_path)
-        result = analyze_file(
-            model.path,
-            dialect=cfg.general.sql_dialect,
-            star_over_join_behavior=cfg.general.star_over_join_behavior,
-        )
-
-        for warning in result.warnings:
-            logger.warning("%s: %s", model.relative_path, warning)
-
-        if result.errors:
-            for error in result.errors:
-                typer.echo(f"error: {model.relative_path}: {error}", err=True)
-            raise typer.Exit(code=1)
-
-        schemas.append(resolve_schema(result))
+    analyzed = _analyze(root, cfg, [*select, *ctx.args])
+    schemas = [schema for _, schema in analyzed]
 
     if output_format == "json":
         typer.echo(
@@ -177,8 +69,74 @@ def infer_schema(
         )
         return
 
+    console = Console()
     for schema in schemas:
         console.print(render_schema(schema), new_line_start=True)
+
+
+@app.command(
+    "validate-schema",
+    context_settings={"allow_extra_args": True},
+)
+def validate(
+    ctx: typer.Context,
+    select: list[str] = typer.Option(
+        [],
+        "--select",
+        "-s",
+        help="Model names to operate on, e.g. `--select orders customers`. "
+        "Omit to operate on every model.",
+    ),
+    project_dir: Path | None = typer.Option(
+        None, "--project-dir", help="Path to the root of the project."
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Enable debug logging."
+    ),
+    output_format: str = typer.Option(
+        "table", "--format", help="Validation output format: table or json."
+    ),
+) -> None:
+    """Infer the schema of the selected models and check it against what they declare.
+
+    Exits non-zero when a column's inferred and declared types cannot both be true.
+    """
+    _configure_logging(verbose)
+
+    root, cfg = _load_project(project_dir)
+    analyzed = _analyze(root, cfg, [*select, *ctx.args])
+
+    # Declarations are a project-wide index: a selected model's source tables are usually
+    # declared in some other model's yml, so every yml is loaded regardless of selection.
+    declared = load_declared_schemas(find_yaml_files(root))
+    logger.info("found %d declared models", len(declared.models))
+    for warning in declared.warnings:
+        typer.echo(f"warning: {warning}", err=True)
+
+    validations: list[StatementValidation] = [
+        validate_schema(schema, declared, model.path) for model, schema in analyzed
+    ]
+
+    if output_format == "json":
+        typer.echo(
+            json.dumps(
+                [validation.model_dump(mode="json") for validation in validations],
+                indent=2,
+            )
+        )
+    else:
+        console = Console()
+        for validation in validations:
+            console.print(render_validation(validation), new_line_start=True)
+
+        # Errors go last, after every model's table, so the summary is the last thing on
+        # screen rather than buried above the grids it refers to.
+        errors = render_errors(validations)
+        if errors is not None:
+            console.print(errors, new_line_start=True)
+
+    if any(validation.has_errors for validation in validations):
+        raise typer.Exit(code=1)
 
 
 def _load_project(project_dir: Path | None) -> tuple[Path, SqlrConfig]:
@@ -197,6 +155,47 @@ def _load_project(project_dir: Path | None) -> tuple[Path, SqlrConfig]:
 
     logger.debug("resolved project root to %s", root)
     return root, cfg
+
+
+def _analyze(
+    root: Path, cfg: SqlrConfig, selectors: list[str]
+) -> list[tuple[Model, StatementSchema]]:
+    """Resolve selectors, analyse each model, and resolve its schema.
+
+    The whole of `infer-schema`; `validate-schema` is this plus a comparison. An analysis
+    error is fatal for the run rather than skipped, because a schema resolved from a
+    statement that did not parse would be quietly wrong rather than visibly absent.
+    """
+    models = _select(root, cfg, selectors)
+    analyzed: list[tuple[Model, StatementSchema]] = []
+
+    for model in models:
+        logger.debug("analyzing %s", model.relative_path)
+        result = analyze_file(
+            model.path,
+            dialect=cfg.general.sql_dialect,
+            star_over_join_behavior=cfg.general.star_over_join_behavior,
+        )
+
+        for warning in result.warnings:
+            logger.warning("%s: %s", model.relative_path, warning)
+
+        if result.errors:
+            for error in result.errors:
+                typer.echo(f"error: {model.relative_path}: {error}", err=True)
+            raise typer.Exit(code=1)
+
+        logger.info(
+            "analysis of %s: %d relations, %d external sources, %d projected columns",
+            model.relative_path,
+            len(result.relations),
+            len(result.sources),
+            len(result.projection),
+        )
+
+        analyzed.append((model, resolve_schema(result)))
+
+    return analyzed
 
 
 def _select(root: Path, cfg: SqlrConfig, selectors: list[str]) -> list[Model]:

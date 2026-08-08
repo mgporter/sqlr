@@ -16,6 +16,9 @@ ResolvedTypeName = Literal[
     "numeric",
     "string",
     "date",
+    "timestamp_ntz",
+    "timestamp_tz",
+    "timestamp_ltz",
     "timestamp",
     "boolean",
     "unknown",
@@ -26,8 +29,14 @@ Most evidence pins down that a column holds a number without saying which kind: 
 and `x > 5` are equally true of an INT, a DECIMAL and a DOUBLE. Rather than pick one and
 be wrong, those resolve to a family:
 
-- `number`  = `integer` | `decimal`  (exact)
-- `numeric` = `integer` | `decimal` | `float`
+- `number`    = `integer` | `decimal`  (exact)
+- `numeric`   = `integer` | `decimal` | `float`
+- `timestamp` = `timestamp_ntz` | `timestamp_tz` | `timestamp_ltz`
+
+`timestamp` is a family for the same reason `numeric` is: an `*_at` suffix, a
+`date_trunc(...)` or a bare `TIMESTAMP` says an instant is stored without saying whether a
+zone travels with it. Only a written type that spells the zone out - `timestamp_ntz`,
+`timestamptz`, `datetime` - lands on a concrete one.
 
 Only evidence that names a type - a cast, or a function with a fixed return type - yields
 a concrete one.
@@ -43,7 +52,10 @@ TYPE_COVER: dict[ResolvedTypeName, frozenset[str]] = {
     "numeric": frozenset({"integer", "decimal", "float"}),
     "string": frozenset({"string"}),
     "date": frozenset({"date"}),
-    "timestamp": frozenset({"timestamp"}),
+    "timestamp_ntz": frozenset({"timestamp_ntz"}),
+    "timestamp_tz": frozenset({"timestamp_tz"}),
+    "timestamp_ltz": frozenset({"timestamp_ltz"}),
+    "timestamp": frozenset({"timestamp_ntz", "timestamp_tz", "timestamp_ltz"}),
     "boolean": frozenset({"boolean"}),
     "unknown": frozenset(),
 }
@@ -55,9 +67,12 @@ WIDENING_ORDER: list[ResolvedTypeName] = [
     "float",
     "string",
     "date",
-    "timestamp",
+    "timestamp_ntz",
+    "timestamp_tz",
+    "timestamp_ltz",
     "boolean",
     "number",
+    "timestamp",
     "numeric",
 ]
 
@@ -73,6 +88,16 @@ def widen(left: ResolvedTypeName, right: ResolvedTypeName) -> ResolvedTypeName:
         if covered <= TYPE_COVER[candidate]:
             return candidate
     return "unknown"
+
+
+def covers(outer: ResolvedTypeName, inner: ResolvedTypeName) -> bool:
+    """True when `inner` is strictly narrower than `outer`.
+
+    `number` covers `integer`, and `timestamp` covers `timestamp_ntz`. A type never covers
+    itself, so a caller can tell "the declaration pinned the family down" apart from "the
+    declaration said the same thing".
+    """
+    return TYPE_COVER[inner] < TYPE_COVER[outer]
 
 
 def compatible(left: ResolvedTypeName, right: ResolvedTypeName) -> bool:
@@ -120,14 +145,15 @@ TYPE_NAMES: dict[str, ResolvedTypeName] = {
     "STRING": "string",
     "UUID": "string",
     "DATE": "date",
+    # Bare `TIMESTAMP` means different things per dialect, so it stays the family.
     "TIMESTAMP": "timestamp",
-    "TIMESTAMPTZ": "timestamp",
-    "TIMESTAMPLTZ": "timestamp",
-    "TIMESTAMPNTZ": "timestamp",
-    "TIMESTAMP_TZ": "timestamp",
-    "TIMESTAMP_LTZ": "timestamp",
-    "TIMESTAMP_NTZ": "timestamp",
-    "DATETIME": "timestamp",
+    "TIMESTAMPTZ": "timestamp_tz",
+    "TIMESTAMPLTZ": "timestamp_ltz",
+    "TIMESTAMPNTZ": "timestamp_ntz",
+    "TIMESTAMP_TZ": "timestamp_tz",
+    "TIMESTAMP_LTZ": "timestamp_ltz",
+    "TIMESTAMP_NTZ": "timestamp_ntz",
+    "DATETIME": "timestamp_ntz",
     "BOOLEAN": "boolean",
     "BOOL": "boolean",
 }
@@ -145,11 +171,12 @@ def normalize_type_name(raw: str) -> str:
         name = name.split("(", 1)[0]
     if "[" in name:
         name = name.split("[", 1)[0]
-    # `timestamp with time zone` / `timestamp without time zone`.
+    # `timestamp with time zone` / `timestamp without time zone`. The `WITHOUT` test comes
+    # first because it is a prefix of neither but a longer match than `WITH`.
+    if name.startswith("TIMESTAMP WITHOUT"):
+        return "TIMESTAMPNTZ"
     if name.startswith("TIMESTAMP WITH"):
         return "TIMESTAMPTZ"
-    if name.startswith("TIMESTAMP WITHOUT"):
-        return "TIMESTAMP"
     return name.strip().replace(" ", "_")
 
 

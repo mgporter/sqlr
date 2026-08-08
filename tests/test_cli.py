@@ -10,16 +10,19 @@ from sqlr.config import CONFIG_FILENAME
 runner = CliRunner()
 
 
-def test_check_runs_from_cwd_with_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    (tmp_path / CONFIG_FILENAME).write_text("version: 1\n")
+def test_infer_schema_errors_from_cwd_without_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.chdir(tmp_path)
-    result = runner.invoke(app, ["check"])
-    assert result.exit_code == 0
+    result = runner.invoke(app, ["infer-schema"])
+    assert result.exit_code == 1
 
 
-def test_check_errors_from_cwd_without_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_validate_schema_errors_from_cwd_without_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.chdir(tmp_path)
-    result = runner.invoke(app, ["check"])
+    result = runner.invoke(app, ["validate-schema"])
     assert result.exit_code == 1
 
 
@@ -200,6 +203,134 @@ def test_infer_schema_errors_on_unparseable_sql(tmp_path: Path) -> None:
 
     result = runner.invoke(
         app, ["infer-schema", "--project-dir", str(tmp_path), "--select", "broken"]
+    )
+
+    assert result.exit_code == 1
+
+
+# ---- validate-schema -----------------------------------------------------------------
+
+AGREEING_YML = """\
+version: 2
+models:
+  - name: person
+    columns:
+      - name: age
+        data_type: decimal(10,2)
+      - name: status
+        data_type: varchar(20)
+"""
+
+CONTRADICTING_YML = """\
+version: 2
+models:
+  - name: person
+    columns:
+      - name: age
+        data_type: timestamp
+"""
+
+
+@pytest.fixture
+def wide(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rich wraps to the terminal, and a wrapped row breaks a substring assertion."""
+    monkeypatch.setenv("COLUMNS", "200")
+
+
+def test_validate_schema_reports_each_column_against_its_declaration(
+    tmp_path: Path, wide: None
+) -> None:
+    _project(tmp_path)
+    (tmp_path / "models" / "schema.yml").write_text(AGREEING_YML)
+
+    result = runner.invoke(
+        app,
+        ["validate-schema", "--project-dir", str(tmp_path), "--select", "customers"],
+    )
+
+    assert result.exit_code == 0
+    # `age > 20` proves a number; the declaration says which kind.
+    assert "decimal(10,2)" in result.output
+    assert "type narrowed" in result.output
+    assert "exact match" in result.output
+    # A column the SQL uses that nothing declares is still worth saying out loud.
+    assert "no declaration" in result.output
+
+
+def test_validate_schema_exits_non_zero_and_explains_a_contradiction(
+    tmp_path: Path, wide: None
+) -> None:
+    _project(tmp_path)
+    (tmp_path / "models" / "schema.yml").write_text(CONTRADICTING_YML)
+
+    result = runner.invoke(
+        app,
+        ["validate-schema", "--project-dir", str(tmp_path), "--select", "customers"],
+    )
+
+    assert result.exit_code == 1
+    assert "1 error" in result.output
+    assert "person.age is declared timestamp" in result.output
+    # The comparison that forced the inferred type, quoted and underlined.
+    assert "p.age > 20" in result.output
+    assert "^" in result.output
+    assert "declared here" in result.output
+
+
+def test_validate_schema_passes_when_nothing_is_declared(tmp_path: Path) -> None:
+    _project(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["validate-schema", "--project-dir", str(tmp_path), "--select", "customers"],
+    )
+
+    assert result.exit_code == 0
+
+
+def test_validate_schema_json_format(tmp_path: Path) -> None:
+    _project(tmp_path)
+    (tmp_path / "models" / "schema.yml").write_text(AGREEING_YML)
+
+    result = runner.invoke(
+        app,
+        [
+            "validate-schema",
+            "--project-dir",
+            str(tmp_path),
+            "--select",
+            "customers",
+            "--format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    [payload] = json.loads(result.output)
+    person = next(t for t in payload["tables"] if t["name"] == "person")
+    age = next(c for c in person["columns"] if c["name"] == "age")
+    assert age["outcome"] == "pass"
+    assert age["detail"] == "type narrowed"
+    assert age["resolved_type"] == "decimal"
+
+
+def test_validate_schema_shares_selection_with_infer_schema(tmp_path: Path) -> None:
+    _project(tmp_path)
+
+    result = runner.invoke(
+        app, ["validate-schema", "--project-dir", str(tmp_path), "--select", "nope"]
+    )
+
+    assert result.exit_code == 1
+    assert "no model named 'nope'" in result.output
+
+
+def test_validate_schema_errors_on_unparseable_sql(tmp_path: Path) -> None:
+    _project(tmp_path)
+    (tmp_path / "models" / "broken.sql").write_text("select from from where;")
+
+    result = runner.invoke(
+        app, ["validate-schema", "--project-dir", str(tmp_path), "--select", "broken"]
     )
 
     assert result.exit_code == 1
