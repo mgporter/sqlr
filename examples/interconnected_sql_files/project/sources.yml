@@ -1,0 +1,94 @@
+version: 2
+
+# The tables this project reads but does not build. Both `database` and `schema` are
+# declared, so the SQL has to write them out: `mydatabase.myschema.raw_department`.
+sources:
+  - name: mysource
+    database: mydatabase
+    schema: myschema
+    tables:
+      - name: raw_department
+        columns:
+          - name: department_id
+            data_type: varchar(20)
+          - name: department_name
+            data_type: varchar(100)
+          - name: cost_center
+            data_type: varchar(20)
+          - name: budget
+            data_type: decimal(12,2)
+          - name: is_active
+            data_type: boolean
+
+      - name: raw_employee
+        columns:
+          - name: employee_id
+            data_type: varchar(20)
+          - name: department_id
+            data_type: varchar(20)
+          - name: first_name
+            data_type: varchar(50)
+          - name: last_name
+            data_type: varchar(50)
+          - name: email
+            data_type: varchar(200)
+          - name: salary
+            data_type: decimal(10,2)
+          - name: bonus
+            data_type: decimal(10,2)
+          - name: hire_date
+            data_type: date
+          - name: status
+            data_type: varchar(20)
+          - name: modified_at
+            data_type: timestamp_ntz
+
+      - name: raw_address
+        columns:
+          - name: person_id
+            data_type: varchar(20)
+          - name: street
+            data_type: varchar(200)
+          - name: city
+            data_type: varchar(100)
+          - name: state
+            data_type: varchar(2)
+          - name: zip
+            data_type: varchar(10)
+          - name: country
+            data_type: varchar(2)
+          - name: updated_at
+            data_type: timestamp_ntz
+
+      - name: online_order
+        columns:
+          - name: order_id
+            data_type: varchar(20)
+          - name: customer_id
+            data_type: varchar(20)
+          - name: employee_id
+            data_type: varchar(20)
+          - name: order_date
+            data_type: date
+          - name: amount
+            data_type: decimal(10,2)
+
+      - name: instore_order
+        columns:
+          - name: order_id
+            data_type: varchar(20)
+          - name: customer_id
+            data_type: varchar(20)
+          - name: employee_id
+            data_type: varchar(20)
+          - name: order_date
+            data_type: date
+          - name: amount
+            data_type: decimal(10,2)
+
+      - name: customer
+        columns:
+          - name: customer_id
+            data_type: varchar(20)
+          - name: is_active
+            data_type: boolean

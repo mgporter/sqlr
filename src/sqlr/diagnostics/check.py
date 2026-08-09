@@ -2,10 +2,10 @@
 
 Two comparisons, one rule set:
 
-- the statement's **projection** against the declaration for its own model, since a
-  dbt-shaped `models:` entry describes what a `.sql` file produces;
-- each **source table** against the declaration for the model of that name, which is what
-  catches the interesting case - `orders.sql` declares `revenue` a varchar, and
+- the statement's **projection** against the declaration for the `.sql` file itself - the
+  source table that claims it with `sql_file:`, or a dbt project's `models:` entry;
+- each **relation it reads** against the declaration of that name, which is what catches
+  the interesting case - `orders.sql` declares `revenue` a varchar, and
   `revenue_report.sql` writes `where revenue > 1000`.
 
 A mismatch is only reported when the declared and inferred types have no concrete type in
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sqlr.declared.types import DeclaredColumn, DeclaredModel, DeclaredSchemas
+from sqlr.declared.types import DeclaredColumn, DeclaredRelation, DeclaredSchemas
 from sqlr.diagnostics import codes
 from sqlr.diagnostics.types import Diagnostic, Location, Related, Severity
 from sqlr.schema_resolution.types import (
@@ -59,7 +59,7 @@ def check_schema(
         diagnostics.extend(_check_missing(schema, own))
 
     for table in schema.tables:
-        model = declared.for_model(_model_name(table.name))
+        model = declared.for_relation(table.name)
         if model is None:
             continue
         diagnostics.extend(_check_table(schema, table.name, table.columns, model))
@@ -73,11 +73,6 @@ def check_schema(
     return diagnostics
 
 
-def _model_name(table: str) -> str:
-    """`mydatabase.myschema.orders` declares as `orders`."""
-    return table.rsplit(".", 1)[-1]
-
-
 # ---- the comparison ------------------------------------------------------------------
 
 
@@ -85,7 +80,7 @@ def _check_table(
     schema: StatementSchema,
     table: str,
     columns: list[ColumnSchema],
-    model: DeclaredModel,
+    model: DeclaredRelation,
 ) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     for column in columns:
@@ -107,7 +102,7 @@ def _check_table(
 
 
 def _check_projection(
-    schema: StatementSchema, model: DeclaredModel
+    schema: StatementSchema, model: DeclaredRelation
 ) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     for column in schema.projection:
@@ -121,7 +116,7 @@ def _check_projection(
                 schema=schema,
                 model=model,
                 declaration=declaration,
-                table=model.name,
+                table=model.display_name,
                 name=column.name,
                 resolved=column.resolved_type,
                 location=column.location,
@@ -132,7 +127,7 @@ def _check_projection(
 
 def _compare(
     schema: StatementSchema,
-    model: DeclaredModel,
+    model: DeclaredRelation,
     declaration: DeclaredColumn,
     table: str,
     name: str,
@@ -191,7 +186,7 @@ def _severity(chosen: TypeEvidence | None) -> Severity:
 
 def _related(
     schema: StatementSchema,
-    model: DeclaredModel,
+    model: DeclaredRelation,
     declaration: DeclaredColumn,
     resolved: ResolvedType,
 ) -> list[Related]:
@@ -252,7 +247,7 @@ def _check_undeclared(
     schema: StatementSchema,
     table: str,
     columns: list[ColumnSchema],
-    model: DeclaredModel,
+    model: DeclaredRelation,
 ) -> list[Diagnostic]:
     return [
         Diagnostic(
@@ -273,9 +268,9 @@ def _check_undeclared(
     ]
 
 
-def _check_missing(schema: StatementSchema, model: DeclaredModel) -> list[Diagnostic]:
+def _check_missing(schema: StatementSchema, model: DeclaredRelation) -> list[Diagnostic]:
     """Columns the model declares that its own SELECT list does not produce."""
-    if any(column.name is None for column in schema.projection):
+    if not schema.projection_is_complete:
         # An unexpandable `*` is in the projection, so the real output is wider than the
         # list here and nothing can be called missing.
         return []
@@ -288,11 +283,12 @@ def _check_missing(schema: StatementSchema, model: DeclaredModel) -> list[Diagno
             code=codes.MISSING_COLUMN,
             severity="hint",
             message=(
-                f"{model.name}.{declaration.name} is declared but {model.name} does not "
+                f"{model.display_name}.{declaration.name} is declared but "
+                f"{model.display_name} does not "
                 f"produce it"
             ),
             location=Location.of(model.source, declaration.name_span),
-            table=model.name,
+            table=model.display_name,
             column=declaration.name,
         )
         for declaration in model.columns
@@ -359,7 +355,7 @@ def unresolved_types(
     """Columns nothing typed and nothing declared - generation has nothing to go on."""
     diagnostics: list[Diagnostic] = []
     for table in schema.tables:
-        model = declared.for_model(_model_name(table.name))
+        model = declared.for_relation(table.name)
         for column in table.columns:
             if column.resolved_type.type_name != "unknown":
                 continue

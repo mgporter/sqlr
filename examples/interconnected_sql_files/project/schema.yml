@@ -1,0 +1,58 @@
+version: 2
+
+# The tables this project builds. `sql_file:` is what makes one of these a model: the
+# columns below describe what that file produces, and the file is checked against them.
+#
+# Neither `database` nor `schema` is declared here, so these are referred to bare -
+# `from employee`, the way employee_dashboard.sql already writes it. Declaring either one
+# would mean every reference had to write it too: `from mydatabase.myschema.employee`.
+sources:
+  - name: project
+    tables:
+      - name: employee
+        sql_file: employee
+        columns:
+          - name: employee_id
+            data_type: varchar(20)
+          - name: department_id
+            data_type: varchar(20)
+          - name: full_name
+            data_type: varchar(101)
+          - name: email
+            data_type: varchar(200)
+          - name: salary
+            data_type: decimal(10,2)
+
+      - name: department
+        sql_file: department
+        columns:
+          - name: department_id
+            data_type: varchar(20)
+          - name: department_name
+            data_type: varchar(100)
+          - name: cost_center
+            data_type: varchar(20)
+
+      - name: address
+        sql_file: address
+        columns:
+          - name: person_id
+            data_type: varchar(20)
+          - name: full_address
+            data_type: varchar(500)
+
+      - name: sales
+        sql_file: sales
+        columns:
+          - name: employee_id
+            data_type: varchar(20)
+          - name: daily_total
+            data_type: decimal(18,2)
+
+      - name: employee_dashboard
+        sql_file: employee_dashboard
+        columns:
+          - name: employee_id
+            data_type: varchar(20)
+          - name: full_name
+            data_type: varchar(101)

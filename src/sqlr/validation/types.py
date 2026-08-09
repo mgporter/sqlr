@@ -8,9 +8,11 @@ Nothing here mirrors `ColumnSchema` or `DeclaredColumn`; both are carried whole.
 inferred side keeps its losing evidence for the same reason schema resolution kept it: a
 user told their `varchar` is contradicted needs to see every use that contradicts it.
 
-`resolved_type` is deliberately `None` rather than `unknown` for a column the SQL never
-mentioned. `unknown` is an answer - "inference looked and found nothing"; absence is the
-statement that inference never got to look, which is what a declared-only column is.
+`resolved_type` is what generation should produce, which is not always what inference said.
+A column the SQL never mentioned resolves to its declared type: inference never got to look
+at it, so there is nothing for the declaration to lose to. It is `None` only when nothing
+can be said at all - no declaration and no usable inference, or a contradiction between the
+two with no concrete type satisfying both.
 """
 
 from pathlib import Path
@@ -39,6 +41,8 @@ ValidationDetail = Literal[
     "type narrowed",
     "type widened",
     "declared only",
+    "declared but not projected",
+    "declared with no explicit projection",
     "no declaration",
     "unrecognized declaration",
     "inferred type differs from declared type",
@@ -50,6 +54,10 @@ ValidationDetail = Literal[
 - `warning` / `type widened` - the declaration is looser than what the SQL proved.
 - `pass` / `declared only` - inference had nothing, or nothing but the column's name, so
   the declaration stands unopposed.
+- `error` / `declared but not projected` - the declaration for this `.sql` file names a
+  column its SELECT list does not produce, and the list is the whole output.
+- `warning` / `declared with no explicit projection` - the same absence, but under an
+  unexpandable `select *`: the column may well be produced, just not written down.
 - `warning` / `no declaration` - inference is all there is.
 - `warning` / `unrecognized declaration` - the written type is not one sqlr knows.
 - `error` / `inferred type differs from declared type` - no concrete type satisfies both.
@@ -97,7 +105,12 @@ class TableValidation(BaseModel):
     star_expanded: bool = False
     """A `*` was expanded, so the SQL's column list is a subset of the real one."""
     declared_model: str | None = None
-    """The model whose declaration this table was checked against, if any."""
+    """The declaration this table was checked against, if any.
+
+    A source table is named the way dbt's `source()` names one - `mysource.raw_department`
+    - rather than by the relation, which is already `name`.
+    """
+    declared_kind: Literal["model", "source"] | None = None
     declared_path: Path | None = None
     columns: list[ColumnValidation] = []
 

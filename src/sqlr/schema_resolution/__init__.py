@@ -718,6 +718,7 @@ def _build_projection(
                 ordinal=projected.ordinal,
                 resolved_type=resolved,
                 origins=[origin.node for origin in projected.origins],
+                star_of=list(projected.star_of),
                 span=projected.span,
                 alias_span=projected.alias_span,
             )

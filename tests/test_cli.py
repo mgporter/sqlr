@@ -212,22 +212,26 @@ def test_infer_schema_errors_on_unparseable_sql(tmp_path: Path) -> None:
 
 AGREEING_YML = """\
 version: 2
-models:
-  - name: person
-    columns:
-      - name: age
-        data_type: decimal(10,2)
-      - name: status
-        data_type: varchar(20)
+sources:
+  - name: warehouse
+    tables:
+      - name: person
+        columns:
+          - name: age
+            data_type: decimal(10,2)
+          - name: status
+            data_type: varchar(20)
 """
 
 CONTRADICTING_YML = """\
 version: 2
-models:
-  - name: person
-    columns:
-      - name: age
-        data_type: timestamp
+sources:
+  - name: warehouse
+    tables:
+      - name: person
+        columns:
+          - name: age
+            data_type: timestamp
 """
 
 
@@ -334,3 +338,119 @@ def test_validate_schema_errors_on_unparseable_sql(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 1
+
+
+# ---- declarations ----------------------------------------------------------------------
+
+
+def test_validate_schema_errors_when_two_sources_describe_one_relation(
+    tmp_path: Path, wide: None
+) -> None:
+    _project(tmp_path)
+    (tmp_path / "models" / "schema.yml").write_text(AGREEING_YML)
+    (tmp_path / "models" / "other.yml").write_text(
+        "version: 2\nsources:\n  - name: other\n    tables:\n      - name: person\n"
+    )
+
+    result = runner.invoke(
+        app,
+        ["validate-schema", "--project-dir", str(tmp_path), "--select", "customers"],
+    )
+
+    assert result.exit_code == 1
+    assert "both describe the relation 'person'" in result.output
+    # It failed before comparing anything, so no grid was printed.
+    assert "type narrowed" not in result.output
+
+
+def test_validate_schema_errors_on_a_sources_key_that_is_not_a_list(
+    tmp_path: Path, wide: None
+) -> None:
+    _project(tmp_path)
+    (tmp_path / "models" / "schema.yml").write_text(
+        "version: 2\nsources:\n  name: warehouse\n  tables:\n    - name: person\n"
+    )
+
+    result = runner.invoke(
+        app,
+        ["validate-schema", "--project-dir", str(tmp_path), "--select", "customers"],
+    )
+
+    assert result.exit_code == 1
+    assert "`sources:` must be a list of sources" in result.output
+
+
+def test_validate_schema_errors_when_sql_file_names_nothing(
+    tmp_path: Path, wide: None
+) -> None:
+    _project(tmp_path)
+    (tmp_path / "models" / "schema.yml").write_text(
+        "version: 2\nsources:\n  - name: warehouse\n    tables:\n"
+        "      - name: person\n        sql_file: nowhere\n"
+    )
+
+    result = runner.invoke(
+        app,
+        ["validate-schema", "--project-dir", str(tmp_path), "--select", "customers"],
+    )
+
+    assert result.exit_code == 1
+    assert "sql_file 'nowhere' does not name a SQL file" in result.output
+
+
+def test_validate_schema_checks_the_projection_of_a_declared_sql_file(
+    tmp_path: Path, wide: None
+) -> None:
+    _project(tmp_path)
+    (tmp_path / "models" / "schema.yml").write_text(
+        "version: 2\nsources:\n  - name: warehouse\n    tables:\n"
+        "      - name: customers\n        sql_file: customers\n        columns:\n"
+        "          - name: city\n            data_type: varchar(40)\n"
+    )
+
+    result = runner.invoke(
+        app,
+        ["validate-schema", "--project-dir", str(tmp_path), "--select", "customers"],
+    )
+
+    assert result.exit_code == 0
+    assert "varchar(40)" in result.output
+
+
+def test_validate_schema_warns_that_models_are_ignored_without_dbt(
+    tmp_path: Path, wide: None
+) -> None:
+    _project(tmp_path)
+    (tmp_path / "models" / "schema.yml").write_text(
+        "version: 2\nmodels:\n  - name: customers\n    columns:\n"
+        "      - name: city\n        data_type: varchar(40)\n"
+    )
+
+    result = runner.invoke(
+        app,
+        ["validate-schema", "--project-dir", str(tmp_path), "--select", "customers"],
+    )
+
+    assert result.exit_code == 0
+    assert "no dbt_project.yml was found" in result.output
+    assert "customers (models/schema.yml:3)" in result.output
+    # Ignored means ignored: the declaration did not reach the comparison.
+    assert "varchar(40)" not in result.output
+
+
+def test_validate_schema_names_the_relation_an_under_qualified_reference_meant(
+    tmp_path: Path, wide: None
+) -> None:
+    _project(tmp_path)
+    (tmp_path / "models" / "schema.yml").write_text(
+        "version: 2\nsources:\n  - name: warehouse\n    database: mydb\n"
+        "    tables:\n      - name: person\n"
+    )
+
+    result = runner.invoke(
+        app,
+        ["validate-schema", "--project-dir", str(tmp_path), "--select", "customers"],
+    )
+
+    assert result.exit_code == 0
+    assert "Write mydb.person in the SQL" in result.output

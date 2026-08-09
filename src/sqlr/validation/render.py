@@ -157,15 +157,34 @@ def _error_block(
     source: SourceDoc, table: TableValidation, column: ColumnValidation
 ) -> RenderableType:
     declared = column.declared
-    lines: list[RenderableType] = [
+    written = declared.written_type if declared is not None else "?"
+    resolved = f" ({declared.resolved_type_name})" if declared is not None else ""
+
+    if column.detail == "declared but not projected":
+        # Nothing to quote from the SQL: the finding *is* the absence, so the report is the
+        # claim and where it was made.
+        lines: list[RenderableType] = [
+            Text.assemble(
+                (f"{table.name}.{column.name}", "bold"),
+                (" is declared ", ""),
+                (written, "cyan"),
+                (resolved, _UNKNOWN),
+                (" but ", ""),
+                (source.name, "bold"),
+                (" does not project it", ""),
+            )
+        ]
+        if column.declaration is not None:
+            lines.extend(_declaration_block(column.declaration))
+        lines.append(Text())
+        return Group(*lines)
+
+    lines = [
         Text.assemble(
             (f"{table.name}.{column.name}", "bold"),
             (" is declared ", ""),
-            (declared.written_type if declared is not None else "?", "cyan"),
-            (
-                f" ({declared.resolved_type_name})" if declared is not None else "",
-                _UNKNOWN,
-            ),
+            (written, "cyan"),
+            (resolved, _UNKNOWN),
             (" but the SQL uses it as ", ""),
             (column.inferred_type or "unknown", "yellow"),
         )

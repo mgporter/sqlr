@@ -21,6 +21,7 @@ from sqlr.sql_analysis.types import (
     LiteralKind,
     NullabilityFact,
     PredicateOperator,
+    RelationRef,
 )
 from sqlr.typemap import ResolvedTypeName
 
@@ -193,6 +194,12 @@ class ProjectionSchema(BaseModel):
     ordinal: int
     resolved_type: ResolvedType = Field(default_factory=ResolvedType)
     origins: list[ColumnNode] = []
+    star_of: list[RelationRef] = []
+    """Set when this column is a `*` that could not be expanded, over these relations.
+
+    Carried through from the analysis because it is the difference between a column list
+    that is the whole output and one that is a lower bound on it.
+    """
     span: SourceSpan | None = None
     alias_span: SourceSpan | None = None
 
@@ -224,6 +231,16 @@ class StatementSchema(BaseModel):
     tables: list[TableSchema] = []
     projection: list[ProjectionSchema] = []
     join_groups: list[JoinGroup] = []
+
+    @property
+    def projection_is_complete(self) -> bool:
+        """True when `projection` is the whole output rather than a lower bound on it.
+
+        A `*` over a relation whose columns could not be enumerated projects columns that
+        appear nowhere here, so absence from the list proves nothing. Without one, the list
+        is exhaustive and a declared column missing from it is genuinely not produced.
+        """
+        return not any(column.star_of for column in self.projection)
 
     def table(self, name: str) -> TableSchema | None:
         lowered = name.lower()

@@ -261,28 +261,68 @@ arbitrated, and what was widened is recorded.
 
 Loads the types the user wrote down, as opposed to the types the analyser inferred.
 
-The format is **dbt's model schema yml, deliberately**. A project that already has
-`schema.yml` files gets checked with no extra authoring, and a project with no dbt at all
-can write the same thing. Only two fields are required of a column — `name` and
-`data_type` — so the cost of adopting it is close to zero.
+The format is **dbt's property yml, deliberately**. A project that already has such files
+gets checked with no extra authoring, and a project with no dbt at all can write the same
+thing. Only two fields are required of a column — `name` and `data_type` — so the cost of
+adopting it is close to zero.
+
+**Which key is read depends on the project.** The presence of a `dbt_project.yml` at the
+project root is the whole test.
+
+*Standalone* — no `dbt_project.yml`. There are no models, only sources: a project with no
+dbt has no `ref()`/`source()` distinction to inherit, so every relation the SQL reads is a
+table someone has to describe, and the ones this project builds say so with `sql_file:`.
 
 ```yml
-models:
-  - name: orders          # matches orders.sql, by stem, as in dbt
-    columns:
-      - name: revenue
-        data_type: numeric
+sources:
+  - name: mysource
+    database: mydatabase
+    schema: myschema
+    tables:
+      - name: raw_department      # read as mydatabase.myschema.raw_department
+        columns:
+          - name: department_id
+            data_type: string
+      - name: employee
+        sql_file: employee        # ...and this one is built by employee.sql
 ```
+
+The parts a table writes down **are** the relation, exactly: `database` and `schema` appear
+in the name only when they are given, so a table declaring neither is written bare and one
+declaring both has to be written out in full — including by the project's own files, when
+the table it names is one of theirs. Nothing is defaulted in, because the value dbt would
+take from a target profile is not knowable here and a guess would silently fail to match
+the name the user actually wrote.
+
+*dbt* — `models:` comes back, matched to a `.sql` file by stem, and a source's missing
+parts are the ones dbt would fill from a profile, so they match anything. Reading dbt's own
+`ref()`/`source()` templating is not implemented; this mode is currently the earlier
+behaviour, kept working.
 
 **Basic**
 - Discover every yml in the project (via `catalog`) and parse the ones with a top-level
-  `models:` list. That key is the discriminator: a yml without it is not ours and is
-  skipped in silence, not warned about.
+  `sources:` or `models:` key. Those keys are the discriminator: a yml with neither is not
+  ours and is skipped in silence, not warned about.
 - Map each `data_type` onto the lattice via `typemap`; an unrecognised name resolves to
   `unknown` and is reported rather than quietly ignored.
-- Match a model to a `.sql` file by stem, case-insensitively.
 - Tolerate malformed yml. A broken file is a problem with that file, not a reason to stop
   analysing the SQL it was meant to describe.
+
+**A relation described twice is fatal, not a warning that picks a winner.** dbt rejects the
+same thing, and when two entries give one column two types there is no answer to choose.
+Sources collide on the *relation they resolve to* rather than on their `source.table`
+names, so two sources may both have a `raw_department` as long as they land in different
+schemas. The same goes for two entries claiming one `sql_file:`, and for a column described
+twice inside one entry.
+
+**An unmatched relation is not fatal** — its columns simply have nothing to check against,
+which is what adopting sqlr on an existing project looks like on day one. But a reference
+whose table name matches a declaration that *nothing else in the run uses* is almost always
+that declaration written short, so `near_miss_warnings` says which name to write instead of
+leaving the user to work out that the declaration they can see is not the one being
+applied. `models:` outside a dbt project gets the same treatment: ignored, but warned about
+by name when an entry would have described a real `.sql` file, with the reason it was
+ignored.
 
 **Discovery is decoupled from interpretation.** `DeclarationProvider` is the seam: this
 module implements it over yml files, and a dbt `manifest.json` / `catalog.json` reader can
@@ -296,7 +336,8 @@ show where the declaration was written — which is half the information the use
 
 **Extended**
 - dbt `manifest.json` / `catalog.json` as a second provider, ranked above hand-written yml.
-- dbt `sources:` blocks, not just `models:`.
+- Real dbt-project support: `ref()`/`source()` templating, and a target profile for the
+  parts a source leaves out.
 - Column-level tests (`accepted_values`, `not_null`) as constraint input, feeding
   `constraints` rather than `diagnostics`.
 - Per-column `description` surfaced into generated fixture documentation.
@@ -517,10 +558,10 @@ is chosen to convert to an LSP diagnostic without loss.
 The first real consumer, and the reason the module exists now rather than later. Two
 comparisons share one rule set:
 
-- the statement's **projection** against the declaration for its own model, since a
-  dbt-shaped `models:` entry describes what a `.sql` file produces;
-- each **source table** against the declaration for the model of that name — which catches
-  the interesting case, where `orders.sql` declares `revenue` a varchar and
+- the statement's **projection** against the declaration for the `.sql` file itself — the
+  source table that claims it with `sql_file:`, or a dbt project's `models:` entry;
+- each **relation it reads** against the declaration of that name — which catches the
+  interesting case, where `orders.sql` declares `revenue` a varchar and
   `revenue_report.sql` writes `where revenue > 1000`.
 
 Rules that keep it quiet enough to be trusted:

@@ -35,14 +35,34 @@ def _check(tmp_path: Path, sql: str, yml: str) -> list[Diagnostic]:
     return check_schema(schema, declared, path)
 
 
-UPSTREAM_YML = """\
-version: 2
-models:
-  - name: source_table
-    columns:
-      - name: revenue
-        data_type: varchar
-"""
+
+def _yml(name: str, *columns: str, sql_file: str | None = None) -> str:
+    """A declaration for one relation, in the shape a standalone project writes.
+
+    Everything is a `sources:` table, including what this project builds: those name the
+    file that builds them with `sql_file:`. `warehouse` declares no database and no
+    schema, so its tables are referred to bare - `source_table`, not `db.schema.x`.
+    """
+    lines = [
+        "version: 2",
+        "sources:",
+        "  - name: warehouse",
+        "    tables:",
+        f"      - name: {name}",
+    ]
+    if sql_file is not None:
+        lines.append(f"        sql_file: {sql_file}")
+    if columns:
+        lines.append("        columns:")
+        for column in columns:
+            column_name, _, data_type = column.partition(" ")
+            lines.append(f"          - name: {column_name}")
+            if data_type:
+                lines.append(f"            data_type: {data_type}")
+    return "\n".join(lines) + "\n"
+
+
+UPSTREAM_YML = _yml("source_table", "revenue varchar")
 
 
 # ---- type mismatch -------------------------------------------------------------------
@@ -70,8 +90,7 @@ def test_a_cast_contradicting_a_declaration_is_an_error(tmp_path: Path) -> None:
     diagnostics = _check(
         tmp_path,
         "select cast(x as integer) as revenue\nfrom source_table\n",
-        "version: 2\nmodels:\n  - name: orders\n    columns:\n"
-        "      - name: revenue\n        data_type: varchar\n",
+        _yml("orders", "revenue varchar", sql_file="orders"),
     )
 
     [mismatch] = [d for d in diagnostics if d.code == codes.TYPE_MISMATCH]
@@ -84,8 +103,7 @@ def test_a_name_pattern_contradicting_a_declaration_is_only_a_hint(
     diagnostics = _check(
         tmp_path,
         "select created_at\nfrom source_table\n",
-        "version: 2\nmodels:\n  - name: source_table\n    columns:\n"
-        "      - name: created_at\n        data_type: integer\n",
+        _yml("source_table", "created_at integer"),
     )
 
     [mismatch] = [d for d in diagnostics if d.code == codes.TYPE_MISMATCH]
@@ -100,8 +118,7 @@ def test_a_declaration_narrower_than_the_inferred_family_is_not_a_mismatch(
     diagnostics = _check(
         tmp_path,
         "select id from source_table where revenue > 1000\n",
-        "version: 2\nmodels:\n  - name: source_table\n    columns:\n"
-        "      - name: revenue\n        data_type: integer\n",
+        _yml("source_table", "revenue integer"),
     )
 
     assert [d for d in diagnostics if d.code == codes.TYPE_MISMATCH] == []
@@ -180,8 +197,7 @@ def test_an_unrecognised_declared_type_is_reported(tmp_path: Path) -> None:
     diagnostics = _check(
         tmp_path,
         "select revenue from source_table\n",
-        "version: 2\nmodels:\n  - name: source_table\n    columns:\n"
-        "      - name: revenue\n        data_type: blorp\n",
+        _yml("source_table", "revenue blorp"),
     )
 
     [unknown] = [d for d in diagnostics if d.code == codes.UNKNOWN_DECLARED_TYPE]
@@ -215,9 +231,7 @@ def test_a_declared_column_the_model_does_not_produce_is_reported(
     diagnostics = _check(
         tmp_path,
         "select id from source_table\n",
-        "version: 2\nmodels:\n  - name: orders\n    columns:\n"
-        "      - name: id\n        data_type: integer\n"
-        "      - name: absent\n        data_type: integer\n",
+        _yml("orders", "id integer", "absent integer", sql_file="orders"),
     )
 
     [missing] = [d for d in diagnostics if d.code == codes.MISSING_COLUMN]
@@ -232,9 +246,7 @@ def test_upstream_declarations_do_not_produce_missing_column_noise(
     diagnostics = _check(
         tmp_path,
         "select revenue from source_table\n",
-        "version: 2\nmodels:\n  - name: source_table\n    columns:\n"
-        "      - name: revenue\n        data_type: varchar\n"
-        "      - name: other\n        data_type: varchar\n",
+        _yml("source_table", "revenue varchar", "other varchar"),
     )
 
     assert [d for d in diagnostics if d.code == codes.MISSING_COLUMN] == []

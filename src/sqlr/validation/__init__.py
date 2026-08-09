@@ -4,12 +4,19 @@ The rule set is small and sits in `_judge`; everything else here is about decidi
 declaration a column should be held against, and about the columns that exist on only one
 of the two sides.
 
-Two asymmetries are deliberate:
+Three asymmetries are deliberate:
 
-- A declaration with no matching column in the SQL is **not** a finding. A `select` that
-  touches four of a table's twelve columns is normal, and after a `*` expansion the SQL's
-  list is a subset by construction. Those rows exist so the declaration is visible, with
-  no inferred type and no resolved one.
+- A **source** declaration with no matching column in the SQL is not a finding. A `select`
+  that touches four of a table's twelve columns is normal, and after a `*` expansion the
+  SQL's list is a subset by construction. Those rows exist so the declaration is visible,
+  and they resolve to the declared type: inference never saw the column, so the
+  declaration is unopposed rather than unsupported.
+- A **projection** declaration with no matching column is a finding, and how loud depends
+  on whether the SELECT list is the whole output. With no unexpandable `*` in it, the list
+  is exhaustive and the file genuinely does not produce the declared column: an error.
+  Under `select * from a`, where `a`'s columns cannot be enumerated, the column may well be
+  produced and simply be invisible from here, so it is only a warning - declaring those
+  columns explicitly is better practice, not a rule to fail a run over.
 - A column with no declaration **is** a finding, at warning. Generation is driven by the
   declared type where there is one, so a column nothing declares is a hole - whether the
   model has no yml at all or its yml simply omits the column.
@@ -22,8 +29,14 @@ user wrote down something inference could not see.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
-from sqlr.declared.types import DeclaredColumn, DeclaredModel, DeclaredSchemas
+from sqlr.declared.types import (
+    DeclaredColumn,
+    DeclaredRelation,
+    DeclaredSchemas,
+    DeclaredSourceTable,
+)
 from sqlr.diagnostics.types import Location
 from sqlr.schema_resolution.types import (
     ProjectionSchema,
@@ -54,6 +67,9 @@ __all__ = [
 
 _Judgement = tuple[ValidationOutcome, ValidationDetail, ResolvedTypeName | None]
 
+_Side = Literal["source", "projection"]
+"""Which of the two comparisons a column belongs to. Only matters when it is missing."""
+
 
 def validate_schema(
     schema: StatementSchema,
@@ -62,32 +78,36 @@ def validate_schema(
 ) -> StatementValidation:
     """Check `schema` against every declaration that bears on it.
 
-    `path` is the `.sql` file, whose stem names the model the projection is checked
-    against - dbt's convention. Source tables are matched by their own names instead.
+    `path` is the `.sql` file this statement came from; the declaration describing what it
+    produces is the one that claims it with `sql_file:`, or - in a dbt project - the
+    `models:` entry of the same stem. Every relation it *reads* is matched by the name the
+    SQL writes.
     """
     return StatementValidation(
         source=schema.source,
         tables=[
-            _validate_table(table, declared.for_model(_model_name(table.name)))
+            _validate_table(table, declared.for_relation(table.name))
             for table in schema.tables
         ],
         projection=_validate_projection(
             schema.projection,
             declared.for_sql_file(path) if path is not None else None,
+            complete=schema.projection_is_complete,
         ),
     )
 
 
-def _model_name(table: str) -> str:
-    """`mydatabase.myschema.orders` declares as `orders`."""
-    return table.rsplit(".", 1)[-1]
+def _kind(model: DeclaredRelation | None) -> Literal["model", "source"] | None:
+    if model is None:
+        return None
+    return "source" if isinstance(model, DeclaredSourceTable) else "model"
 
 
 # ---- the two sides ---------------------------------------------------------------------
 
 
 def _validate_table(
-    table: TableSchema, model: DeclaredModel | None
+    table: TableSchema, model: DeclaredRelation | None
 ) -> TableValidation:
     columns = [
         _validate_column(
@@ -105,14 +125,17 @@ def _validate_table(
         name=table.name,
         kind="source",
         star_expanded=table.star_expanded,
-        declared_model=model.name if model is not None else None,
+        declared_model=model.display_name if model is not None else None,
+        declared_kind=_kind(model),
         declared_path=model.path if model is not None else None,
         columns=columns,
     )
 
 
 def _validate_projection(
-    projection: list[ProjectionSchema], model: DeclaredModel | None
+    projection: list[ProjectionSchema],
+    model: DeclaredRelation | None,
+    complete: bool = True,
 ) -> TableValidation:
     columns = [
         _validate_column(
@@ -131,13 +154,18 @@ def _validate_projection(
             seen={
                 column.name.lower() for column in projection if column.name is not None
             },
+            kind="projection",
+            complete=complete,
         )
     )
 
     return TableValidation(
-        name=model.name if model is not None else "projection",
+        # Named by the relation rather than by the declaration: this block is what the
+        # file produces, and the relation is what another file has to write to read it.
+        name=model.relation_name if model is not None else "projection",
         kind="projection",
-        declared_model=model.name if model is not None else None,
+        declared_model=model.display_name if model is not None else None,
+        declared_kind=_kind(model),
         declared_path=model.path if model is not None else None,
         columns=columns,
     )
@@ -146,7 +174,7 @@ def _validate_projection(
 def _validate_column(
     name: str,
     inferred: ResolvedType,
-    model: DeclaredModel | None,
+    model: DeclaredRelation | None,
     ordinal: int | None = None,
 ) -> ColumnValidation:
     declaration = model.column(name) if model is not None else None
@@ -164,14 +192,17 @@ def _validate_column(
 
 
 def _declared_only(
-    model: DeclaredModel | None, seen: set[str]
+    model: DeclaredRelation | None,
+    seen: set[str],
+    kind: _Side = "source",
+    complete: bool = True,
 ) -> list[ColumnValidation]:
     """Rows for declarations the SQL never mentioned.
 
     `inferred` is None rather than an empty `ResolvedType`: inference did not fail on
     these columns, it never saw them. They still go through `_judge`, because a
     declaration can be wrong on its own - an unrecognised type is unusable whether or not
-    any SQL refers to it.
+    any SQL refers to it, and on the projection side the absence is itself the finding.
     """
     if model is None:
         return []
@@ -180,7 +211,7 @@ def _declared_only(
     for declaration in model.columns:
         if declaration.name.lower() in seen:
             continue
-        outcome, detail, resolved = _judge(None, declaration)
+        outcome, detail, resolved = _judge(None, declaration, kind, complete)
         rows.append(
             ColumnValidation(
                 name=declaration.name,
@@ -196,7 +227,7 @@ def _declared_only(
 
 
 def _declaration_location(
-    model: DeclaredModel | None, declaration: DeclaredColumn | None
+    model: DeclaredRelation | None, declaration: DeclaredColumn | None
 ) -> Location | None:
     if model is None or declaration is None:
         return None
@@ -206,21 +237,42 @@ def _declaration_location(
 # ---- the rule set ----------------------------------------------------------------------
 
 
-def _judge(inferred: ResolvedType | None, declaration: DeclaredColumn | None) -> _Judgement:
+def _judge(
+    inferred: ResolvedType | None,
+    declaration: DeclaredColumn | None,
+    kind: _Side = "source",
+    complete: bool = True,
+) -> _Judgement:
     """Which of the two types stands, and how loudly to say so."""
     if declaration is None:
         resolved = inferred.type_name if inferred is not None else None
         return "warning", "no declaration", _known(resolved)
 
     declared_name = declaration.resolved_type_name
+    missing = inferred is None and kind == "projection"
+    # An unexpandable `*` means the SELECT list is a lower bound on the output, so a column
+    # missing from it may still be produced - it was just never written down. Without one
+    # the list is the whole answer, and the column really is not there.
+    missing_outcome: ValidationOutcome = "error" if complete else "warning"
+    missing_detail: ValidationDetail = (
+        "declared but not projected" if complete else "declared with no explicit projection"
+    )
+
     if declared_name == "unknown":
         # A type sqlr cannot map cannot be compared against, or generated from - which is
-        # true of a column the SQL never mentioned too, so this is judged before that.
+        # true of a column the SQL never mentioned too, so this is judged before that. Not
+        # before a column the projection is provably missing, though: that one outranks it,
+        # and reporting the weaker of two true things is the wrong default.
+        if missing:
+            return missing_outcome, missing_detail, None
         return "warning", "unrecognized declaration", None
 
     if inferred is None:
-        # Declared but never referenced. Nothing was checked, so nothing resolved.
-        return "pass", "declared only", None
+        # Declared but never referenced. Nothing opposed the declaration, so it stands -
+        # generation has the type it needs even though inference never saw the column.
+        if missing:
+            return missing_outcome, missing_detail, declared_name
+        return "pass", "declared only", declared_name
 
     inferred_name = inferred.type_name
     if inferred_name == "unknown":

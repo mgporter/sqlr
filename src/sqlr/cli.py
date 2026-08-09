@@ -8,7 +8,13 @@ from rich.console import Console
 from sqlr import config as config_module
 from sqlr.catalog import find_yaml_files
 from sqlr.config.types import SqlrConfig
-from sqlr.declared import load_declared_schemas
+from sqlr.declared import (
+    check_sql_file_links,
+    ignored_models_warning,
+    load_declared_schemas,
+    near_miss_warnings,
+)
+from sqlr.declared.types import DeclaredSchemas
 from sqlr.schema_resolution import resolve_schema
 from sqlr.schema_resolution.render import render_schema
 from sqlr.schema_resolution.types import StatementSchema
@@ -18,6 +24,7 @@ from sqlr.selection import (
     build_model_index,
     select_models,
 )
+from sqlr.selection.types import ModelIndex
 from sqlr.sql_analysis import analyze_file
 from sqlr.validation import render_errors, render_validation, validate_schema
 from sqlr.validation.types import StatementValidation
@@ -60,8 +67,8 @@ def infer_schema(
     root, cfg = _load_project(project_dir)
     # Click has no variadic option, so `--select a b` leaves `b` in the extra args. They
     # are selectors too; anything starting with `-` still fails as an unknown option.
-    analyzed = _analyze(root, cfg, [*select, *ctx.args])
-    schemas = [schema for _, schema in analyzed]
+    _, models = _select(root, cfg, [*select, *ctx.args])
+    schemas = [schema for _, schema in _analyze(cfg, models)]
 
     if output_format == "json":
         typer.echo(
@@ -104,13 +111,20 @@ def validate(
     _configure_logging(verbose)
 
     root, cfg = _load_project(project_dir)
-    analyzed = _analyze(root, cfg, [*select, *ctx.args])
+    index, models = _select(root, cfg, [*select, *ctx.args])
 
-    # Declarations are a project-wide index: a selected model's source tables are usually
-    # declared in some other model's yml, so every yml is loaded regardless of selection.
-    declared = load_declared_schemas(find_yaml_files(root))
-    logger.info("found %d declared models", len(declared.models))
-    for warning in declared.warnings:
+    # Declarations are loaded before anything is analysed: a yml that describes one
+    # relation twice has no right answer to pick, and running the comparison anyway would
+    # report whichever of the two happened to be read first as though it were the rule.
+    declared = _load_declarations(root, index)
+
+    analyzed = _analyze(cfg, models)
+
+    # Near misses are a property of the run, not of one file: the declaration a reference
+    # was meant to reach can sit in any yml, and whether anything else uses it is only
+    # knowable once every selected model has been read.
+    relations = [table.name for _, schema in analyzed for table in schema.tables]
+    for warning in near_miss_warnings(declared, relations):
         typer.echo(f"warning: {warning}", err=True)
 
     validations: list[StatementValidation] = [
@@ -157,16 +171,49 @@ def _load_project(project_dir: Path | None) -> tuple[Path, SqlrConfig]:
     return root, cfg
 
 
+def _load_declarations(root: Path, index: ModelIndex) -> DeclaredSchemas:
+    """Every declaration in the project, or exit 1 with what is wrong with them.
+
+    Project-wide regardless of selection: a selected model's upstream tables are usually
+    described in some other file's yml. Two of the checks need the model index rather than
+    the yml alone - whether a `sql_file:` names a real file, and whether an ignored
+    `models:` entry would have described one - so they run here.
+    """
+    mode = config_module.declaration_mode(root)
+    logger.debug("reading declarations in %s mode", mode)
+
+    declared = load_declared_schemas(find_yaml_files(root), mode)
+    logger.info(
+        "found %d declared sources and %d declared models",
+        len(declared.sources),
+        len(declared.models),
+    )
+
+    warnings = list(declared.warnings)
+    ignored = ignored_models_warning(declared, index.names, root)
+    if ignored is not None:
+        warnings.append(ignored)
+    for warning in warnings:
+        typer.echo(f"warning: {warning}", err=True)
+
+    errors = [*declared.errors, *check_sql_file_links(declared, index.names)]
+    for error in errors:
+        typer.echo(f"error: {error}", err=True)
+    if errors:
+        raise typer.Exit(code=1)
+
+    return declared
+
+
 def _analyze(
-    root: Path, cfg: SqlrConfig, selectors: list[str]
+    cfg: SqlrConfig, models: list[Model]
 ) -> list[tuple[Model, StatementSchema]]:
-    """Resolve selectors, analyse each model, and resolve its schema.
+    """Analyse each model and resolve its schema.
 
     The whole of `infer-schema`; `validate-schema` is this plus a comparison. An analysis
     error is fatal for the run rather than skipped, because a schema resolved from a
     statement that did not parse would be quietly wrong rather than visibly absent.
     """
-    models = _select(root, cfg, selectors)
     analyzed: list[tuple[Model, StatementSchema]] = []
 
     for model in models:
@@ -198,8 +245,13 @@ def _analyze(
     return analyzed
 
 
-def _select(root: Path, cfg: SqlrConfig, selectors: list[str]) -> list[Model]:
+def _select(
+    root: Path, cfg: SqlrConfig, selectors: list[str]
+) -> tuple[ModelIndex, list[Model]]:
     """Resolve selectors against the project, or exit 1 with the reason.
+
+    The whole index comes back beside the selection because declarations are checked
+    against every model in the project, not only the ones being run.
 
     A duplicate model name and an unknown selector are both user-fixable project
     problems, not crashes, so they are reported as messages and not tracebacks.
@@ -216,7 +268,7 @@ def _select(root: Path, cfg: SqlrConfig, selectors: list[str]) -> list[Model]:
         raise typer.Exit(code=1)
 
     logger.info("selected %d of %d models", len(models), len(index.models))
-    return models
+    return index, models
 
 
 if __name__ == "__main__":
