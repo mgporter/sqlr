@@ -1,0 +1,937 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Type checking SQL with sqlglot and a signature catalog</title>
+<link rel="stylesheet" href="shared.css">
+</head>
+<body>
+
+<header class="masthead">
+  <div class="eyebrow"><span class="dot"></span> design spike &middot; sqlglot annotate_types &middot; DuckDB</div>
+  <h1 class="title">Type checking a whole SQL file with sqlglot</h1>
+  <p class="subtitle">Every output on this page was produced by running the code on this page,
+  against sqlglot 30.14.0. Nothing is illustrative. Read the outputs first &mdash; the code only
+  makes sense once you can see what it is walking over.</p>
+  <div class="meta-row">
+    <span class="meta-chip">learning/type_check_demo/</span>
+    <span class="meta-chip">205 lines of new code</span>
+    <span class="meta-chip">no parser written</span>
+    <span class="meta-chip">3 findings, 0 false positives</span>
+  </div>
+</header>
+
+<div class="shell">
+<div class="layout">
+
+<nav class="toc">
+  <div class="toc-label">Contents</div>
+  <ol>
+    <li><a href="#goal">What we are building</a></li>
+    <li><a href="#input">The input</a></li>
+    <li><a href="#ast">What a parse looks like</a></li>
+    <li><a href="#qualify">qualify: making columns addressable</a></li>
+    <li><a href="#pass0">Pass 0: stock annotate_types</a></li>
+    <li><a href="#unknown">Reading the UNKNOWNs</a></li>
+    <li><a href="#catalog">The signature catalog</a></li>
+    <li><a href="#forward">Forward: catalog &rarr; types</a></li>
+    <li><a href="#backward">Backward: catalog &rarr; sources</a></li>
+    <li><a href="#check">The checking pass</a></li>
+    <li><a href="#spans">Where spans come from</a></li>
+    <li><a href="#limits">Limits and next steps</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ============================================================= 01 -->
+<section id="goal">
+  <h2><span class="num">01</span> What we are building</h2>
+  <p class="lede">A checker that types <em>every expression in the file</em>, not just the source
+  columns coming in and the projection going out &mdash; and that reports a real error when a
+  function is called wrongly, using only the information the file itself carries plus whatever
+  the user has declared.</p>
+
+  <p>Today sqlr infers types at the two ends of a model. The middle is dark: a CTE column like
+  <code>upper(status_code)</code> never gets a type, so nothing downstream of it can be checked.
+  This page closes that gap.</p>
+
+  <p>The whole thing is four passes over one tree. Nothing here parses SQL &mdash; sqlglot does that.</p>
+
+  <div class="flow">
+    <div class="node"><div class="k">step 1</div><div class="n">parse</div></div>
+    <div class="arrow">&rarr;</div>
+    <div class="node"><div class="k">step 2</div><div class="n">qualify</div></div>
+    <div class="arrow">&rarr;</div>
+    <div class="node"><div class="k">step 3</div><div class="n">annotate_types</div></div>
+    <div class="arrow">&rarr;</div>
+    <div class="node"><div class="k">step 4</div><div class="n">check</div></div>
+  </div>
+  <p class="flow-caption">Steps 1&ndash;3 are sqlglot. Step 4 is ours. The catalog we add feeds
+  <em>into</em> step 3 and is read again by step 4 &mdash; the same table, in two directions.</p>
+
+  <div class="callout amber">
+    <p><strong>The single most important fact about <code>annotate_types</code>:</strong> it infers,
+    it never rejects. There is no error path anywhere in it. <code>round(varchar_col, 2)</code> gets
+    a type and no complaint. Type <em>checking</em> is a pass you write yourself over the annotated
+    tree. sqlglot supplies the types; you supply the judgement.</p>
+  </div>
+</section>
+
+<!-- ============================================================= 02 -->
+<section id="input">
+  <h2><span class="num">02</span> The input</h2>
+  <p class="lede">One file, two CTEs, three deliberate bugs, and a source table whose schema is
+  only three-fifths declared.</p>
+
+  <h3>example.sql</h3>
+<pre class="code"><span class="kw">with</span> enriched <span class="kw">as</span> (
+    <span class="kw">select</span>
+        order_id,
+        date_trunc(<span class="str">'day'</span>, order_ts)                  <span class="kw">as</span> order_day,
+        amount_cents / <span class="str">100.0</span>                         <span class="kw">as</span> amount,
+        upper(status_code)                           <span class="kw">as</span> status,
+        datediff(<span class="str">'day'</span>, order_ts, current_timestamp) <span class="kw">as</span> age_days,
+        list_extract(split(promo_csv, <span class="str">','</span>), <span class="str">1</span>)       <span class="kw">as</span> first_promo
+    <span class="kw">from</span> orders
+),
+flagged <span class="kw">as</span> (
+    <span class="kw">select</span>
+        *,
+        amount &gt; <span class="str">100</span>              <span class="kw">as</span> is_large,
+        round(status, <span class="str">2</span>)          <span class="kw">as</span> bogus,        <span class="cm">-- bug 1</span>
+        zeroifnull(amount)        <span class="kw">as</span> safe_amount,  <span class="cm">-- bug 2</span>
+        list_extract(first_promo) <span class="kw">as</span> broken       <span class="cm">-- bug 3</span>
+    <span class="kw">from</span> enriched
+)
+<span class="kw">select</span> order_id, order_day, amount, is_large
+<span class="kw">from</span> flagged
+<span class="kw">where</span> age_days &lt; <span class="str">30</span></pre>
+
+  <h3>The declared schema &mdash; deliberately incomplete</h3>
+<pre class="code">DECLARED = {<span class="str">"orders"</span>: {<span class="str">"order_id"</span>: <span class="str">"BIGINT"</span>,
+                       <span class="str">"order_ts"</span>: <span class="str">"TIMESTAMP"</span>,
+                       <span class="str">"amount_cents"</span>: <span class="str">"INT"</span>}}
+
+<span class="cm"># status_code and promo_csv are read by the SQL but described nowhere.</span></pre>
+  <p class="cap">This is what adopting sqlr on a real project looks like on day one.</p>
+
+  <p>Three groups of columns, and the point of the example is that all three get typed:</p>
+
+  <table class="confidence">
+    <tr><th>Group</th><th>Columns</th><th>Where the type comes from</th></tr>
+    <tr>
+      <td><span class="pill explicit">declared</span></td>
+      <td><code>order_id</code>, <code>order_ts</code>, <code>amount_cents</code></td>
+      <td>the user's yml, straight into sqlglot's schema</td>
+    </tr>
+    <tr>
+      <td><span class="pill inferred">inferred</span></td>
+      <td><code>status_code</code>, <code>promo_csv</code></td>
+      <td>backward evidence &mdash; they are fed to <code>upper()</code> and <code>split()</code>, so
+      they must be strings (&sect;9)</td>
+    </tr>
+    <tr>
+      <td><span class="pill guessed">intermediate</span></td>
+      <td><code>order_day</code>, <code>amount</code>, <code>status</code>, <code>age_days</code>,
+          <code>first_promo</code>, <code>is_large</code>, <code>bogus</code>&hellip;</td>
+      <td>computed. In no source table and in no final projection &mdash; today, invisible to sqlr</td>
+    </tr>
+  </table>
+
+  <p>The three bugs are all in that last group. <code>bogus</code> is the interesting one: it is never
+  selected by the final query, so no amount of source-schema or projection-schema inference will ever
+  see it. It is only findable by typing the middle of the file.</p>
+</section>
+
+<!-- ============================================================= 03 -->
+<section id="ast">
+  <h2><span class="num">03</span> What a parse looks like</h2>
+  <p class="lede">Before any of the code makes sense you need to see the shape it walks. Two
+  projections, dumped verbatim.</p>
+
+<pre class="code"><span class="cm">&gt;&gt;&gt; e = sqlglot.parse_one(SQL, read="duckdb")
+&gt;&gt;&gt; # the projection: list_extract(split(promo_csv, ','), 1) as first_promo</span>
+Alias(
+  this=Anonymous(
+    this=list_extract,
+    expressions=[
+      Split(
+        this=Column(
+          this=Identifier(this=promo_csv, quoted=False)),
+        expression=Literal(this=',', is_string=True)),
+      Literal(this=1, is_string=False)]),
+  alias=Identifier(this=first_promo, quoted=False))</pre>
+
+  <p>Three things to take from that dump, because all three drive design decisions later:</p>
+
+  <ol>
+    <li><strong><code>Anonymous</code> vs a real class.</strong> <code>split</code> got its own node
+    class, <code>exp.Split</code>. <code>list_extract</code> did not &mdash; sqlglot has no class for
+    it, so it lands in the catch-all <code>exp.Anonymous</code> with the written name in
+    <code>this</code>. Your catalog has to key both.</li>
+    <li><strong>Arguments are named, not positional.</strong> <code>Split</code> holds
+    <code>this</code> and <code>expression</code>. <code>Anonymous</code> holds <code>this</code>
+    (the name) and <code>expressions</code> (the actual args). There is no uniform
+    <code>node.arguments</code>.</li>
+    <li><strong>Every node is a plain tree of <code>Expr</code>.</strong> <code>node.args</code> is
+    the dict, <code>node.walk()</code> is the traversal, <code>node.type</code> is where a type gets
+    written.</li>
+  </ol>
+
+  <p>And the projection holding our headline bug:</p>
+
+<pre class="code"><span class="cm">&gt;&gt;&gt; # round(status, 2) as bogus</span>
+Alias(
+  this=Round(
+    this=Column(
+      this=Identifier(this=status, quoted=False)),
+    decimals=Literal(this=2, is_string=False)),
+  alias=Identifier(this=bogus, quoted=False))</pre>
+
+  <p><code>Round</code> names its arguments <code>this</code> and <code>decimals</code>. Note that
+  <em>nothing about types appears anywhere</em> in a fresh parse. That is what step 3 adds.</p>
+
+  <div class="callout amber">
+    <p><strong>Gotcha you will hit within an hour.</strong> sqlglot normalises argument order into
+    its node shape, which is not always the order written. Look at what
+    <code>date_trunc('day', order_ts)</code> becomes:</p>
+<pre class="code" style="margin:10px 0 0">TimestampTrunc(this=order_ts, unit='day')   <span class="cm"># unit second, though written first</span></pre>
+    <p style="margin-top:10px">A signature written as <code>(STRING, TEMPORAL)</code> &mdash; matching
+    the SQL you can see &mdash; will produce a confident, wrong error on perfectly valid SQL. Catalog
+    signatures must be written against sqlglot's node order. This cost me one false positive on the
+    first run of this exact example.</p>
+  </div>
+</section>
+
+<!-- ============================================================= 04 -->
+<section id="qualify">
+  <h2><span class="num">04</span> qualify: making every column addressable</h2>
+  <p class="lede">Type inference cannot start until every column reference says which relation it
+  came from, and <code>select *</code> has been turned into a real list. That is
+  <code>qualify</code>'s job, and it needs a schema to do it.</p>
+
+  <p>Here is why it matters. <code>traverse_scope</code> on the <em>unqualified</em> tree already
+  gives you the scope graph &mdash; this is the same machinery <code>relations.py</code> uses today:</p>
+
+<pre class="code"><span class="cm">&gt;&gt;&gt; for s in traverse_scope(e):
+...     print(name, s.sources, [c.sql() for c in s.columns])</span>
+
+enriched     sources={'orders': Table}                    columns=['order_id', 'order_ts', 'amount_cents',
+                                                                  'status_code', 'order_ts', 'promo_csv']
+flagged      sources={'enriched': Scope}                  columns=['amount', 'status', 'amount', 'first_promo']
+&lt;root&gt;       sources={'enriched': Scope, 'flagged': Scope} columns=['order_id', 'order_day', 'amount',
+                                                                  'is_large', 'age_days']</pre>
+
+  <p>Notice <code>flagged</code> lists only four columns. The <code>*</code> has not been expanded, so
+  the six columns flowing through it are invisible. Qualifying fixes that.</p>
+
+  <h3>The trap: a partial schema is fatal</h3>
+<pre class="code"><span class="cm">&gt;&gt;&gt; qualify(tree, schema=MappingSchema(DECLARED), dialect="duckdb")</span>
+OptimizeError: Column 'status_code' could not be resolved. Line: 6, Col: 25</pre>
+
+  <p>This is the first real design decision. <code>qualify</code> validates that every column
+  resolves, and our schema deliberately does not describe <code>status_code</code>. Two ways out:</p>
+
+  <div class="split">
+    <div class="rule-card">
+      <div class="rn">Option A &mdash; reject</div>
+      <h4>validate_qualify_columns=False</h4>
+      <p>Qualification proceeds, but <code>status_code</code> and <code>promo_csv</code> stay
+      <em>unqualified</em> in the output &mdash; <code>UPPER("status_code")</code>, no table prefix.
+      Later passes cannot tell which relation they belong to.</p>
+      <p><strong>Don't.</strong> It silently degrades exactly the columns you most need to reason
+      about.</p>
+    </div>
+    <div class="rule-card">
+      <div class="rn">Option B &mdash; take</div>
+      <h4>Gap-fill the schema with UNKNOWN</h4>
+      <p>Give the schema every column the SQL reads; type the undeclared ones
+      <code>UNKNOWN</code>. Now the schema is complete, validation passes, and everything qualifies
+      properly.</p>
+      <p><code>UNKNOWN</code> is a first-class <code>DType</code> in sqlglot, not a sentinel you
+      invented. Passes below already handle it.</p>
+    </div>
+  </div>
+
+<pre class="code"><span class="cm"># Option B. The column list comes from the tree itself, so nothing has to be known
+# in advance. Note this runs *before* qualify, on the scope graph shown above.</span>
+<span class="kw">def</span> table_columns(tree):
+    <span class="cm">"""Columns read straight off a real table, per table."""</span>
+    out = {}
+    <span class="kw">for</span> scope <span class="kw">in</span> traverse_scope(tree):
+        tables = {n: s <span class="kw">for</span> n, s <span class="kw">in</span> scope.sources.items() <span class="kw">if</span> isinstance(s, exp.Table)}
+        <span class="kw">if not</span> tables:
+            <span class="kw">continue</span>                  <span class="cm"># scope reads CTEs only; nothing to declare</span>
+        <span class="kw">for</span> col <span class="kw">in</span> scope.columns:
+            <span class="cm"># an unqualified column in a single-table scope belongs to that table</span>
+            name = col.table <span class="kw">or</span> (next(iter(tables)) <span class="kw">if</span> len(tables) == <span class="str">1</span> <span class="kw">else</span> <span class="kw">None</span>)
+            <span class="kw">if</span> name <span class="kw">in</span> tables:
+                out.setdefault(tables[name].name, set()).add(col.name)
+    <span class="kw">return</span> out
+
+<span class="kw">def</span> gapfilled(declared, tree):
+    <span class="kw">return</span> {t: {c: declared.get(t, {}).get(c, <span class="str">"UNKNOWN"</span>) <span class="kw">for</span> c <span class="kw">in</span> sorted(cols)}
+            <span class="kw">for</span> t, cols <span class="kw">in</span> table_columns(tree).items()}</pre>
+  <p class="cap">Filtering to <code>exp.Table</code> sources is what stops CTE-internal names like
+  <code>amount</code> and <code>is_large</code> from being invented as columns of
+  <code>orders</code>.</p>
+
+  <h3>What comes out</h3>
+<pre class="code">WITH <span class="str">"enriched"</span> AS (
+  SELECT
+    <span class="fl">"orders"."order_id"</span> AS <span class="str">"order_id"</span>,
+    DATE_TRUNC('DAY', <span class="fl">"orders"."order_ts"</span>) AS <span class="str">"order_day"</span>,
+    <span class="fl">"orders"."amount_cents"</span> / 100.0 AS <span class="str">"amount"</span>,
+    UPPER(<span class="fl">"orders"."status_code"</span>) AS <span class="str">"status"</span>,
+    DATE_DIFF('DAY', <span class="fl">"orders"."order_ts"</span>, CURRENT_TIMESTAMP) AS <span class="str">"age_days"</span>,
+    LIST_EXTRACT(STR_SPLIT(<span class="fl">"orders"."promo_csv"</span>, ','), 1) AS <span class="str">"first_promo"</span>
+  FROM <span class="str">"orders"</span> AS <span class="str">"orders"</span>
+), <span class="str">"flagged"</span> AS (
+  SELECT
+    <span class="fl">"enriched"."order_id"</span> AS <span class="str">"order_id"</span>,
+    <span class="fl">"enriched"."order_day"</span> AS <span class="str">"order_day"</span>,
+    <span class="fl">"enriched"."amount"</span> AS <span class="str">"amount"</span>,
+    <span class="fl">"enriched"."status"</span> AS <span class="str">"status"</span>,
+    <span class="fl">"enriched"."age_days"</span> AS <span class="str">"age_days"</span>,
+    <span class="fl">"enriched"."first_promo"</span> AS <span class="str">"first_promo"</span>,
+    <span class="fl">"enriched"."amount"</span> &gt; 100 AS <span class="str">"is_large"</span>,
+    ROUND(<span class="fl">"enriched"."status"</span>, 2) AS <span class="str">"bogus"</span>,
+    ZEROIFNULL(<span class="fl">"enriched"."amount"</span>) AS <span class="str">"safe_amount"</span>,
+    LIST_EXTRACT(<span class="fl">"enriched"."first_promo"</span>) AS <span class="str">"broken"</span>
+  FROM <span class="str">"enriched"</span> AS <span class="str">"enriched"</span>
+)
+SELECT
+  <span class="fl">"flagged"."order_id"</span> AS <span class="str">"order_id"</span>,
+  <span class="fl">"flagged"."order_day"</span> AS <span class="str">"order_day"</span>,
+  <span class="fl">"flagged"."amount"</span> AS <span class="str">"amount"</span>,
+  <span class="fl">"flagged"."is_large"</span> AS <span class="str">"is_large"</span>
+FROM <span class="str">"flagged"</span> AS <span class="str">"flagged"</span>
+WHERE
+  <span class="fl">"flagged"."age_days"</span> &lt; 30</pre>
+  <p class="cap">The <code>*</code> is gone, replaced by six real projections. Every column now names
+  its relation. <code>split</code> was rewritten to <code>STR_SPLIT</code> &mdash; that is sqlglot
+  normalising to DuckDB's canonical spelling, and it is harmless.</p>
+
+  <div class="callout">
+    <p>Qualification is also where an <em>unresolvable</em> column becomes reportable. If a user
+    writes <code>orders.custmer_id</code>, Option B's gap-fill will happily invent it &mdash; so the
+    real check for typos belongs here, comparing the tree's column set against the declared one,
+    <strong>before</strong> gap-filling. That is a different diagnostic from anything on this page.</p>
+  </div>
+</section>
+
+<!-- ============================================================= 05 -->
+<section id="pass0">
+  <h2><span class="num">05</span> Pass 0: stock <code>annotate_types</code>, nothing added</h2>
+  <p class="lede">Before writing a line of catalog, run sqlglot as-is and look at what you get for
+  free. This is the baseline every later decision is measured against.</p>
+
+<pre class="code"><span class="kw">from</span> sqlglot.optimizer.annotate_types <span class="kw">import</span> annotate_types
+
+ms = MappingSchema(gapfilled(DECLARED, tree), dialect=<span class="str">"duckdb"</span>)
+q  = qualify(sqlglot.parse_one(SQL, read=<span class="str">"duckdb"</span>), schema=ms, dialect=<span class="str">"duckdb"</span>)
+a  = annotate_types(q, schema=ms, dialect=<span class="str">"duckdb"</span>)
+
+<span class="kw">for</span> scope <span class="kw">in</span> traverse_scope(a):
+    <span class="kw">for</span> s <span class="kw">in</span> scope.expression.selects:
+        print(s.alias_or_name, s.type.sql(<span class="str">"duckdb"</span>), type(s.this).__name__)</pre>
+
+<pre class="code"><span class="cm">########## PASS 0  stock sqlglot, declared schema gap-filled with UNKNOWN</span>
+-- enriched
+   order_id         BIGINT           &lt;- Column
+   order_day        <span class="fl">UNKNOWN</span>          &lt;- TimestampTrunc
+   amount           DOUBLE           &lt;- Div
+   status           TEXT             &lt;- Upper
+   age_days         BIGINT           &lt;- DateDiff
+   first_promo      <span class="fl">UNKNOWN</span>          &lt;- Anonymous
+-- flagged
+   order_id         BIGINT           &lt;- Column
+   order_day        <span class="fl">UNKNOWN</span>          &lt;- Column
+   amount           DOUBLE           &lt;- Column
+   status           TEXT             &lt;- Column
+   age_days         BIGINT           &lt;- Column
+   first_promo      <span class="fl">UNKNOWN</span>          &lt;- Column
+   is_large         BOOLEAN          &lt;- GT
+   bogus            <span class="fl">DOUBLE</span>           &lt;- Round
+   safe_amount      <span class="fl">UNKNOWN</span>          &lt;- Anonymous
+   broken           <span class="fl">UNKNOWN</span>          &lt;- Anonymous
+-- &lt;final projection&gt;
+   order_id         BIGINT           &lt;- Column
+   order_day        <span class="fl">UNKNOWN</span>          &lt;- Column
+   amount           DOUBLE           &lt;- Column
+   is_large         BOOLEAN          &lt;- Column</pre>
+
+  <p>A lot of this is genuinely useful and you did not write any of it:</p>
+  <ul>
+    <li><code>amount_cents / 100.0</code> &rarr; <code>DOUBLE</code>. INT over a float literal, with
+    DuckDB's division semantics applied (<code>Dialect.TYPED_DIVISION</code>).</li>
+    <li><code>amount &gt; 100</code> &rarr; <code>BOOLEAN</code>, because <code>GT</code> is a
+    <code>Predicate</code>.</li>
+    <li><code>datediff(...)</code> &rarr; <code>BIGINT</code>, from sqlglot's own table.</li>
+    <li>Every type <strong>flows across CTE boundaries</strong>. <code>amount</code> is
+    <code>DOUBLE</code> in <code>flagged</code> because <code>flagged</code>'s scope resolved it back
+    into <code>enriched</code>'s already-annotated projection. This is the part that would take
+    months to rebuild, and it works out of the box.</li>
+  </ul>
+
+  <div class="callout amber">
+    <p>Now the line that should worry you: <code>bogus</code> came out <strong>DOUBLE</strong>.
+    That is <code>round(status, 2)</code> where <code>status</code> is a string. sqlglot typed it
+    without hesitation and reported nothing. Nothing is broken &mdash; it is doing inference, and
+    inference has no opinion about validity. Everything in &sect;10 exists because of this line.</p>
+  </div>
+</section>
+
+<!-- ============================================================= 06 -->
+<section id="unknown">
+  <h2><span class="num">06</span> Reading the UNKNOWNs</h2>
+  <p class="lede">Five <code>UNKNOWN</code>s in that output, and they have four completely different
+  causes. Telling them apart is the difference between a useful tool and a noisy one.</p>
+
+  <table class="confidence">
+    <tr><th>Column</th><th>Cause</th><th>Whose problem</th></tr>
+    <tr>
+      <td><code>order_day</code></td>
+      <td><strong>Coverage gap in sqlglot.</strong> DuckDB parses <code>date_trunc</code> to
+      <code>exp.TimestampTrunc</code>, but the dispatch table only registers the date-unit annotator
+      for <code>DateTrunc</code>/<code>DateAdd</code>/<code>DateSub</code>. Nothing is wrong with the
+      SQL.</td>
+      <td>ours &mdash; fill it</td>
+    </tr>
+    <tr>
+      <td><code>first_promo</code></td>
+      <td><strong>No signature.</strong> <code>list_extract</code> is <code>Anonymous</code>; sqlglot
+      cannot know its return type. <code>split</code> has a class but no metadata entry either.</td>
+      <td>ours &mdash; catalog it</td>
+    </tr>
+    <tr>
+      <td><code>safe_amount</code></td>
+      <td><strong>Function does not exist</strong> in this dialect. <code>zeroifnull</code> is
+      Snowflake. Also <code>Anonymous</code>, and indistinguishable from the row above without a
+      catalog to check against.</td>
+      <td>the user &mdash; report it</td>
+    </tr>
+    <tr>
+      <td><code>broken</code></td>
+      <td><strong>Wrong arity.</strong> <code>list_extract</code> with one argument.</td>
+      <td>the user &mdash; report it</td>
+    </tr>
+    <tr>
+      <td>&lsquo;<code>order_day</code>&rsquo; in <code>flagged</code> and in the final projection</td>
+      <td><strong>Propagation.</strong> One UNKNOWN upstream, and every expression that touches it is
+      UNKNOWN too.</td>
+      <td>derived &mdash; do not report twice</td>
+    </tr>
+  </table>
+
+  <div class="callout">
+    <p><strong>UNKNOWN is absorbing.</strong> <code>_annotate_by_args</code> returns immediately with
+    UNKNOWN the moment any argument is UNKNOWN. There is no partial recovery. One uncatalogued
+    function near the bottom of a file blanks out everything above it &mdash; which is why
+    <code>order_day</code> is UNKNOWN in all three scopes from one missing metadata entry.</p>
+    <p>The practical consequence: measure your catalog's coverage as a <em>number</em>, and treat
+    "argument was typed but result is UNKNOWN" as a coverage bug to be fixed, never as a user error
+    to be reported.</p>
+  </div>
+</section>
+
+<!-- ============================================================= 07 -->
+<section id="catalog">
+  <h2><span class="num">07</span> The signature catalog</h2>
+  <p class="lede">One table, keyed by dialect and SQL function name. It is the only new data in this
+  design, and it gets read three different ways.</p>
+
+<pre class="code"><span class="kw">from</span> dataclasses <span class="kw">import</span> dataclass
+
+<span class="fl">@dataclass</span>(frozen=<span class="kw">True</span>)
+<span class="kw">class</span> Sig:
+    params: tuple[str, ...]   <span class="cm"># families: NUMERIC STRING TEMPORAL BOOLEAN ARRAY ANY</span>
+    returns: str              <span class="cm"># a type string, or "@element" / "@argN"</span>
+
+CATALOG: dict[str, list[Sig]] = {
+    <span class="str">"UPPER"</span>:           [Sig((<span class="str">"STRING"</span>,), <span class="str">"VARCHAR"</span>)],
+    <span class="str">"SPLIT"</span>:           [Sig((<span class="str">"STRING"</span>, <span class="str">"STRING"</span>), <span class="str">"ARRAY&lt;VARCHAR&gt;"</span>)],
+    <span class="str">"LIST_EXTRACT"</span>:    [Sig((<span class="str">"ARRAY"</span>, <span class="str">"NUMERIC"</span>), <span class="str">"@element"</span>)],
+    <span class="str">"ROUND"</span>:           [Sig((<span class="str">"NUMERIC"</span>, <span class="str">"NUMERIC"</span>), <span class="str">"@arg0"</span>), Sig((<span class="str">"NUMERIC"</span>,), <span class="str">"@arg0"</span>)],
+    <span class="cm"># NOTE: params are in sqlglot's *node* arg order, not the order written in SQL.
+    # date_trunc('day', ts) parses to TimestampTrunc(this=ts, unit='day').</span>
+    <span class="str">"TIMESTAMP_TRUNC"</span>: [Sig((<span class="str">"TEMPORAL"</span>, <span class="str">"STRING"</span>), <span class="str">"@arg0"</span>)],
+}</pre>
+
+  <p>Four decisions worth defending, since this shape is the thing you would live with:</p>
+
+  <div class="split">
+    <div class="rule-card">
+      <div class="rn">Decision 1</div>
+      <h4>Key on the SQL name, never the class name</h4>
+      <p><code>"ROUND"</code>, not <code>exp.Round</code>. Class names change between sqlglot
+      versions and do not exist at all for <code>Anonymous</code> functions. One lookup helper covers
+      both cases:</p>
+<pre class="code" style="margin:8px 0 0;font-size:12.5px"><span class="kw">def</span> catalog_key(node):
+    <span class="kw">if</span> isinstance(node, exp.Anonymous):
+        <span class="kw">return</span> node.name.upper()
+    <span class="kw">if</span> isinstance(node, exp.Func):
+        <span class="kw">return</span> node.sql_name()
+    <span class="kw">return</span> <span class="kw">None</span></pre>
+    </div>
+    <div class="rule-card">
+      <div class="rn">Decision 2</div>
+      <h4>Families, not concrete types</h4>
+      <p><code>round</code> accepts any numeric. Enumerating nine numeric types per parameter would
+      make the catalog unmaintainable and unwritable by hand. Families map straight onto sqlglot's
+      own constants:</p>
+<pre class="code" style="margin:8px 0 0;font-size:12.5px">FAMILIES = {
+  <span class="str">"NUMERIC"</span>:  set(exp.DataType.NUMERIC_TYPES),
+  <span class="str">"STRING"</span>:   set(exp.DataType.TEXT_TYPES),
+  <span class="str">"TEMPORAL"</span>: set(exp.DataType.TEMPORAL_TYPES),
+  <span class="str">"BOOLEAN"</span>:  {exp.DType.BOOLEAN},
+  <span class="str">"ARRAY"</span>:    {exp.DType.ARRAY},
+}</pre>
+    </div>
+    <div class="rule-card">
+      <div class="rn">Decision 3</div>
+      <h4>Polymorphic returns as markers</h4>
+      <p><code>"@arg0"</code> means "whatever the first argument was" &mdash;
+      <code>round(DECIMAL)</code> stays DECIMAL, <code>round(DOUBLE)</code> stays DOUBLE, with one
+      entry. <code>"@element"</code> unwraps an <code>ARRAY&lt;T&gt;</code> to <code>T</code>.
+      Without these, <code>list_extract</code> would need one row per element type.</p>
+    </div>
+    <div class="rule-card">
+      <div class="rn">Decision 4</div>
+      <h4>Three-valued family test</h4>
+      <p>The whole design hinges on this returning <code>None</code>, not <code>False</code>, for an
+      unknown type. False means "definitely wrong, report it". None means "cannot say, stay quiet".
+      Conflating them is how a checker gets a reputation for lying.</p>
+<pre class="code" style="margin:8px 0 0;font-size:12.5px"><span class="kw">def</span> in_family(dtype, family):
+    <span class="kw">if</span> family == <span class="str">"ANY"</span>:
+        <span class="kw">return</span> <span class="kw">True</span>
+    <span class="kw">if</span> dtype <span class="kw">is None or</span> dtype.is_type(exp.DType.UNKNOWN):
+        <span class="kw">return</span> <span class="kw">None</span>
+    <span class="kw">return</span> dtype.this <span class="kw">in</span> FAMILIES[family]</pre>
+    </div>
+  </div>
+
+  <div class="callout">
+    <p><strong>Where the real catalog comes from.</strong> Not from typing it out. DuckDB will hand
+    you roughly 1,200 overloads with argument and return types from
+    <code>select * from duckdb_functions()</code>, and Postgres the same from <code>pg_proc</code>.
+    Snowflake and BigQuery have no equivalent, which is the actual cost of this whole design and the
+    thing to scope before committing.</p>
+  </div>
+
+  <p>Note what is <em>not</em> in the catalog: <code>datediff</code>, <code>current_timestamp</code>,
+  <code>/</code>, <code>&gt;</code>. sqlglot already types all of those correctly. The catalog is a
+  gap-filler, not a replacement &mdash; keep it that way, or you inherit 300 entries of maintenance
+  you did not need.</p>
+</section>
+
+<!-- ============================================================= 08 -->
+<section id="forward">
+  <h2><span class="num">08</span> Forward: catalog &rarr; types</h2>
+  <p class="lede">Installing the catalog is 10 lines, because sqlglot's dispatch table is a plain
+  dict you are allowed to write to.</p>
+
+  <p>Recall the mechanism from <code>annotate_types.py</code> &mdash; when it reaches a node, it does
+  exactly this and nothing more:</p>
+
+<pre class="code">spec = self.expression_metadata.get(expr.__class__)
+<span class="kw">if</span> spec <span class="kw">and</span> (annotator := spec.get(<span class="str">"annotator"</span>)):
+    annotator(self, expr)
+<span class="kw">elif</span> spec <span class="kw">and</span> (returns := spec.get(<span class="str">"returns"</span>)):
+    self._set_type(expr, returns)
+<span class="kw">else</span>:
+    self._set_type(expr, exp.DType.UNKNOWN)</pre>
+  <p class="cap">sqlglot 30.14.0, annotate_types.py:528. Class &rarr; dict lookup &rarr; constant type
+  or a callable. That is the entire extension point.</p>
+
+  <p>So to inject the catalog, put a callable in that dict for each entry:</p>
+
+<pre class="code"><span class="kw">def</span> pick_overload(node):
+    <span class="cm">"""First overload no argument definitively contradicts."""</span>
+    args = func_args(node)
+    <span class="kw">for</span> sig <span class="kw">in</span> CATALOG.get(catalog_key(node) <span class="kw">or</span> <span class="str">""</span>, []):
+        <span class="kw">if</span> len(sig.params) != len(args):
+            <span class="kw">continue</span>
+        <span class="kw">if</span> any(in_family(a.type, f) <span class="kw">is False</span> <span class="kw">for</span> a, f <span class="kw">in</span> zip(args, sig.params)):
+            <span class="kw">continue</span>                      <span class="cm"># definitely the wrong overload</span>
+        <span class="kw">return</span> sig, args
+    <span class="kw">return</span> <span class="kw">None</span>, args
+
+
+<span class="kw">def</span> _annotate(annotator, node):
+    sig, args = pick_overload(node)
+    annotator._set_type(node, _resolve_return(sig, args) <span class="kw">if</span> sig <span class="kw">else</span> exp.DType.UNKNOWN)
+
+
+<span class="kw">def</span> install_catalog(dialect_name=<span class="str">"duckdb"</span>):
+    <span class="cm">"""Register one annotator per catalog entry, on this dialect only."""</span>
+    d = Dialect.get_or_raise(dialect_name)
+    <span class="kw">for</span> key <span class="kw">in</span> CATALOG:
+        cls = exp.FUNCTION_BY_NAME.get(key)      <span class="cm"># sqlglot's own name -&gt; class map</span>
+        <span class="kw">if</span> cls <span class="kw">is not None</span>:
+            d.EXPRESSION_METADATA[cls] = {<span class="str">"annotator"</span>: _annotate}
+    <span class="cm"># everything with no sqlglot class arrives as Anonymous; route it by written name</span>
+    d.EXPRESSION_METADATA[exp.Anonymous] = {<span class="str">"annotator"</span>: _annotate}</pre>
+
+  <p><code>exp.FUNCTION_BY_NAME</code> is sqlglot's own <code>"ROUND" &rarr; exp.Round</code> mapping,
+  so the catalog never has to mention a class. Entries with no class (<code>LIST_EXTRACT</code>) are
+  reached through the single <code>Anonymous</code> registration, which dispatches on
+  <code>node.name</code>.</p>
+
+  <p>Argument extraction is the one fiddly bit, because of the two node shapes from &sect;3:</p>
+
+<pre class="code"><span class="kw">def</span> func_args(node):
+    <span class="cm">"""Positional arguments of a call, in sqlglot's node arg order."""</span>
+    <span class="kw">if</span> isinstance(node, exp.Anonymous):
+        <span class="kw">return</span> list(node.args.get(<span class="str">"expressions"</span>) <span class="kw">or</span> [])
+    out = []
+    <span class="kw">for</span> name <span class="kw">in</span> node.arg_types:              <span class="cm"># declaration order, stable</span>
+        val = node.args.get(name)
+        <span class="kw">if</span> val <span class="kw">is None or</span> isinstance(val, (str, bool)):
+            <span class="kw">continue</span>                        <span class="cm"># flags like `big_int`, not arguments</span>
+        out.extend(val <span class="kw">if</span> isinstance(val, list) <span class="kw">else</span> [val])
+    <span class="kw">return</span> out</pre>
+
+  <h3>Pass 1 &mdash; same schema, catalog installed</h3>
+<pre class="code"><span class="cm">########## PASS 1  catalog installed, source types still partial</span>
+-- enriched
+   order_id         BIGINT
+   order_day        <span class="kw">TIMESTAMP</span>        <span class="cm">&lt;- was UNKNOWN (metadata gap, now filled)</span>
+   amount           DOUBLE
+   status           TEXT
+   age_days         BIGINT
+   first_promo      <span class="kw">TEXT</span>             <span class="cm">&lt;- was UNKNOWN (split -&gt; ARRAY&lt;VARCHAR&gt; -&gt; @element)</span>
+-- flagged
+   ...
+   is_large         BOOLEAN
+   bogus            <span class="kw">UNKNOWN</span>          <span class="cm">&lt;- was DOUBLE. no overload matched: the bug is now visible</span>
+   safe_amount      UNKNOWN          <span class="cm">&lt;- still: zeroifnull isn't in the catalog, correctly</span>
+   broken           UNKNOWN          <span class="cm">&lt;- still: wrong arity, no overload has arity 1</span>
+-- &lt;final projection&gt;
+   order_day        <span class="kw">TIMESTAMP</span>        <span class="cm">&lt;- propagated two scopes up</span></pre>
+
+  <p>Two chains resolved that could not have resolved separately:</p>
+  <ul>
+    <li><code>first_promo</code> needed <em>both</em> catalog entries.
+    <code>split</code> produced <code>ARRAY&lt;VARCHAR&gt;</code>, and only then could
+    <code>list_extract</code>'s <code>@element</code> unwrap it to <code>VARCHAR</code>. Composition
+    is free &mdash; annotation is bottom-up, so nested calls just work.</li>
+    <li><code>bogus</code> flipped from a confident wrong answer to <code>UNKNOWN</code>, because
+    <code>pick_overload</code> found no signature that <code>TEXT</code> satisfies. Sound inference
+    and error detection are the same mechanism seen from two sides.</li>
+  </ul>
+</section>
+
+<!-- ============================================================= 09 -->
+<section id="backward">
+  <h2><span class="num">09</span> Backward: catalog &rarr; source types</h2>
+  <p class="lede">The same table read in reverse. If a column is fed to <code>upper()</code>, that
+  column is a string &mdash; and this is the only evidence anyone has about a column nobody
+  declared.</p>
+
+  <p>This direction is what makes "partially inferable" schemas work. <code>status_code</code> and
+  <code>promo_csv</code> are described nowhere, but the SQL constrains them.</p>
+
+<pre class="code"><span class="kw">def</span> source_columns(tree):
+    <span class="cm">"""Every qualified column that reads a real table, keyed by (table, column)."""</span>
+    found = {}
+    <span class="kw">for</span> scope <span class="kw">in</span> traverse_scope(tree):
+        <span class="kw">for</span> col <span class="kw">in</span> scope.columns:
+            source = scope.sources.get(col.table)
+            <span class="kw">if</span> isinstance(source, exp.Table):     <span class="cm"># a Table, not a nested Scope</span>
+                found.setdefault((source.name, col.name), col)
+    <span class="kw">return</span> found
+
+
+<span class="kw">def</span> backward_evidence(tree):
+    real = source_columns(tree)
+    by_node = {id(c): k <span class="kw">for</span> k, c <span class="kw">in</span> real.items()}
+    evidence = {}
+    <span class="kw">for</span> node <span class="kw">in</span> tree.walk():
+        <span class="kw">if not</span> isinstance(node, exp.Func):
+            <span class="kw">continue</span>
+        <span class="kw">for</span> sig <span class="kw">in</span> CATALOG.get(catalog_key(node) <span class="kw">or</span> <span class="str">""</span>, []):
+            args = func_args(node)
+            <span class="kw">if</span> len(sig.params) != len(args):
+                <span class="kw">continue</span>
+            <span class="kw">for</span> arg, family <span class="kw">in</span> zip(args, sig.params):
+                key = by_node.get(id(arg))
+                <span class="cm"># only claim something about a column we know nothing about</span>
+                <span class="kw">if</span> key <span class="kw">and</span> family != <span class="str">"ANY"</span> <span class="kw">and</span> in_family(arg.type, family) <span class="kw">is None</span>:
+                    evidence.setdefault(key, family)
+            <span class="kw">break</span>
+    <span class="kw">return</span> evidence</pre>
+
+  <p>The <code>isinstance(source, exp.Table)</code> test is the load-bearing line. It is what
+  separates <em>"this column comes from a real table, so my claim is about stored data"</em> from
+  <em>"this column comes from a CTE, so its type is already computed and I must not overwrite it"</em>.
+  Without it, backward evidence would fight forward inference.</p>
+
+<pre class="code"><span class="cm">&gt;&gt;&gt; backward_evidence(pass1_tree)</span>
+{'orders.status_code': 'STRING', 'orders.promo_csv': 'STRING'}
+
+<span class="cm">&gt;&gt;&gt; widen_schema(gapfilled(DECLARED, tree), evidence)</span>
+{
+  "orders": {
+    "amount_cents": "INT",         <span class="cm"># declared</span>
+    "order_id":     "BIGINT",      <span class="cm"># declared</span>
+    "order_ts":     "TIMESTAMP",   <span class="cm"># declared</span>
+    "promo_csv":    <span class="fl">"VARCHAR"</span>,     <span class="cm"># inferred: split() wants a STRING</span>
+    "status_code":  <span class="fl">"VARCHAR"</span>      <span class="cm"># inferred: upper() wants a STRING</span>
+  }
+}</pre>
+
+  <p>Then re-annotate against the widened schema. Declared and inferred types are now
+  indistinguishable to every downstream pass &mdash; the same <code>MappingSchema</code>, whatever the
+  provenance. That interchangeability is the property worth protecting: it means the checker behaves
+  identically on a fully-documented project and an undocumented one, differing only in confidence.</p>
+
+<pre class="code"><span class="cm">########## PASS 2  schema widened by backward evidence</span>
+-- enriched
+   order_id         BIGINT           order_day    TIMESTAMP
+   amount           DOUBLE           status       TEXT
+   age_days         BIGINT           first_promo  TEXT
+-- flagged
+   ... all six inherited, plus:
+   is_large         BOOLEAN
+   bogus            UNKNOWN
+   safe_amount      UNKNOWN
+   broken           UNKNOWN
+-- &lt;final projection&gt;
+   order_id BIGINT   order_day TIMESTAMP   amount DOUBLE   is_large BOOLEAN</pre>
+
+  <p>Every intermediate column in the file now carries a type, except the three that are bugs. That
+  is the state the checker wants to be handed.</p>
+
+  <div class="callout amber">
+    <p><strong>Guard against oscillation.</strong> Backward evidence changes the schema, which changes
+    inference, which could produce new backward evidence. Here it converges in one round because
+    <code>widen_schema</code> only writes into <code>UNKNOWN</code> slots &mdash; it never overwrites
+    a type, so the schema is monotone and a second round is a no-op. Keep that property. If you ever
+    let evidence overwrite an existing type, cap the iterations and record what changed.</p>
+    <p>This is also where sqlr's existing weighted-evidence machinery belongs rather than my
+    <code>setdefault</code>: two functions can constrain one column differently, and picking a winner
+    by first-seen is exactly the arbitrary coin-flip the design doc argues against.</p>
+  </div>
+</section>
+
+<!-- ============================================================= 10 -->
+<section id="check">
+  <h2><span class="num">10</span> The checking pass</h2>
+  <p class="lede">Everything so far was inference. This is the only code that has an opinion, and it
+  is a single walk over the annotated tree.</p>
+
+<pre class="code"><span class="kw">def</span> check(tree):
+    out = []
+    <span class="kw">for</span> node <span class="kw">in</span> tree.walk():
+        <span class="kw">if not</span> isinstance(node, exp.Func):
+            <span class="kw">continue</span>
+        key  = catalog_key(node)
+        sigs = CATALOG.get(key <span class="kw">or</span> <span class="str">""</span>)
+
+        <span class="cm"># F001 - no signature at all. Only report for Anonymous: a function with a
+        # sqlglot class exists somewhere, it is our catalog that is thin.</span>
+        <span class="kw">if not</span> sigs:
+            <span class="kw">if</span> isinstance(node, exp.Anonymous):
+                s, e = name_span(node)
+                out.append(Finding(<span class="str">"SQLR-F001"</span>,
+                    f<span class="str">"unknown function {node.name!r} in dialect {DIALECT}"</span>, s, e))
+            <span class="kw">continue</span>
+
+        <span class="cm"># F002 - arity. Checked before types, so a 1-arg call never also
+        # reports a bogus type mismatch against a 2-arg signature.</span>
+        args = func_args(node)
+        <span class="kw">if</span> all(len(sig.params) != len(args) <span class="kw">for</span> sig <span class="kw">in</span> sigs):
+            arities = sorted({len(s.params) <span class="kw">for</span> s <span class="kw">in</span> sigs})
+            s, e = name_span(node)
+            out.append(Finding(<span class="str">"SQLR-F002"</span>,
+                f<span class="str">"{key} takes {arities} arguments, {len(args)} given"</span>, s, e))
+            <span class="kw">continue</span>
+
+        <span class="cm"># F003 - right arity, no overload accepts these types. Blame the
+        # specific argument, on the first same-arity overload.</span>
+        sig, _ = pick_overload(node)
+        <span class="kw">if</span> sig <span class="kw">is None</span>:
+            <span class="kw">for</span> cand <span class="kw">in</span> sigs:
+                <span class="kw">if</span> len(cand.params) != len(args):
+                    <span class="kw">continue</span>
+                <span class="kw">for</span> i, (arg, family) <span class="kw">in</span> enumerate(zip(args, cand.params)):
+                    <span class="kw">if</span> in_family(arg.type, family) <span class="kw">is False</span>:   <span class="cm"># False, never None</span>
+                        s, e = span(arg)
+                        out.append(Finding(<span class="str">"SQLR-F003"</span>,
+                            f<span class="str">"{key} argument {i+1} expects {family}, "</span>
+                            f<span class="str">"got {arg.type.sql(DIALECT)}"</span>, s, e))
+                <span class="kw">break</span>
+    <span class="kw">return</span> out</pre>
+
+  <h3>The output</h3>
+<pre class="code"><span class="cm">########## FINDINGS</span>
+  <span class="fl">SQLR-F003</span>  chars 492-497  ROUND argument 1 expects NUMERIC, got TEXT
+           | status
+  <span class="fl">SQLR-F001</span>  chars 530-539  unknown function 'zeroifnull' in dialect duckdb
+           | zeroifnull
+  <span class="fl">SQLR-F002</span>  chars 580-591  LIST_EXTRACT takes [2] arguments, 1 given
+           | list_extract</pre>
+
+  <p>Three bugs planted, three found, nothing else reported. Worth being precise about why there are
+  no false positives, because that is the part that is easy to lose:</p>
+
+  <ul>
+    <li><code>order_day</code> was UNKNOWN for two whole passes and never generated a finding &mdash;
+    <code>in_family</code> returned <code>None</code>, and <code>None</code> is not
+    <code>False</code>.</li>
+    <li><code>promo_csv</code> was undeclared and never generated a finding, for the same reason.</li>
+    <li><code>datediff</code>, <code>current_timestamp</code> and the arithmetic are not in the
+    catalog at all, and absence from the catalog is never an error for a class-backed function.</li>
+    <li><code>broken</code> got exactly one finding, not two. Arity is checked first and
+    <code>continue</code>s, so the type check never runs against a signature the call could not
+    match anyway.</li>
+  </ul>
+
+  <div class="callout">
+    <p>Notice the checker never looks at the SQL text, only at <code>node.type</code>. Everything
+    upstream &mdash; declared yml, backward inference, sqlglot's own tables, cross-CTE propagation
+    &mdash; has already been flattened into one uniform annotated tree. That is the property that
+    makes this a foundation other modules can build on rather than another special case: relationship
+    inference, constraint extraction and fixture generation can all read <code>node.type</code> off
+    the same tree without knowing where any of it came from.</p>
+  </div>
+</section>
+
+<!-- ============================================================= 11 -->
+<section id="spans">
+  <h2><span class="num">11</span> Where the spans come from</h2>
+  <p class="lede"><code>chars 492-497</code> is not something the checker computed. sqlglot stashes
+  token offsets on the nodes it positioned, and the two helpers just read them.</p>
+
+<pre class="code"><span class="cm">&gt;&gt;&gt; sql = "select round(status, 2) as bogus from t"
+&gt;&gt;&gt; for n in parse_one(sql).find(exp.Round).walk():
+...     print(type(n).__name__, n.meta.get("start"), n.meta.get("end"))</span>
+Round       7    11        <span class="cm"># the name token: sql[7:12] == "round"</span>
+Column      None None      <span class="cm"># composite nodes carry nothing</span>
+Identifier  13   18        <span class="cm"># "status"</span>
+Literal     21   21        <span class="cm"># "2"</span></pre>
+
+  <p>Two different helpers, because the two kinds of finding want to point at different things:</p>
+
+<pre class="code"><span class="kw">def</span> name_span(node):
+    <span class="cm">"""Just the token sqlglot positioned on this node - for a call, its name."""</span>
+    <span class="kw">return</span> node.meta.get(<span class="str">"start"</span>), node.meta.get(<span class="str">"end"</span>)
+
+<span class="kw">def</span> span(node):
+    <span class="cm">"""Hull of every positioned leaf beneath a node."""</span>
+    starts = [n.meta[<span class="str">"start"</span>] <span class="kw">for</span> n <span class="kw">in</span> node.walk() <span class="kw">if</span> n.meta.get(<span class="str">"start"</span>) <span class="kw">is not None</span>]
+    ends   = [n.meta[<span class="str">"end"</span>]   <span class="kw">for</span> n <span class="kw">in</span> node.walk() <span class="kw">if</span> n.meta.get(<span class="str">"end"</span>)   <span class="kw">is not None</span>]
+    <span class="kw">return</span> (min(starts) <span class="kw">if</span> starts <span class="kw">else</span> <span class="kw">None</span>, max(ends) <span class="kw">if</span> ends <span class="kw">else</span> <span class="kw">None</span>)</pre>
+
+  <p>F001 and F002 are complaints about <em>the call</em>, so they use <code>name_span</code> and
+  underline just <code>zeroifnull</code>. F003 is a complaint about <em>one argument</em>, so it uses
+  the hull and underlines <code>status</code>.</p>
+
+  <div class="callout">
+    <p>Getting this wrong is visible in the output. An earlier run used the hull for F001 and
+    underlined <code>zeroifnull(amount</code> &mdash; the closing paren is not a positioned leaf, so
+    the hull stops short of it. That is precisely the unbalanced-hull problem
+    <code>source.py</code> already documents and repairs. Reuse <code>Positions</code> here rather
+    than the toy <code>span()</code> above; it has solved this already.</p>
+  </div>
+</section>
+
+<!-- ============================================================= 12 -->
+<section id="limits">
+  <h2><span class="num">12</span> Limits and next steps</h2>
+  <p class="lede">205 lines got a working whole-file type checker. Here is what those 205 lines
+  honestly do not do.</p>
+
+  <table class="confidence">
+    <tr><th>Gap</th><th>What it means</th></tr>
+    <tr>
+      <td><strong>No implicit coercion</strong></td>
+      <td><code>round('3.7', 2)</code> is flagged. In DuckDB it is legal &mdash; the string casts.
+      A real catalog needs each parameter to say whether it coerces, and the answer is per-dialect.
+      Expect this to be the main source of false positives on real SQL, and to be the reason you end
+      up wanting <code>duckdb_functions()</code> rather than hand-written entries.</td>
+    </tr>
+    <tr>
+      <td><strong>No <code>DECIMAL(p,s)</code> propagation</strong></td>
+      <td><code>@arg0</code> passes the whole <code>DataType</code> through, so it happens to work
+      for round. Genuine precision arithmetic
+      (<code>DECIMAL(10,2) * DECIMAL(5,3)</code>) needs per-warehouse rules that neither the catalog
+      nor sqlglot models.</td>
+    </tr>
+    <tr>
+      <td><strong>No variadics</strong></td>
+      <td><code>Sig.params</code> is a fixed tuple, so <code>concat(a, b, c, ...)</code> and
+      <code>coalesce</code> cannot be expressed. Needs a repeat marker on the last parameter, plus a
+      same-type constraint across the repeats. Notice <code>coalesce</code> is deliberately absent
+      from this catalog for exactly that reason.</td>
+    </tr>
+    <tr>
+      <td><strong>Nullability is not tracked</strong></td>
+      <td>sqlglot has a <code>meta["nonnull"]</code> flag and it does propagate through unary and
+      binary operators, but it is dropped by every function call &mdash;
+      <code>upper(nonnull_col)</code> loses it. sqlr's own nullability evidence stays sqlr's job.</td>
+    </tr>
+    <tr>
+      <td><strong>Aggregates and windows unmodelled</strong></td>
+      <td>No check that an aggregate is not nested inside another, that a window function has a valid
+      frame, or that a non-grouped column appears in <code>group by</code>. All real errors, none of
+      them expressible as a function signature.</td>
+    </tr>
+    <tr>
+      <td><strong>Global dialect mutation</strong></td>
+      <td><code>install_catalog</code> writes into <code>Dialect.get_or_raise("duckdb")</code>, a
+      process-global. Fine for a demo; in sqlr, subclass the dialect or pass
+      <code>expression_metadata=</code> straight to <code>annotate_types()</code> so two runs with
+      different catalogs cannot interfere.</td>
+    </tr>
+    <tr>
+      <td><strong>Pinned to a young API</strong></td>
+      <td>This entire layer moved in sqlglot 30 &mdash; it was <code>Dialect.ANNOTATORS</code>, it is
+      now <code>sqlglot.typing.EXPRESSION_METADATA</code> with the
+      <code>{"returns"|"annotator"}</code> shape. Pin <code>~=30.14</code> and write a test that
+      asserts every catalog key still resolves through <code>exp.FUNCTION_BY_NAME</code> and still
+      yields a non-UNKNOWN type. A minor bump will break this silently otherwise.</td>
+    </tr>
+  </table>
+
+  <h3>What to build first</h3>
+  <ol>
+    <li><strong>Generate the catalog</strong> from <code>duckdb_functions()</code> instead of writing
+    it. ~1,200 overloads, exact, free, and DuckDB is already the execution engine.</li>
+    <li><strong>Delete the hardcoded sets.</strong> <code>FUNCTION_TYPE_MAP</code> in
+    <code>schema_resolution</code> is the forward direction of this catalog;
+    <code>STRING_ARGUMENT_FUNCTIONS</code> / <code>NUMERIC_ARGUMENT_FUNCTIONS</code> /
+    <code>STRING_FIRST_ARGUMENT_FUNCTIONS</code> in <code>facts.py</code> are the backward direction.
+    One table replaces all four, and stops being keyed on sqlglot class names.</li>
+    <li><strong>Write the coverage test</strong> before the catalog grows: parse a corpus, count
+    expressions whose arguments are typed but whose result is UNKNOWN. That number is your coverage
+    debt, and it is the only way to keep &sect;6's four causes of UNKNOWN distinguishable as the
+    catalog grows.</li>
+    <li><strong>Feed evidence through sqlr's weighting</strong> rather than <code>setdefault</code>,
+    so two functions constraining one column differently get arbitrated instead of racing.</li>
+  </ol>
+
+  <div class="callout">
+    <p>Everything on this page is Python layered on sqlglot. No parser was written, no Rust, no
+    bindings. The parser was never the hard part &mdash; the catalog is, and the catalog is a data
+    problem that a rewrite in another language would not make any smaller.</p>
+  </div>
+</section>
+
+<footer class="end">
+  Runnable source: <code>learning/type_check_demo/</code> &mdash;
+  <code>pipeline.py</code> (the 205 lines), <code>run.py</code> (produces every output above),
+  <code>example.sql</code>. Run with
+  <code>uv run python run.py</code> from that directory.
+  Verified against sqlglot 30.14.0.
+</footer>
+
+</main>
+</div>
+</div>
+
+</body>
+</html>

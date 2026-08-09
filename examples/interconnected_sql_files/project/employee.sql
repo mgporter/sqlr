@@ -15,7 +15,8 @@ current_employee as (
     salary * 12 as annual_salary,
     ifnull(bonus, 0) as bonus,
     hire_date,
-    datediff(year, hire_date, current_date()) as tenure_years
+    datediff(year, hire_date, current_date()) as tenure_years,
+    *
   from deduped
   where rn = 1
     and department_id in (

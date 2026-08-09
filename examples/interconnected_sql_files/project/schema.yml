@@ -22,6 +22,8 @@ sources:
             data_type: varchar(200)
           - name: salary
             data_type: decimal(10,2)
+          - name: extracol
+            data_type: decimal(10,2)
 
       - name: department
         sql_file: department
