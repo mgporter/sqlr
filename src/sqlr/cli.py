@@ -29,6 +29,9 @@ from sqlr.sql_analysis import analyze_file
 from sqlr.validation import render_errors, render_validation, validate_schema
 from sqlr.validation.types import StatementValidation
 
+
+from sqlr.sql_analysis2 import validate_schema
+
 app = typer.Typer(no_args_is_help=True)
 logger = logging.getLogger("sqlr")
 
@@ -117,6 +120,12 @@ def validate(
     # relation twice has no right answer to pick, and running the comparison anyway would
     # report whichever of the two happened to be read first as though it were the rule.
     declared = _load_declarations(root, index)
+
+    validate_schema(cfg, declared, models)
+
+
+
+    return
 
     analyzed = _analyze(cfg, models)
 

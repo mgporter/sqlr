@@ -1,0 +1,6 @@
+sources:
+  - name: test
+    database: mydatabase
+    columns:
+      - name: id
+        data_type: varchar(20)
