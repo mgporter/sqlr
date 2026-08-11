@@ -6,6 +6,6 @@ general:
   fixture_directory: fixtures
   sql_file_globs:
     - "**/*.sql"
-  sql_dialect: snowflake
+  sql_dialect: duckdb
   star_over_join_behavior: guess
   model_paths: project

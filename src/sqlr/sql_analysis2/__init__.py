@@ -1,44 +1,245 @@
+"""The typing pipeline. Steps are numbered as in `type_check_plan.md`.
 
+Only steps 0-4 are wired. Steps 5-7 (backward evidence, re-annotate, check) are marked
+where they belong and do nothing yet.
+"""
 
+import logging
 from pathlib import Path
+from typing import cast
 
 import sqlglot
-from sqlglot import ParseError
+from pydantic import BaseModel
+from sqlglot import ParseError, exp
+from sqlglot.errors import OptimizeError
+from sqlglot.optimizer.annotate_types import annotate_types
 from sqlglot.optimizer.qualify import qualify
+from sqlglot.optimizer.scope import Scope, traverse_scope
+from sqlglot.schema import ensure_schema
+from sqlglot.typing import ExprMetadataType
 
 from sqlr.config.types import SqlrConfig
 from sqlr.declared.types import DeclaredSchemas
 from sqlr.selection.types import Model
-from sqlr.sql_analysis2.sourcedoc import Positions, SourceDoc
+from sqlr.sql_analysis2.annotate import expression_metadata, func_args
+from sqlr.sql_analysis2.sourcedoc import Positions, SourceDoc, SourceSpan
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_DIALECT = "duckdb"
+
+Schema = dict[str, dict[str, str]]
+"""`{table: {column: type}}` - the shape `qualify` and `annotate_types` take."""
 
 
-def validate_schema(cfg: SqlrConfig, declared: DeclaredSchemas, models: list[Model]) -> None:
+class TypeFact(BaseModel):
+    span: SourceSpan
+    type: str
+
+
+# ---------------------------------------------------------------- step 2: schema
+def declared_columns(declared: DeclaredSchemas) -> Schema:
+    """Every declared source table, keyed by the bare table name, lowercased.
+
+    Bare name only: sqlglot's schema dict is keyed the way the SQL writes the table, and
+    `qualify` lowercases identifiers. A declaration that writes `db.schema.table` matches
+    here on its last part - a known simplification, see plan step 3 and Q7 before any of
+    this reaches a report.
+    """
+    out: Schema = {}
+    for table in declared.sources.values():
+        out[table.table_name.lower()] = {
+            column.name.lower(): column.written_type for column in table.columns
+        }
+    return out
+
+
+def table_columns(scopes: list[Scope]) -> dict[str, set[str]]:
+    """Columns read straight off a real table, per table. Runs before qualify.
+
+    The `isinstance(source, exp.Table)` filter is what stops CTE-internal names from
+    being invented as columns of a real table.
+    """
+    out: dict[str, set[str]] = {}
+    for scope in scopes:
+        tables = {n: s for n, s in scope.sources.items() if isinstance(s, exp.Table)}
+        if not tables:
+            continue  # scope reads CTEs only; nothing to declare
+        for column in scope.columns:
+            # an unqualified column in a single-table scope belongs to that table
+            name = column.table or (next(iter(tables)) if len(tables) == 1 else None)
+            if name in tables:
+                out.setdefault(tables[name].name.lower(), set()).add(column.name.lower())
+    return out
+
+
+def gapfilled(declared: Schema, scopes: list[Scope]) -> Schema:
+    """Complete the schema's *column set* so `qualify` does not raise.
+
+    Declared types where the user wrote them, UNKNOWN everywhere else. Not optional:
+    `qualify` validates that every column resolves, and every built-in escape
+    (`allow_partial_qualification`, `infer_schema`) still raises. See plan step 2.
+
+    TODO (plan step 2, "the typo trap"): a misspelled column is invented here as a real
+    one. The unresolvable-column check has to run before this, and does not exist yet.
+    """
+    return {
+        table: {
+            column: declared.get(table, {}).get(column, "UNKNOWN")
+            for column in sorted(columns)
+        }
+        for table, columns in table_columns(scopes).items()
+    }
+
+
+def needs_inference(schema: Schema) -> bool:
+    """Whether steps 5 and 6 have anything to do. O(columns), not O(nodes)."""
+    return any(t.upper() == "UNKNOWN" for cols in schema.values() for t in cols.values())
+
+
+# ------------------------------------------------------------------- diagnostics
+def log_coverage(tree: exp.Expr) -> None:
+    """Coverage debt: a Func whose arguments are all typed but whose result is UNKNOWN is
+    a catalog gap, never a user error. That second number is the one that matters."""
+    total = 0
+    typed = 0
+    gaps: list[str] = []
+    for node in tree.walk():
+        total += 1
+        node_type = node.type
+        if node_type is not None and not node_type.is_type(exp.DType.UNKNOWN):
+            typed += 1
+        elif isinstance(node, exp.Func) and node.is_type(exp.DType.UNKNOWN):
+            args = func_args(node)
+            if args and all(
+                a.type is not None and not a.type.is_type(exp.DType.UNKNOWN) for a in args
+            ):
+                gaps.append(node.name if isinstance(node, exp.Anonymous) else node.sql_name())
+    logger.info(
+        "typed %d/%d nodes; %d UNKNOWN with fully-typed arguments (catalog gaps)",
+        typed,
+        total,
+        len(gaps),
+    )
+    if gaps:
+        logger.debug("catalog gaps: %s", ", ".join(sorted(set(gaps))))
+
+
+def log_projections(tree: exp.Expr) -> None:
+    """Per-scope name -> type table. More useful than dumping an annotated tree, and a
+    fraction of the size."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    for scope in traverse_scope(tree):
+        select = scope.expression
+        if not isinstance(select, exp.Select):
+            continue
+        parent = select.parent
+        name = parent.alias if isinstance(parent, exp.CTE) else "<final>"
+        logger.debug("-- %s", name)
+        for projection in select.selects:
+            logger.debug("   %-20s %s", projection.alias_or_name, projection.type)
+
+
+# ---------------------------------------------------------------------- pipeline
+def validate_schema(
+    cfg: SqlrConfig, declared: DeclaredSchemas, models: list[Model]
+) -> None:
+    dialect_name = cfg.general.sql_dialect or DEFAULT_DIALECT
+
+    # Step 0: the annotation metadata, built once per run rather than per file. It is a
+    # copy of the dialect's own map with our catalog layered on top; the dialect itself is
+    # never mutated, so two runs with different dialects cannot interfere (plan Q6).
+    metadata = expression_metadata(dialect_name)
+
+    # Declarations are read once too - they do not vary per model.
+    declared_schema = declared_columns(declared)
 
     for model in models:
         sql = Path(model.path).read_text()
         source = SourceDoc(path=model.path, text=sql)
 
-        # One index for the whole document: sqlglot's character offsets are absolute, so they
-        # stay valid across every statement in the file.
+        # One index for the whole document: sqlglot's character offsets are absolute, so
+        # they stay valid across every statement in the file.
         positions = Positions(sql)
-    
+
         # Step 1: parse.
         try:
-            statements = sqlglot.parse(sql, read=cfg.general.sql_dialect)
-
+            statements = sqlglot.parse(sql, read=dialect_name)
         except ParseError as e:
-            print(f"error: {model.relative_path}: {str(e)}")
-            # return SqlAnalysisResult(source=source, errors=[str(e)])
-            return
+            print(f"error: {model.relative_path}: {e}")
+            continue
 
-        first_statement = statements[0]
+        parsed = [s for s in statements if s is not None]
+        if not parsed:
+            print(f"error: {model.relative_path}: no statements found in the SQL file")
+            continue
+        if len(parsed) > 1:
+            # Plan Q4: run the steps per statement, keep the warning.
+            print(
+                f"warning: {model.relative_path}: file contains multiple statements; "
+                "each is checked on its own"
+            )
 
-        if first_statement is None:
-            print(f"error: {model.relative_path}: No statements found in the SQL file.")
-            return
+        logger.info("parsed %s: %d statements", model.relative_path, len(parsed))
 
-        print(repr(first_statement))
+        for statement in parsed:
+            _check_statement(
+                statement, declared_schema, dialect_name, metadata, model, source, positions
+            )
 
-        
-    
-        # sqlAnalysisResults: list[SqlAnalysisResult] = []
+
+def _check_statement(
+    statement: exp.Expr,
+    declared_schema: Schema,
+    dialect_name: str,
+    metadata: ExprMetadataType,
+    model: Model,
+    source: SourceDoc,
+    positions: Positions,
+) -> None:
+    # Step 2: gap-fill the declared schema against what this statement actually reads.
+    schema = gapfilled(declared_schema, traverse_scope(statement))
+    for table, columns in schema.items():
+        declared_count = sum(1 for t in columns.values() if t.upper() != "UNKNOWN")
+        logger.info(
+            "%s: %d of %d columns declared, %d gap-filled UNKNOWN",
+            table,
+            declared_count,
+            len(columns),
+            len(columns) - declared_count,
+        )
+
+    # Built once and threaded through: `qualify` and `annotate_types` each construct a
+    # MappingSchema from a bare dict otherwise. The cast is the one place our
+    # `{table: {column: type}}` meets sqlglot's invariant `dict[str, object]`.
+    mapped_schema = ensure_schema(cast("dict[str, object]", schema), dialect=dialect_name)
+
+    # Step 3: qualify. Every column names its relation, `select *` becomes a real
+    # projection list. Prerequisite for all type inference, and 39% of the runtime.
+    try:
+        qualified = qualify(statement, schema=mapped_schema, dialect=dialect_name)
+    except OptimizeError as e:
+        print(f"error: {model.relative_path}: {e}")
+        return
+    logger.debug("qualified %s:\n%s", model.relative_path, qualified.sql(dialect_name, pretty=True))
+
+    # Step 3b: the non-type analysis (build_graph / Resolver / extract_facts) belongs
+    # here, fed this same qualified tree. Not wired yet.
+
+    # Step 4: annotate, pass 1. Types every expression from what is currently known, and
+    # establishes what is *already* known, which step 5 depends on.
+    annotated = annotate_types(
+        qualified, schema=mapped_schema, expression_metadata=metadata, dialect=dialect_name
+    )
+
+    log_coverage(annotated)
+    log_projections(annotated)
+
+    # Steps 5 and 6 are skipped when the schema has no UNKNOWN slots - proven no-op.
+    if needs_inference(schema):
+        logger.debug("schema has UNKNOWN slots; steps 5-6 run here")
+
+    # TODO step 7: check the annotated tree and report findings. `positions` turns a node
+    # into a SourceSpan and `source` slices the text under it.
+    _ = (source, positions)
