@@ -6,7 +6,7 @@ where they belong and do nothing yet.
 
 import logging
 from pathlib import Path
-from typing import cast
+from typing import NamedTuple, cast
 
 import sqlglot
 from pydantic import BaseModel
@@ -14,7 +14,7 @@ from sqlglot import ParseError, exp
 from sqlglot.errors import OptimizeError
 from sqlglot.optimizer.annotate_types import annotate_types
 from sqlglot.optimizer.qualify import qualify
-from sqlglot.optimizer.scope import Scope, traverse_scope
+from sqlglot.optimizer.scope import traverse_scope
 from sqlglot.schema import ensure_schema
 from sqlglot.typing import ExprMetadataType
 
@@ -56,43 +56,106 @@ def declared_columns(declared: DeclaredSchemas) -> dict[TableName, dict[ColumnNa
     return out
 
 
-def table_columns(scopes: list[Scope]) -> dict[TableName, set[ColumnName]]:
-    """Columns read straight off a real table, per table. Runs before qualify.
+class ResolvedColumns(NamedTuple):
+    """What the probe pass learned: which columns each real table is asked for, and
+    which columns belong to no source at all."""
 
-    The `isinstance(source, exp.Table)` filter is what stops CTE-internal names from
-    being invented as columns of a real table.
+    columns_per_table: dict[TableName, set[ColumnName]]
+    unresolvable_columns: list[exp.Column]
+
+
+def resolve_columns_to_source_tables(
+    statement: exp.Expr, dialect_name: str
+) -> ResolvedColumns:
+    """Attribute every column to the source it reads from, by letting sqlglot do it.
+
+    The naive version of this - "a bare column belongs to the table when the scope has
+    exactly one source" - drops every bare column in a scope that joins a table to a CTE,
+    even though such a query is perfectly resolvable: a CTE's column set is its own
+    projection list, knowable without any schema, so a name absent from it can only have
+    come from the table. `Resolver.get_table` already implements exactly that rule, plus
+    join-context disambiguation, USING expansion, set-op and lateral column derivation,
+    and column-alias shadowing. Re-deriving any of it here would be a second, worse copy.
+
+    So the resolution is delegated: qualify a *throwaway copy* against an **empty** schema.
+    That is the whole trick. With no schema, every real table reports zero known columns,
+    which makes it the `infer_schema` fallback target, while CTEs and derived tables still
+    report theirs. Bare columns then land on the one table that could own them, and only a
+    genuinely ambiguous name (two undeclared tables, say) is left unqualified.
+
+    Passing the *declared* schema here instead would defeat it: a partially declared table
+    reports a non-empty column set, stops being the fallback target, and its undeclared
+    columns fail to resolve again - the exact bug this replaces.
+
+    The copy is discarded. `qualify` rewrites the tree it is given (alias references get
+    expanded, stars stay folded), and only the harvested names are wanted.
+
+    One blind spot, and it is sqlglot's rather than ours: `_convert_columns_to_dots`
+    reinterprets any qualifier that names no source as a STRUCT or JSON field lookup, so
+    `select ghots.id from test` is read as field `id` of a struct column named `ghots` and
+    the typo comes back as a real column of `test`. That rewrite is not dialect-gated -
+    Postgres and Snowflake, which do not accept bare dotted field access at all, behave
+    the same here. It only bites when a lone source is available to absorb the name; with
+    two sources the qualifier resolves to nothing and is reported.
     """
-    out: dict[TableName, set[ColumnName]] = {}
-    for scope in scopes:
-        sources = scope.sources
-        # Only take real tables, not CTEs
-        tables: dict[TableName, exp.Table] = {n: s for n, s in sources.items() if isinstance(s, exp.Table)}
-        if not tables:
-            continue  # scope reads CTEs only; nothing to declare
+    probe = qualify(
+        statement.copy(),
+        dialect=dialect_name,
+        schema={},
+        infer_schema=True,
+        # A column qualified against a table whose columns are unknown is not an error.
+        allow_partial_qualification=True,
+        # A star cannot expand against an empty schema, and the probe does not need it to.
+        expand_stars=False,
+        # Unresolvable columns are reported by us, with a span; they must not raise here.
+        validate_qualify_columns=False,
+        quote_identifiers=False,
+    )
+
+    columns_per_table: dict[TableName, set[ColumnName]] = {}
+    unresolvable_columns: list[exp.Column] = []
+
+    for scope in traverse_scope(probe):
         for column in scope.columns:
-            # If the scope contains a single table (len(tables) == 1) and there are 
-            # no other CTEs (len(sources) is also 1), then we know that all of the columns belong to that table.
-            # Otherwise, we try to get the column's alias (column.table)
-            name = column.table or (next(iter(tables)) if len(tables) == 1 and len(sources) == 1 else None)
-            if name in tables:
-                out.setdefault(tables[name].name.lower(), set()).add(column.name.lower())
-    return out
+            if not column.table:
+                # Still bare after qualification: no source can own it.
+                unresolvable_columns.append(column)
+                continue
+
+            source = scope.sources.get(column.table)
+            if isinstance(source, exp.Table):
+                columns_per_table.setdefault(source.name.lower(), set()).add(
+                    column.name.lower()
+                )
+            elif source is None:
+                # A qualifier naming no source in this scope - a mistyped table alias.
+                # See the docstring: this only survives when the scope has more than one
+                # source, because a lone source absorbs the name as a struct read.
+                unresolvable_columns.append(column)
+            # Anything else is a CTE or derived table, whose columns are its own
+            # projections - nothing to fabricate a declaration for.
+
+    return ResolvedColumns(
+        columns_per_table=columns_per_table, unresolvable_columns=unresolvable_columns
+    )
 
 
-def get_declared_types_per_table(declared: dict[TableName, dict[ColumnName, ColumnTypeName]], scopes: list[Scope]) -> \
-    dict[TableName, dict[ColumnName, ColumnTypeName]]:
+def get_declared_types_per_table(
+    declared: dict[TableName, dict[ColumnName, ColumnTypeName]],
+    column_names_per_table: dict[TableName, set[ColumnName]],
+) -> dict[TableName, dict[ColumnName, ColumnTypeName]]:
     """Complete the schema's *column set* so `qualify` does not raise.
 
     Declared types where the user wrote them, UNKNOWN everywhere else. Not optional:
     `qualify` validates that every column resolves, and every built-in escape
     (`allow_partial_qualification`, `infer_schema`) still raises. See plan step 2.
 
-    TODO (plan step 2, "the typo trap"): a misspelled column is invented here as a real
-    one. The unresolvable-column check has to run before this, and does not exist yet.
+    The "typo trap" this used to warn about - a misspelled column silently invented here
+    as a real one - is now caught upstream: a name that resolves to no source at all comes
+    back in `ResolvedColumns.unresolvable_columns` and the statement is reported before
+    reaching this point. A name misspelled into a *declared* table's slot is still
+    invented, and still needs the declared column set checked against the fabricated one.
     """
-
-    column_names_per_table = table_columns(scopes)
-
     return {
         table_name: {
             column: declared.get(table_name, {}).get(column, "UNKNOWN")
@@ -209,9 +272,30 @@ def _check_statement(
     positions: Positions,
 ) -> None:
     
-    # Step 2: traverse_scope to get columns, resolve them to tables, and then
-    # match the tables against the source declarations to fill in declared type information.
-    declared_types_per_table = get_declared_types_per_table(declared_schema, traverse_scope(statement))
+    # Step 2a: a probe qualification resolves every column to the source it reads from.
+    try:
+        resolved = resolve_columns_to_source_tables(statement, dialect_name)
+    except OptimizeError as e:
+        print(f"error: {model.relative_path}: {e}")
+        return
+
+    # A column that resolves to nothing is a user error - a typo, or a missing join. It is
+    # reported here rather than being invented as a real column of some table below.
+    if resolved.unresolvable_columns:
+        for column in resolved.unresolvable_columns:
+            span = positions.span_of(column)
+            location = f":{span}" if span is not None else ""
+            print(
+                f"error: {model.relative_path}{location}: column '{column.name}' "
+                "could not be resolved to any source"
+            )
+        return
+
+    # Step 2b: match the resolved tables against the source declarations to fill in
+    # declared type information.
+    declared_types_per_table = get_declared_types_per_table(
+        declared_schema, resolved.columns_per_table
+    )
     logger.debug("declared_types_per_table: %s", declared_types_per_table)
 
     for table, columns in declared_types_per_table.items():
@@ -227,9 +311,9 @@ def _check_statement(
     # Built once and threaded through: `qualify` and `annotate_types` each construct a
     # MappingSchema from a bare dict otherwise. The cast is the one place our
     # `{table: {column: type}}` meets sqlglot's invariant `dict[str, object]`.
-    print(declared_types_per_table)
-    mapped_schema = ensure_schema(cast("dict[str, object]", declared_types_per_table), dialect=dialect_name)
-    print(mapped_schema.__dict__)
+    mapped_schema = ensure_schema(
+        cast("dict[str, object]", declared_types_per_table), dialect=dialect_name
+    )
 
     # Step 3: qualify. Every column names its relation, `select *` becomes a real
     # projection list. Prerequisite for all type inference, and 39% of the runtime.
