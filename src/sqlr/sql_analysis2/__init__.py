@@ -28,17 +28,19 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DIALECT = "duckdb"
 
-Schema = dict[str, dict[str, str]]
-"""`{table: {column: type}}` - the shape `qualify` and `annotate_types` take."""
+
 
 
 class TypeFact(BaseModel):
     span: SourceSpan
     type: str
 
+type TableName = str
+type ColumnName = str
+type ColumnTypeName = str
 
 # ---------------------------------------------------------------- step 2: schema
-def declared_columns(declared: DeclaredSchemas) -> Schema:
+def declared_columns(declared: DeclaredSchemas) -> dict[TableName, dict[ColumnName, ColumnTypeName]]:
     """Every declared source table, keyed by the bare table name, lowercased.
 
     Bare name only: sqlglot's schema dict is keyed the way the SQL writes the table, and
@@ -46,7 +48,7 @@ def declared_columns(declared: DeclaredSchemas) -> Schema:
     here on its last part - a known simplification, see plan step 3 and Q7 before any of
     this reaches a report.
     """
-    out: Schema = {}
+    out: dict[TableName, dict[ColumnName, ColumnTypeName]] = {}
     for table in declared.sources.values():
         out[table.table_name.lower()] = {
             column.name.lower(): column.written_type for column in table.columns
@@ -54,26 +56,31 @@ def declared_columns(declared: DeclaredSchemas) -> Schema:
     return out
 
 
-def table_columns(scopes: list[Scope]) -> dict[str, set[str]]:
+def table_columns(scopes: list[Scope]) -> dict[TableName, set[ColumnName]]:
     """Columns read straight off a real table, per table. Runs before qualify.
 
     The `isinstance(source, exp.Table)` filter is what stops CTE-internal names from
     being invented as columns of a real table.
     """
-    out: dict[str, set[str]] = {}
+    out: dict[TableName, set[ColumnName]] = {}
     for scope in scopes:
-        tables = {n: s for n, s in scope.sources.items() if isinstance(s, exp.Table)}
+        sources = scope.sources
+        # Only take real tables, not CTEs
+        tables: dict[TableName, exp.Table] = {n: s for n, s in sources.items() if isinstance(s, exp.Table)}
         if not tables:
             continue  # scope reads CTEs only; nothing to declare
         for column in scope.columns:
-            # an unqualified column in a single-table scope belongs to that table
-            name = column.table or (next(iter(tables)) if len(tables) == 1 else None)
+            # If the scope contains a single table (len(tables) == 1) and there are 
+            # no other CTEs (len(sources) is also 1), then we know that all of the columns belong to that table.
+            # Otherwise, we try to get the column's alias (column.table)
+            name = column.table or (next(iter(tables)) if len(tables) == 1 and len(sources) == 1 else None)
             if name in tables:
                 out.setdefault(tables[name].name.lower(), set()).add(column.name.lower())
     return out
 
 
-def gapfilled(declared: Schema, scopes: list[Scope]) -> Schema:
+def get_declared_types_per_table(declared: dict[TableName, dict[ColumnName, ColumnTypeName]], scopes: list[Scope]) -> \
+    dict[TableName, dict[ColumnName, ColumnTypeName]]:
     """Complete the schema's *column set* so `qualify` does not raise.
 
     Declared types where the user wrote them, UNKNOWN everywhere else. Not optional:
@@ -83,16 +90,19 @@ def gapfilled(declared: Schema, scopes: list[Scope]) -> Schema:
     TODO (plan step 2, "the typo trap"): a misspelled column is invented here as a real
     one. The unresolvable-column check has to run before this, and does not exist yet.
     """
+
+    column_names_per_table = table_columns(scopes)
+
     return {
-        table: {
-            column: declared.get(table, {}).get(column, "UNKNOWN")
+        table_name: {
+            column: declared.get(table_name, {}).get(column, "UNKNOWN")
             for column in sorted(columns)
         }
-        for table, columns in table_columns(scopes).items()
+        for table_name, columns in column_names_per_table.items()
     }
 
 
-def needs_inference(schema: Schema) -> bool:
+def needs_inference(schema: dict[TableName, dict[ColumnName, ColumnTypeName]]) -> bool:
     """Whether steps 5 and 6 have anything to do. O(columns), not O(nodes)."""
     return any(t.upper() == "UNKNOWN" for cols in schema.values() for t in cols.values())
 
@@ -191,16 +201,20 @@ def validate_schema(
 
 def _check_statement(
     statement: exp.Expr,
-    declared_schema: Schema,
+    declared_schema: dict[TableName, dict[ColumnName, ColumnTypeName]],
     dialect_name: str,
     metadata: ExprMetadataType,
     model: Model,
     source: SourceDoc,
     positions: Positions,
 ) -> None:
-    # Step 2: gap-fill the declared schema against what this statement actually reads.
-    schema = gapfilled(declared_schema, traverse_scope(statement))
-    for table, columns in schema.items():
+    
+    # Step 2: traverse_scope to get columns, resolve them to tables, and then
+    # match the tables against the source declarations to fill in declared type information.
+    declared_types_per_table = get_declared_types_per_table(declared_schema, traverse_scope(statement))
+    logger.debug("declared_types_per_table: %s", declared_types_per_table)
+
+    for table, columns in declared_types_per_table.items():
         declared_count = sum(1 for t in columns.values() if t.upper() != "UNKNOWN")
         logger.info(
             "%s: %d of %d columns declared, %d gap-filled UNKNOWN",
@@ -213,7 +227,9 @@ def _check_statement(
     # Built once and threaded through: `qualify` and `annotate_types` each construct a
     # MappingSchema from a bare dict otherwise. The cast is the one place our
     # `{table: {column: type}}` meets sqlglot's invariant `dict[str, object]`.
-    mapped_schema = ensure_schema(cast("dict[str, object]", schema), dialect=dialect_name)
+    print(declared_types_per_table)
+    mapped_schema = ensure_schema(cast("dict[str, object]", declared_types_per_table), dialect=dialect_name)
+    print(mapped_schema.__dict__)
 
     # Step 3: qualify. Every column names its relation, `select *` becomes a real
     # projection list. Prerequisite for all type inference, and 39% of the runtime.
@@ -237,7 +253,7 @@ def _check_statement(
     log_projections(annotated)
 
     # Steps 5 and 6 are skipped when the schema has no UNKNOWN slots - proven no-op.
-    if needs_inference(schema):
+    if needs_inference(declared_types_per_table):
         logger.debug("schema has UNKNOWN slots; steps 5-6 run here")
 
     # TODO step 7: check the annotated tree and report findings. `positions` turns a node
