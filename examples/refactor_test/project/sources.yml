@@ -1,8 +1,9 @@
 sources:
   - name: test
     database: mydatabase
+    schema: myschema
     tables:
-      - name: test
+      - name: table1
         columns:
           - name: id
             data_type: varchar(20)

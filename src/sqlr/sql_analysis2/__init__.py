@@ -353,6 +353,7 @@ def _check_statement(
     declared_types_per_table = get_declared_types_per_table(
         declared_schema, resolved.columns_per_table
     )
+    print(declared_types_per_table)
     findings += findings_for_columns_declared_as_scalar_but_read_as_structured(
         declared_schema, resolved.columns_per_table, positions
     )
