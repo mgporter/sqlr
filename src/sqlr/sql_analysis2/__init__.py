@@ -6,7 +6,7 @@ where they belong and do nothing yet.
 
 import logging
 from pathlib import Path
-from typing import NamedTuple, cast
+from typing import cast
 
 import sqlglot
 from pydantic import BaseModel
@@ -22,7 +22,21 @@ from sqlr.config.types import SqlrConfig
 from sqlr.declared.types import DeclaredSchemas
 from sqlr.selection.types import Model
 from sqlr.sql_analysis2.annotate import expression_metadata, func_args
+from sqlr.sql_analysis2.reporting import (
+    findings_for_columns_declared_as_scalar_but_read_as_structured,
+    findings_for_columns_read_with_unsupported_dot_notation,
+    findings_for_unresolvable_columns,
+    print_findings,
+)
 from sqlr.sql_analysis2.sourcedoc import Positions, SourceDoc, SourceSpan
+from sqlr.sql_analysis2.types import (
+    ColumnName,
+    ColumnTypeName,
+    ParsedColumn,
+    ResolvedColumns,
+    StructuredAccessKind,
+    TableName,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +49,6 @@ class TypeFact(BaseModel):
     span: SourceSpan
     type: str
 
-type TableName = str
-type ColumnName = str
-type ColumnTypeName = str
 
 # ---------------------------------------------------------------- step 2: schema
 def declared_columns(declared: DeclaredSchemas) -> dict[TableName, dict[ColumnName, ColumnTypeName]]:
@@ -56,48 +67,68 @@ def declared_columns(declared: DeclaredSchemas) -> dict[TableName, dict[ColumnNa
     return out
 
 
-class ResolvedColumns(NamedTuple):
-    """What the probe pass learned: which columns each real table is asked for, and
-    which columns belong to no source at all."""
+DIALECTS_WITH_DOT_FIELD_ACCESS = frozenset(
+    {"duckdb", "spark", "databricks", "bigquery", "hive", "trino", "presto", "athena"}
+)
+"""Dialects that read `a.b` as a field of the structured column `a` when `a` names no
+source. Postgres wants `(a).b` and Snowflake wants `a:b`, so for them a dotted name that
+matches no source is a mistake instead."""
 
-    columns_per_table: dict[TableName, set[ColumnName]]
-    unresolvable_columns: list[exp.Column]
+
+def dialect_parses_unresolvable_aliases_as_json_columns(dialect_name: str) -> bool:
+    """Whether a qualifier naming no source is legitimately a structured column read.
+
+    Internal for now; a candidate for `GeneralConfig` if a dialect ever needs overriding.
+    """
+    return dialect_name.lower() in DIALECTS_WITH_DOT_FIELD_ACCESS
+
+
+def structured_access_of(column: exp.Column) -> StructuredAccessKind | None:
+    """The access one column node carries, or None when it is read as a plain value."""
+    parent = column.parent
+    if parent is None or parent.args.get("this") is not column:
+        return None
+    if isinstance(parent, exp.Dot):
+        return "dot_field"
+    if isinstance(parent, exp.Bracket):
+        key = parent.expressions[0] if parent.expressions else None
+        if isinstance(key, exp.Literal) and key.is_string:
+            return "bracket_key"
+        return "bracket_index"
+    return None
 
 
 def resolve_columns_to_source_tables(
-    statement: exp.Expr, dialect_name: str
+    statement: exp.Expr,
+    dialect_name: str,
+    allow_unresolvable_aliases_as_structured_columns: bool | None = None,
 ) -> ResolvedColumns:
     """Attribute every column to the source it reads from, by letting sqlglot do it.
 
-    The naive version of this - "a bare column belongs to the table when the scope has
-    exactly one source" - drops every bare column in a scope that joins a table to a CTE,
-    even though such a query is perfectly resolvable: a CTE's column set is its own
-    projection list, knowable without any schema, so a name absent from it can only have
-    come from the table. `Resolver.get_table` already implements exactly that rule, plus
-    join-context disambiguation, USING expansion, set-op and lateral column derivation,
-    and column-alias shadowing. Re-deriving any of it here would be a second, worse copy.
+    Qualify a *throwaway copy* against an **empty** schema. That is the whole trick: with
+    no schema every real table reports zero known columns, so it becomes the
+    `infer_schema` fallback target, while CTEs and derived tables still report their own
+    projections. Bare columns land on the one table that could own them, and only a
+    genuinely ambiguous name is left unqualified. Passing the *declared* schema instead
+    would defeat it - a partially declared table stops being the fallback target and its
+    undeclared columns fail to resolve.
 
-    So the resolution is delegated: qualify a *throwaway copy* against an **empty** schema.
-    That is the whole trick. With no schema, every real table reports zero known columns,
-    which makes it the `infer_schema` fallback target, while CTEs and derived tables still
-    report theirs. Bare columns then land on the one table that could own them, and only a
-    genuinely ambiguous name (two undeclared tables, say) is left unqualified.
+    `Resolver.get_table` also brings join-context disambiguation, USING expansion, set-op
+    and lateral derivation and alias shadowing; re-deriving those here would be a worse
+    copy. The copy is discarded - only the harvested names are wanted.
 
-    Passing the *declared* schema here instead would defeat it: a partially declared table
-    reports a non-empty column set, stops being the fallback target, and its undeclared
-    columns fail to resolve again - the exact bug this replaces.
-
-    The copy is discarded. `qualify` rewrites the tree it is given (alias references get
-    expanded, stars stay folded), and only the harvested names are wanted.
-
-    One blind spot, and it is sqlglot's rather than ours: `_convert_columns_to_dots`
-    reinterprets any qualifier that names no source as a STRUCT or JSON field lookup, so
-    `select ghots.id from test` is read as field `id` of a struct column named `ghots` and
-    the typo comes back as a real column of `test`. That rewrite is not dialect-gated -
-    Postgres and Snowflake, which do not accept bare dotted field access at all, behave
-    the same here. It only bites when a lone source is available to absorb the name; with
-    two sources the qualifier resolves to nothing and is reported.
+    sqlglot's `_convert_columns_to_dots` rewrites any qualifier naming no source into a
+    struct field read, so `select ghots.id from test` comes back as a column `ghots` of
+    `test`. The rewrite is not dialect-gated, so this gates it:
+    `allow_unresolvable_aliases_as_structured_columns` false makes such a read a finding
+    rather than a column. It only fires when a lone source can absorb the name; with two
+    sources the qualifier resolves to nothing and is unresolvable instead.
     """
+    if allow_unresolvable_aliases_as_structured_columns is None:
+        allow_unresolvable_aliases_as_structured_columns = (
+            dialect_parses_unresolvable_aliases_as_json_columns(dialect_name)
+        )
+
     probe = qualify(
         statement.copy(),
         dialect=dialect_name,
@@ -112,42 +143,60 @@ def resolve_columns_to_source_tables(
         quote_identifiers=False,
     )
 
-    columns_per_table: dict[TableName, set[ColumnName]] = {}
+    columns_per_table: dict[TableName, dict[ColumnName, ParsedColumn]] = {}
     unresolvable_columns: list[exp.Column] = []
+    columns_read_with_unsupported_dot_notation: list[exp.Column] = []
 
     for scope in traverse_scope(probe):
         for column in scope.columns:
-            print(column.table, column.name)
             if not column.table:
                 # Still bare after qualification: no source can own it.
                 unresolvable_columns.append(column)
                 continue
 
             source = scope.sources.get(column.table)
-            if isinstance(source, exp.Table):
-                columns_per_table.setdefault(source.name.lower(), set()).add(
-                    column.name.lower()
-                )
-            elif source is None:
+            if source is None:
                 # A qualifier naming no source in this scope - a mistyped table alias.
                 # See the docstring: this only survives when the scope has more than one
                 # source, because a lone source absorbs the name as a struct read.
                 unresolvable_columns.append(column)
+                continue
+
+            access = structured_access_of(column)
+            if access == "dot_field" and not allow_unresolvable_aliases_as_structured_columns:
+                columns_read_with_unsupported_dot_notation.append(column)
+
+            if isinstance(source, exp.Table):
+                columns = columns_per_table.setdefault(source.name.lower(), {})
+                name = column.name.lower()
+                parsed = columns.setdefault(
+                    name, ParsedColumn(name=name, structured_access=[])
+                )
+                if access is not None:
+                    parsed.structured_access.append((access, column))
             # Anything else is a CTE or derived table, whose columns are its own
             # projections - nothing to fabricate a declaration for.
 
-    print()
-    print("columns_per_table", columns_per_table)
-    print("unresolvable_columns", unresolvable_columns)
+    # print()
+    # print("columns_per_table", columns_per_table)
+    # print()
+    # print("unresolvable_columns", unresolvable_columns)
+    # print()
+    # print(
+    #     "columns_read_with_unsupported_dot_notation",
+    #     columns_read_with_unsupported_dot_notation,
+    # )
 
     return ResolvedColumns(
-        columns_per_table=columns_per_table, unresolvable_columns=unresolvable_columns
+        columns_per_table=columns_per_table,
+        unresolvable_columns=unresolvable_columns,
+        columns_read_with_unsupported_dot_notation=columns_read_with_unsupported_dot_notation,
     )
 
 
 def get_declared_types_per_table(
     declared: dict[TableName, dict[ColumnName, ColumnTypeName]],
-    column_names_per_table: dict[TableName, set[ColumnName]],
+    column_names_per_table: dict[TableName, dict[ColumnName, ParsedColumn]],
 ) -> dict[TableName, dict[ColumnName, ColumnTypeName]]:
     """Complete the schema's *column set* so `qualify` does not raise.
 
@@ -278,29 +327,43 @@ def _check_statement(
 ) -> None:
     
     # Step 2a: a probe qualification resolves every column to the source it reads from.
+    # This is necessary to get the sources for columns without an alias but which MUST
+    # come from a source because no other source has that column.
+    # E.g.: with t2 as (select distinct id from mytable) 
+    #       select a from t1 join t2 on t1.id = t2.id;
+    # Here, 'a' must come from either t1, since t2 only has 'id'.
     try:
         resolved = resolve_columns_to_source_tables(statement, dialect_name)
     except OptimizeError as e:
         print(f"error: {model.relative_path}: {e}")
         return
 
-    # A column that resolves to nothing is a user error - a typo, or a missing join. It is
-    # reported here rather than being invented as a real column of some table below.
-    if resolved.unresolvable_columns:
-        for column in resolved.unresolvable_columns:
-            span = positions.span_of(column)
-            location = f":{span}" if span is not None else ""
-            print(
-                f"error: {model.relative_path}{location}: column '{column.name}' "
-                "could not be resolved to any source"
-            )
-        return
+    # Everything wrong with the resolution is reported before step 3. `qualify` describes
+    # the tree it rewrote rather than the SQL that was written, so its message for the
+    # same mistake is strictly harder to act on than the one built here.
+    findings = [
+        *findings_for_unresolvable_columns(resolved.unresolvable_columns, positions),
+        *findings_for_columns_read_with_unsupported_dot_notation(
+            resolved.columns_read_with_unsupported_dot_notation, positions, dialect_name
+        ),
+    ]
 
     # Step 2b: match the resolved tables against the source declarations to fill in
     # declared type information.
     declared_types_per_table = get_declared_types_per_table(
         declared_schema, resolved.columns_per_table
     )
+    findings += findings_for_columns_declared_as_scalar_but_read_as_structured(
+        declared_schema, resolved.columns_per_table, positions
+    )
+    print_findings(findings, str(model.relative_path))
+
+    # An unresolvable column is the one finding that has to stop the statement: it belongs
+    # to no table, so no fabricated schema can cover it and `qualify` raises. A dotted read
+    # is harvested despite its finding, so the rest of the statement is still checked.
+    if resolved.unresolvable_columns:
+        return
+
     logger.debug("declared_types_per_table: %s", declared_types_per_table)
 
     for table, columns in declared_types_per_table.items():

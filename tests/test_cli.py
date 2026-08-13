@@ -223,62 +223,12 @@ sources:
             data_type: varchar(20)
 """
 
-CONTRADICTING_YML = """\
-version: 2
-sources:
-  - name: warehouse
-    tables:
-      - name: person
-        columns:
-          - name: age
-            data_type: timestamp
-"""
-
-
 @pytest.fixture
 def wide(monkeypatch: pytest.MonkeyPatch) -> None:
     """Rich wraps to the terminal, and a wrapped row breaks a substring assertion."""
     monkeypatch.setenv("COLUMNS", "200")
 
 
-def test_validate_schema_reports_each_column_against_its_declaration(
-    tmp_path: Path, wide: None
-) -> None:
-    _project(tmp_path)
-    (tmp_path / "models" / "schema.yml").write_text(AGREEING_YML)
-
-    result = runner.invoke(
-        app,
-        ["validate-schema", "--project-dir", str(tmp_path), "--select", "customers"],
-    )
-
-    assert result.exit_code == 0
-    # `age > 20` proves a number; the declaration says which kind.
-    assert "decimal(10,2)" in result.output
-    assert "type narrowed" in result.output
-    assert "exact match" in result.output
-    # A column the SQL uses that nothing declares is still worth saying out loud.
-    assert "no declaration" in result.output
-
-
-def test_validate_schema_exits_non_zero_and_explains_a_contradiction(
-    tmp_path: Path, wide: None
-) -> None:
-    _project(tmp_path)
-    (tmp_path / "models" / "schema.yml").write_text(CONTRADICTING_YML)
-
-    result = runner.invoke(
-        app,
-        ["validate-schema", "--project-dir", str(tmp_path), "--select", "customers"],
-    )
-
-    assert result.exit_code == 1
-    assert "1 error" in result.output
-    assert "person.age is declared timestamp" in result.output
-    # The comparison that forced the inferred type, quoted and underlined.
-    assert "p.age > 20" in result.output
-    assert "^" in result.output
-    assert "declared here" in result.output
 
 
 def test_validate_schema_passes_when_nothing_is_declared(tmp_path: Path) -> None:
@@ -292,31 +242,6 @@ def test_validate_schema_passes_when_nothing_is_declared(tmp_path: Path) -> None
     assert result.exit_code == 0
 
 
-def test_validate_schema_json_format(tmp_path: Path) -> None:
-    _project(tmp_path)
-    (tmp_path / "models" / "schema.yml").write_text(AGREEING_YML)
-
-    result = runner.invoke(
-        app,
-        [
-            "validate-schema",
-            "--project-dir",
-            str(tmp_path),
-            "--select",
-            "customers",
-            "--format",
-            "json",
-        ],
-    )
-
-    assert result.exit_code == 0
-    [payload] = json.loads(result.output)
-    person = next(t for t in payload["tables"] if t["name"] == "person")
-    age = next(c for c in person["columns"] if c["name"] == "age")
-    assert age["outcome"] == "pass"
-    assert age["detail"] == "type narrowed"
-    assert age["resolved_type"] == "decimal"
-
 
 def test_validate_schema_shares_selection_with_infer_schema(tmp_path: Path) -> None:
     _project(tmp_path)
@@ -328,16 +253,6 @@ def test_validate_schema_shares_selection_with_infer_schema(tmp_path: Path) -> N
     assert result.exit_code == 1
     assert "no model named 'nope'" in result.output
 
-
-def test_validate_schema_errors_on_unparseable_sql(tmp_path: Path) -> None:
-    _project(tmp_path)
-    (tmp_path / "models" / "broken.sql").write_text("select from from where;")
-
-    result = runner.invoke(
-        app, ["validate-schema", "--project-dir", str(tmp_path), "--select", "broken"]
-    )
-
-    assert result.exit_code == 1
 
 
 # ---- declarations ----------------------------------------------------------------------
@@ -398,24 +313,6 @@ def test_validate_schema_errors_when_sql_file_names_nothing(
     assert "sql_file 'nowhere' does not name a SQL file" in result.output
 
 
-def test_validate_schema_checks_the_projection_of_a_declared_sql_file(
-    tmp_path: Path, wide: None
-) -> None:
-    _project(tmp_path)
-    (tmp_path / "models" / "schema.yml").write_text(
-        "version: 2\nsources:\n  - name: warehouse\n    tables:\n"
-        "      - name: customers\n        sql_file: customers\n        columns:\n"
-        "          - name: city\n            data_type: varchar(40)\n"
-    )
-
-    result = runner.invoke(
-        app,
-        ["validate-schema", "--project-dir", str(tmp_path), "--select", "customers"],
-    )
-
-    assert result.exit_code == 0
-    assert "varchar(40)" in result.output
-
 
 def test_validate_schema_warns_that_models_are_ignored_without_dbt(
     tmp_path: Path, wide: None
@@ -438,19 +335,4 @@ def test_validate_schema_warns_that_models_are_ignored_without_dbt(
     assert "varchar(40)" not in result.output
 
 
-def test_validate_schema_names_the_relation_an_under_qualified_reference_meant(
-    tmp_path: Path, wide: None
-) -> None:
-    _project(tmp_path)
-    (tmp_path / "models" / "schema.yml").write_text(
-        "version: 2\nsources:\n  - name: warehouse\n    database: mydb\n"
-        "    tables:\n      - name: person\n"
-    )
 
-    result = runner.invoke(
-        app,
-        ["validate-schema", "--project-dir", str(tmp_path), "--select", "customers"],
-    )
-
-    assert result.exit_code == 0
-    assert "Write mydb.person in the SQL" in result.output

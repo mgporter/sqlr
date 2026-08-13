@@ -3,13 +3,10 @@ with src as (
 )
 select
   id,
-  table1.name,
+  name,
   date_trunc('day', modified_at) as modified_at,
   list_extract(titles, 1) as first_title,
-  mistyped_tablename.col1 as col1,
-  mistyped_tablename.col2.jsonfield as col2,
-  mistyped_tablename['col3'] as col3,
-  mistyped_tablename.col4['jsonfield'] as col4
+  structured_col['myfield'] as my_field,
 from mydatabase.myschema.table1
 inner join src
     on id = src.test_id

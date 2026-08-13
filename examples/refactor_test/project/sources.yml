@@ -6,3 +6,5 @@ sources:
         columns:
           - name: id
             data_type: varchar(20)
+          - name: name
+            data_type: varchar(20)
