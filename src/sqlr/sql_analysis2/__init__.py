@@ -117,6 +117,7 @@ def resolve_columns_to_source_tables(
 
     for scope in traverse_scope(probe):
         for column in scope.columns:
+            print(column.table, column.name)
             if not column.table:
                 # Still bare after qualification: no source can own it.
                 unresolvable_columns.append(column)
@@ -134,6 +135,10 @@ def resolve_columns_to_source_tables(
                 unresolvable_columns.append(column)
             # Anything else is a CTE or derived table, whose columns are its own
             # projections - nothing to fabricate a declaration for.
+
+    print()
+    print("columns_per_table", columns_per_table)
+    print("unresolvable_columns", unresolvable_columns)
 
     return ResolvedColumns(
         columns_per_table=columns_per_table, unresolvable_columns=unresolvable_columns
