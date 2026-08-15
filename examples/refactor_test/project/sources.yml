@@ -7,5 +7,13 @@ sources:
         columns:
           - name: id
             data_type: varchar(20)
-          # - name: name
-          #   data_type: varchar(20)
+          - name: name
+            data_type: varchar(20)
+      - name: table2
+        columns:
+          - name: id
+            data_type: varchar(20)
+          - name: name
+            data_type: varchar(20)
+          - name: test_id
+            data_type: varchar(20)

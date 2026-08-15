@@ -259,6 +259,8 @@ def resolve_columns_to_source_tables(
         if not column.table and (offsets := token_offsets_of(column)) is not None
     }
 
+    print(offsets_of_columns_written_without_a_source)
+
     probe = qualify(
         statement.copy(),
         dialect=dialect_name,
@@ -290,6 +292,7 @@ def resolve_columns_to_source_tables(
                 # sqlglot gives up on either - and only the declarations can say which
                 # happened. Without them, the older reading stands.
                 offsets = token_offsets_of(column)
+                print(offsets)
                 if (
                     declared_schema is not None
                     and offsets is not None

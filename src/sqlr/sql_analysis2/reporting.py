@@ -205,9 +205,38 @@ def findings_for_columns_declared_as_scalar_but_read_as_structured(
     return findings
 
 
+def findings_without_exact_duplicates(
+    findings: list[ColumnFinding],
+) -> list[ColumnFinding]:
+    """The same finding reported twice is one finding.
+
+    A column can be reached by more than one path through the resolution - the same read
+    is unresolvable in a CTE and again in the query that selects from it - and each path
+    builds its own finding. Nothing distinguishes them once built, so only the first
+    occurrence is kept; two findings that differ in any field, position included, are two
+    separate problems and both survive.
+    """
+    seen: set[tuple[object, ...]] = set()
+    unique: list[ColumnFinding] = []
+    for finding in findings:
+        key = (
+            finding.code,
+            finding.severity,
+            finding.column_name,
+            finding.message,
+            finding.span,
+            finding.access_span,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(finding)
+    return unique
+
+
 def print_findings(findings: list[ColumnFinding], relative_path: str) -> None:
     """The CLI's view. An editor consumes the findings themselves instead."""
-    for finding in findings:
+    for finding in findings_without_exact_duplicates(findings):
         print(
             f"{finding.severity}: {relative_path}{finding.where()}: {finding.message}"
         )
