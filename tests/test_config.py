@@ -74,3 +74,19 @@ def test_star_over_join_behavior_rejects_unknown_value(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError):
         load(tmp_path)
+
+
+def test_warn_on_column_without_source_defaults_to_true(tmp_path: Path) -> None:
+    _write_config(tmp_path)
+
+    cfg = load(tmp_path)
+
+    assert cfg.general.warn_on_column_without_source is True
+
+
+def test_warn_on_column_without_source_is_read_from_config(tmp_path: Path) -> None:
+    _write_config(tmp_path, MINIMAL_CONFIG + "  warn_on_column_without_source: false\n")
+
+    cfg = load(tmp_path)
+
+    assert cfg.general.warn_on_column_without_source is False

@@ -3,16 +3,24 @@
 Every fixture here is an inline SQL string, per `tests/README.md`.
 """
 
+from pathlib import Path
+
 import pytest
 import sqlglot
 from sqlglot import exp
 
+from sqlr import sql_analysis2
+from sqlr.catalog.types import SqlFile
+from sqlr.selection.types import Model
 from sqlr.sql_analysis2 import (
     get_declared_types_per_table,
     resolve_columns_to_source_tables,
 )
+from sqlr.sql_analysis2.annotate import expression_metadata
+from sqlr.sql_analysis2.sourcedoc import Positions, SourceDoc
 from sqlr.sql_analysis2.types import (
     ColumnName,
+    ColumnTypeName,
     ParsedColumn,
     ResolvedColumns,
     StructuredAccessKind,
@@ -22,9 +30,12 @@ from sqlr.sql_analysis2.types import (
 DIALECT = "duckdb"
 
 
-def resolve(sql: str) -> ResolvedColumns:
+def resolve(
+    sql: str,
+    declared: dict[TableName, dict[ColumnName, ColumnTypeName]] | None = None,
+) -> ResolvedColumns:
     return resolve_columns_to_source_tables(
-        sqlglot.parse_one(sql, read=DIALECT), DIALECT
+        sqlglot.parse_one(sql, read=DIALECT), DIALECT, declared_schema=declared
     )
 
 
@@ -46,6 +57,24 @@ def kinds(
 
 def unresolvable_names(resolved: ResolvedColumns) -> list[str]:
     return [column.name for column in resolved.unresolvable_columns]
+
+
+def ambiguous_names(resolved: ResolvedColumns) -> list[tuple[str, list[TableName]]]:
+    """Each ambiguous column and the sources it could equally have come from."""
+    return [
+        (ambiguous.column.name, ambiguous.candidate_sources)
+        for ambiguous in resolved.ambiguous_columns
+    ]
+
+
+def guessed_names(
+    resolved: ResolvedColumns,
+) -> list[tuple[str, TableName, list[TableName]]]:
+    """Each guessed column, what it was credited to, and what was not ruled out."""
+    return [
+        (guessed.column.name, guessed.resolved_source, guessed.open_sources)
+        for guessed in resolved.guessed_columns
+    ]
 
 
 def parsed(names: list[ColumnName]) -> dict[ColumnName, ParsedColumn]:
@@ -353,6 +382,236 @@ def test_column_qualified_against_a_cte_is_neither_harvested_nor_reported() -> N
     )
     assert column_names(resolved) == {"test": {"id"}, "table_in_cte": {"test_id"}}
     assert resolved.unresolvable_columns == []
+
+
+# --------------------------------------------- columns written without a source
+JOINED_TO_A_CTE = """
+with src as (select test_id, name from mydatabase.myschema.table_in_cte)
+select {selection}
+from mydatabase.myschema.test
+inner join src on test.id = src.test_id
+"""
+
+
+def test_a_declared_column_set_is_read_as_the_complete_list() -> None:
+    """The rule the whole check rests on.
+
+    `name` is projected by the CTE and declared on `test`, so both certainly own it and
+    neither can be preferred. Without the declaration sqlglot credits the CTE silently,
+    because an undeclared table reports no columns at all.
+    """
+    resolved = resolve(
+        JOINED_TO_A_CTE.format(selection="name"),
+        {"test": {"id": "varchar(20)", "name": "varchar(20)"}},
+    )
+    assert ambiguous_names(resolved) == [("name", ["src", "test"])]
+    assert guessed_names(resolved) == []
+
+
+def test_an_ambiguous_column_is_not_credited_to_either_source() -> None:
+    """Recording the probe's pick would fabricate a declaration slot on a table that may
+    not own the column, and every type inferred from it would inherit the mistake."""
+    resolved = resolve(
+        JOINED_TO_A_CTE.format(selection="name"),
+        {"test": {"id": "varchar(20)", "name": "varchar(20)"}},
+    )
+    assert "name" not in resolved.columns_per_table["test"]
+    assert "name" not in column_names(resolved)["table_in_cte"] - {"name"}
+
+
+def test_two_declared_tables_that_both_own_the_name_are_ambiguous() -> None:
+    """The probe leaves this one bare - against an empty schema, two tables that both own
+    the name look exactly like two that both lack it. Only the declarations separate them,
+    so the finding is an ambiguity rather than an unresolvable column."""
+    resolved = resolve(
+        """
+        select name
+        from mydatabase.myschema.test
+        inner join mydatabase.myschema.other on test.id = other.id
+        """,
+        {"test": {"name": "varchar(20)"}, "other": {"id": "int", "name": "varchar(20)"}},
+    )
+    assert ambiguous_names(resolved) == [("name", ["other", "test"])]
+    assert unresolvable_names(resolved) == []
+
+
+def test_an_undeclared_table_leaves_the_attribution_a_guess() -> None:
+    resolved = resolve(JOINED_TO_A_CTE.format(selection="name"), {})
+    assert guessed_names(resolved) == [("name", "src", ["test"])]
+    assert ambiguous_names(resolved) == []
+
+
+def test_a_declaration_with_no_columns_says_nothing() -> None:
+    """An empty column list is an absent answer, not an empty one."""
+    resolved = resolve(JOINED_TO_A_CTE.format(selection="name"), {"test": {}})
+    assert guessed_names(resolved) == [("name", "src", ["test"])]
+
+
+def test_a_guessed_column_is_still_credited_to_its_source() -> None:
+    """Unlike an ambiguous column: the guess is the best answer available, and dropping
+    it would only cost the column its declared type."""
+    resolved = resolve(JOINED_TO_A_CTE.format(selection="id, name"), {})
+    assert guessed_names(resolved) == [("name", "src", ["test"])]
+    assert column_names(resolved)["table_in_cte"] == {"test_id", "name"}
+
+
+def test_a_source_ruled_out_by_its_declaration_makes_no_noise() -> None:
+    """`test` is declared and does not list `name`, so the CTE is the only candidate
+    left and the attribution is forced rather than guessed."""
+    resolved = resolve(
+        JOINED_TO_A_CTE.format(selection="name"), {"test": {"id": "varchar(20)"}}
+    )
+    assert guessed_names(resolved) == []
+    assert ambiguous_names(resolved) == []
+
+
+def test_a_column_no_declaration_mentions_is_neither_ambiguous_nor_guessed() -> None:
+    """The closed-world reading decides verdicts only. `modified_at` appears in neither
+    the CTE's projections nor `test`'s declaration, yet `test` still absorbs it - a
+    partial declaration has to keep working."""
+    resolved = resolve(
+        JOINED_TO_A_CTE.format(selection="modified_at"),
+        {"test": {"id": "varchar(20)", "name": "varchar(20)"}},
+    )
+    assert guessed_names(resolved) == []
+    assert ambiguous_names(resolved) == []
+    assert "modified_at" in column_names(resolved)["test"]
+
+
+def test_a_qualified_column_is_never_judged() -> None:
+    resolved = resolve(
+        JOINED_TO_A_CTE.format(selection="src.name"),
+        {"test": {"id": "varchar(20)", "name": "varchar(20)"}},
+    )
+    assert ambiguous_names(resolved) == []
+    assert guessed_names(resolved) == []
+
+
+def test_a_lone_source_cannot_be_ambiguous() -> None:
+    resolved = resolve(
+        "select id, name from mydatabase.myschema.test",
+        {"test": {"id": "varchar(20)", "name": "varchar(20)"}},
+    )
+    assert ambiguous_names(resolved) == []
+    assert guessed_names(resolved) == []
+
+
+def test_a_projection_cloned_into_group_by_is_judged_once() -> None:
+    """`group by 1` is expanded into a copy of the projection, so one written column
+    reaches the walk twice. It is one mistake, and gets one finding."""
+    resolved = resolve(
+        JOINED_TO_A_CTE.format(selection="name, count(*)") + "group by 1",
+        {"test": {"id": "varchar(20)", "name": "varchar(20)"}},
+    )
+    assert ambiguous_names(resolved) == [("name", ["src", "test"])]
+
+
+def test_a_name_written_twice_is_reported_at_both_sites() -> None:
+    """The mirror of the case above: `group by name` writes the column a second time,
+    and an editor underlining only the first would leave the other unmarked."""
+    resolved = resolve(
+        JOINED_TO_A_CTE.format(selection="name, count(*)") + "group by name",
+        {"test": {"id": "varchar(20)", "name": "varchar(20)"}},
+    )
+    assert ambiguous_names(resolved) == [
+        ("name", ["src", "test"]),
+        ("name", ["src", "test"]),
+    ]
+
+
+def test_no_declarations_means_no_verdicts() -> None:
+    """`declared_schema=None` is how every other caller gets the old behaviour."""
+    resolved = resolve(JOINED_TO_A_CTE.format(selection="name"))
+    assert ambiguous_names(resolved) == []
+    assert guessed_names(resolved) == []
+
+
+def check_one_statement(
+    sql: str,
+    declared: dict[TableName, dict[ColumnName, ColumnTypeName]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    warn_on_column_without_source: bool = True,
+) -> tuple[list[str], bool]:
+    """Run the per-statement pipeline. Returns its output and whether step 4 was reached.
+
+    Annotation is the first step past `qualify`, so patching it out is how a test sees
+    that a finding stopped the statement rather than merely being printed alongside it.
+    """
+    reached_annotation = False
+
+    def record(tree: exp.Expr, **_: object) -> exp.Expr:
+        nonlocal reached_annotation
+        reached_annotation = True
+        return tree
+
+    monkeypatch.setattr(sql_analysis2, "annotate_types", record)
+
+    model = Model(
+        name="x",
+        file=SqlFile(path=Path("x.sql"), relative_path="x.sql", mtime=0.0, content_hash=""),
+    )
+    sql_analysis2._check_statement(  # pyright: ignore[reportPrivateUsage]
+        sqlglot.parse_one(sql, read=DIALECT),
+        declared,
+        DIALECT,
+        expression_metadata(DIALECT),
+        model,
+        SourceDoc(path=Path("x.sql"), text=sql),
+        Positions(sql),
+        warn_on_column_without_source,
+    )
+    return capsys.readouterr().out.splitlines(), reached_annotation
+
+
+def test_an_ambiguous_column_stops_the_statement(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Committing to either source would hand `qualify` an attribution as likely wrong as
+    right, and every type inferred downstream would inherit the choice."""
+    output, reached_annotation = check_one_statement(
+        JOINED_TO_A_CTE.format(selection="name"),
+        {"test": {"id": "varchar(20)", "name": "varchar(20)"}},
+        monkeypatch,
+        capsys,
+    )
+    assert any(line.startswith("error: x.sql:") and "ambiguous" in line for line in output)
+    assert not reached_annotation
+
+
+def test_a_guessed_column_does_not_stop_the_statement(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output, reached_annotation = check_one_statement(
+        JOINED_TO_A_CTE.format(selection="name"), {}, monkeypatch, capsys
+    )
+    assert any(line.startswith("warning: x.sql:") for line in output)
+    assert reached_annotation
+
+
+def test_the_guess_warning_can_be_switched_off(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output, reached_annotation = check_one_statement(
+        JOINED_TO_A_CTE.format(selection="name"),
+        {},
+        monkeypatch,
+        capsys,
+        warn_on_column_without_source=False,
+    )
+    assert output == []
+    assert reached_annotation
+
+
+def test_an_ambiguous_column_keeps_its_source_position() -> None:
+    sql = JOINED_TO_A_CTE.format(selection="name")
+    resolved = resolve(sql, {"test": {"id": "varchar(20)", "name": "varchar(20)"}})
+    (ambiguous,) = resolved.ambiguous_columns
+    identifier = ambiguous.column.this
+    assert isinstance(identifier, exp.Identifier)
+    start = identifier.meta["start"]
+    end = identifier.meta["end"]
+    assert sql[start : end + 1] == "name"
 
 
 # ------------------------------------------------------------- schema fabrication

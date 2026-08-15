@@ -36,6 +36,38 @@ from pydantic import BaseModel
 from sqlglot import exp
 
 
+def token_offsets_of(expression: exp.Expr | None) -> tuple[int, int] | None:
+    """The half-open offset hull of every positioned token under `expression`.
+
+    Split out of `Positions.span_of` because it needs no source text: a caller that only
+    wants to *identify* a node - "is this the same column I saw before qualification?" -
+    gets a stable key without building a line index for a document it may not have.
+
+    The pair is half-open, unlike sqlglot's own inclusive `end`.
+    """
+    if expression is None:
+        return None
+
+    start: int | None = None
+    end: int | None = None
+
+    for node in expression.walk():
+        meta = node.meta
+        node_start = meta.get("start")
+        node_end = meta.get("end")
+        if not isinstance(node_start, int) or not isinstance(node_end, int):
+            continue
+        if start is None or node_start < start:
+            start = node_start
+        # sqlglot's `end` points at the last character; make it exclusive.
+        if end is None or node_end + 1 > end:
+            end = node_end + 1
+
+    if start is None or end is None:
+        return None
+    return start, end
+
+
 class SourceSpan(BaseModel, frozen=True):
     """A half-open character range in one source file, with line/column resolved.
 
@@ -126,26 +158,10 @@ class Positions:
         sqlglot synthesised rather than parsed, such as an alias invented by
         `qualify_tables`. Callers must treat a missing span as normal, not exceptional.
         """
-        if expression is None:
+        offsets = token_offsets_of(expression)
+        if offsets is None:
             return None
-
-        start: int | None = None
-        end: int | None = None
-
-        for node in expression.walk():
-            meta = node.meta
-            node_start = meta.get("start")
-            node_end = meta.get("end")
-            if not isinstance(node_start, int) or not isinstance(node_end, int):
-                continue
-            if start is None or node_start < start:
-                start = node_start
-            # sqlglot's `end` points at the last character; make it exclusive.
-            if end is None or node_end + 1 > end:
-                end = node_end + 1
-
-        if start is None or end is None:
-            return None
+        start, end = offsets
         if end > len(self.text):
             # The offsets belong to some other document. That means this index was built
             # from text the expression was not parsed from, and any span derived here

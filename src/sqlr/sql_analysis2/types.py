@@ -49,9 +49,37 @@ class ParsedColumn(NamedTuple):
         )
 
 
+class AmbiguousColumn(NamedTuple):
+    """A bare column that two or more sources are each known to own.
+
+    "Known" is the whole point: a CTE's projections and a declared table's column list are
+    both complete answers, so a name appearing in two of them has no correct attribution
+    at all. Nothing can break the tie, which is why this stops the statement.
+    """
+
+    column: exp.Column
+    candidate_sources: list[TableName]
+    """Every source known to own the name, sorted - the choices offered to the reader."""
+
+
+class GuessedColumn(NamedTuple):
+    """A bare column attributed by elimination rather than by proof.
+
+    One source is known to own the name (or is the only one left standing), while some
+    other source in the scope has an unknown column set and might own it too. The
+    attribution is the best available answer and is used, but the reader is told.
+    """
+
+    column: exp.Column
+    resolved_source: TableName
+    """The source the column was credited to."""
+    open_sources: list[TableName]
+    """Sources whose column set is unknown, sorted - the reason this is a guess."""
+
+
 class ResolvedColumns(NamedTuple):
     """What the probe pass learned: which columns each real table is asked for, how they
-    were read, and which columns no source can own."""
+    were read, which columns no source can own, and which were attributed uncertainly."""
 
     columns_per_table: dict[TableName, dict[ColumnName, ParsedColumn]]
     unresolvable_columns: list[exp.Column]
@@ -59,3 +87,10 @@ class ResolvedColumns(NamedTuple):
     """Dotted names absorbed as struct reads by a dialect that has no such syntax. Still
     harvested into `columns_per_table` - the report is the point, and dropping them only
     makes step 3 fail with a worse message."""
+    ambiguous_columns: list[AmbiguousColumn]
+    """Deliberately *not* harvested into `columns_per_table`: recording the probe's pick
+    would fabricate a declaration slot on a table that may not own the column, and every
+    type inferred from it downstream would inherit the mistake."""
+    guessed_columns: list[GuessedColumn]
+    """Harvested normally. The guess is the best answer available, and dropping it would
+    only cost the column its declared type."""

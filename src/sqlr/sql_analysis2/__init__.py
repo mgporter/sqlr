@@ -14,7 +14,7 @@ from sqlglot import ParseError, exp
 from sqlglot.errors import OptimizeError
 from sqlglot.optimizer.annotate_types import annotate_types
 from sqlglot.optimizer.qualify import qualify
-from sqlglot.optimizer.scope import traverse_scope
+from sqlglot.optimizer.scope import Scope, traverse_scope
 from sqlglot.schema import ensure_schema
 from sqlglot.typing import ExprMetadataType
 
@@ -23,15 +23,24 @@ from sqlr.declared.types import DeclaredSchemas
 from sqlr.selection.types import Model
 from sqlr.sql_analysis2.annotate import expression_metadata, func_args
 from sqlr.sql_analysis2.reporting import (
+    findings_for_ambiguous_columns,
     findings_for_columns_declared_as_scalar_but_read_as_structured,
     findings_for_columns_read_with_unsupported_dot_notation,
+    findings_for_columns_without_a_source,
     findings_for_unresolvable_columns,
     print_findings,
 )
-from sqlr.sql_analysis2.sourcedoc import Positions, SourceDoc, SourceSpan
+from sqlr.sql_analysis2.sourcedoc import (
+    Positions,
+    SourceDoc,
+    SourceSpan,
+    token_offsets_of,
+)
 from sqlr.sql_analysis2.types import (
+    AmbiguousColumn,
     ColumnName,
     ColumnTypeName,
+    GuessedColumn,
     ParsedColumn,
     ResolvedColumns,
     StructuredAccessKind,
@@ -98,10 +107,115 @@ def structured_access_of(column: exp.Column) -> StructuredAccessKind | None:
     return None
 
 
+def sources_a_bare_column_could_read(scope: Scope) -> list[tuple[TableName, exp.Table | Scope]]:
+    """The sources an unqualified column in this scope could actually be reading from.
+
+    `Scope.sources` also holds every CTE the statement defines, whether or not this scope
+    selects from it. `selected_sources` is what a FROM or JOIN actually brought in, and
+    `lateral_sources` what a lateral added - the same pair sqlglot's own `Resolver`
+    consults when it decides which names are unambiguous.
+    """
+    sources: list[tuple[TableName, exp.Table | Scope]] = [
+        (name, source) for name, (_, source) in scope.selected_sources.items()
+    ]
+    already_listed = {name for name, _ in sources}
+    sources.extend(
+        (name, source)
+        for name, source in scope.lateral_sources.items()
+        if name not in already_listed
+    )
+    return sources
+
+
+def known_column_names_of_source(
+    source: exp.Table | Scope,
+    declared_schema: dict[TableName, dict[ColumnName, ColumnTypeName]],
+) -> set[ColumnName] | None:
+    """Every column a source is known to have, or None when its column set is unknown.
+
+    None is not "owns nothing" - it is "no answer available", and the two lead to opposite
+    verdicts about an unqualified column.
+
+    A CTE or derived table answers for itself: its projections are the whole set. A real
+    table answers only through `sources.yml`, and a declaration carrying at least one
+    column is read as the *complete* list rather than a sample - that is the rule this
+    whole check rests on. A table that is undeclared, or declared with no columns, could
+    own anything.
+    """
+    if isinstance(source, exp.Table):
+        declared = declared_schema.get(source.name.lower())
+        return set(declared) if declared else None
+
+    named_selects = getattr(source.expression, "named_selects", None)
+    if not named_selects or "*" in named_selects:
+        # A derived table projecting a star cannot be enumerated without a schema, which
+        # the probe deliberately does not have.
+        return None
+    return {name.lower() for name in named_selects}
+
+
+def sources_owning_and_sources_open_for(
+    column_name: ColumnName,
+    scope: Scope,
+    declared_schema: dict[TableName, dict[ColumnName, ColumnTypeName]],
+) -> tuple[list[TableName], list[TableName]]:
+    """Split this scope's sources by what they say about one unqualified column name.
+
+    Returns the sources *known* to own the name and the sources whose column set is
+    unknown, both sorted. A source known not to own it appears in neither: it has been
+    ruled out, and cannot make an attribution either wrong or uncertain.
+    """
+    owning: list[TableName] = []
+    open_sources: list[TableName] = []
+    for source_name, source in sources_a_bare_column_could_read(scope):
+        known = known_column_names_of_source(source, declared_schema)
+        if known is None:
+            open_sources.append(source_name)
+        elif column_name in known:
+            owning.append(source_name)
+    return sorted(owning), sorted(open_sources)
+
+
+def judge_a_column_written_without_a_source(
+    column: exp.Column,
+    scope: Scope,
+    declared_schema: dict[TableName, dict[ColumnName, ColumnTypeName]],
+) -> AmbiguousColumn | GuessedColumn | None:
+    """How much the probe's attribution of one unqualified column can be trusted.
+
+    The column has already been attributed - `column.table` is the probe's answer. This
+    only grades it, by counting the sources that were *not* ruled out:
+
+    - two or more sources known to own the name: an `AmbiguousColumn`. Nothing can break
+      the tie, so the statement stops.
+    - exactly one candidate: certain, and nothing is returned. A lone source with an
+      unknown column set counts here - if every other source in the scope is known not to
+      own the name, the attribution is forced rather than guessed.
+    - several candidates, at least one of them a source with an unknown column set: a
+      `GuessedColumn`. The attribution stands and the reader is told what was assumed.
+
+    A source known *not* to own the name is ruled out and counts for nothing - which is
+    what keeps a partially declared table from turning every column it omits into noise.
+    That table is still the probe's fallback and still absorbs those columns; a declaration
+    is read as complete only when deciding this question, never when resolving one.
+    """
+    owning, open_sources = sources_owning_and_sources_open_for(
+        column.name.lower(), scope, declared_schema
+    )
+    if len(owning) >= 2:
+        return AmbiguousColumn(column=column, candidate_sources=owning)
+    if open_sources and len(owning) + len(open_sources) > 1:
+        return GuessedColumn(
+            column=column, resolved_source=column.table, open_sources=open_sources
+        )
+    return None
+
+
 def resolve_columns_to_source_tables(
     statement: exp.Expr,
     dialect_name: str,
     allow_unresolvable_aliases_as_structured_columns: bool | None = None,
+    declared_schema: dict[TableName, dict[ColumnName, ColumnTypeName]] | None = None,
 ) -> ResolvedColumns:
     """Attribute every column to the source it reads from, by letting sqlglot do it.
 
@@ -123,11 +237,27 @@ def resolve_columns_to_source_tables(
     `allow_unresolvable_aliases_as_structured_columns` false makes such a read a finding
     rather than a column. It only fires when a lone source can absorb the name; with two
     sources the qualifier resolves to nothing and is unresolvable instead.
+
+    `declared_schema` is judgement, never input: it decides whether an unqualified column
+    was attributed with certainty, and is *not* handed to `qualify`. Passing it as the
+    probe's schema would undo everything above - a partially declared table would stop
+    being the `infer_schema` fallback target, and every column it does not declare would
+    fail to resolve. Omit it and the certainty verdicts are simply not made.
     """
     if allow_unresolvable_aliases_as_structured_columns is None:
         allow_unresolvable_aliases_as_structured_columns = (
             dialect_parses_unresolvable_aliases_as_json_columns(dialect_name)
         )
+
+    # Which columns were written without a qualifier, recorded before the probe rewrites
+    # them. Token offsets survive `copy()` and survive `qualify` - the synthesised table
+    # identifier it adds carries none of its own - so the hull of a qualified column is
+    # still the hull of the name the user typed, and identifies it across the two trees.
+    offsets_of_columns_written_without_a_source = {
+        offsets
+        for column in statement.find_all(exp.Column)
+        if not column.table and (offsets := token_offsets_of(column)) is not None
+    }
 
     probe = qualify(
         statement.copy(),
@@ -146,11 +276,34 @@ def resolve_columns_to_source_tables(
     columns_per_table: dict[TableName, dict[ColumnName, ParsedColumn]] = {}
     unresolvable_columns: list[exp.Column] = []
     columns_read_with_unsupported_dot_notation: list[exp.Column] = []
+    ambiguous_columns: list[AmbiguousColumn] = []
+    guessed_columns: list[GuessedColumn] = []
+    # `qualify` can clone a projection into GROUP BY or ORDER BY, so one written column can
+    # arrive here twice. It is one mistake either way, and deserves one finding.
+    offsets_already_judged: set[tuple[int, int]] = set()
 
     for scope in traverse_scope(probe):
         for column in scope.columns:
             if not column.table:
-                # Still bare after qualification: no source can own it.
+                # Still bare after qualification. Against an empty schema two tables that
+                # both own the name are indistinguishable from two that both lack it, so
+                # sqlglot gives up on either - and only the declarations can say which
+                # happened. Without them, the older reading stands.
+                offsets = token_offsets_of(column)
+                if (
+                    declared_schema is not None
+                    and offsets is not None
+                    and offsets not in offsets_already_judged
+                ):
+                    offsets_already_judged.add(offsets)
+                    owning, _ = sources_owning_and_sources_open_for(
+                        column.name.lower(), scope, declared_schema
+                    )
+                    if len(owning) >= 2:
+                        ambiguous_columns.append(
+                            AmbiguousColumn(column=column, candidate_sources=owning)
+                        )
+                        continue
                 unresolvable_columns.append(column)
                 continue
 
@@ -161,6 +314,24 @@ def resolve_columns_to_source_tables(
                 # source, because a lone source absorbs the name as a struct read.
                 unresolvable_columns.append(column)
                 continue
+
+            offsets = token_offsets_of(column)
+            if (
+                declared_schema is not None
+                and offsets in offsets_of_columns_written_without_a_source
+                and offsets not in offsets_already_judged
+            ):
+                offsets_already_judged.add(offsets)
+                verdict = judge_a_column_written_without_a_source(
+                    column, scope, declared_schema
+                )
+                if isinstance(verdict, AmbiguousColumn):
+                    # Attributing it at all would fabricate a declaration slot on a table
+                    # that may not own the column.
+                    ambiguous_columns.append(verdict)
+                    continue
+                if isinstance(verdict, GuessedColumn):
+                    guessed_columns.append(verdict)
 
             access = structured_access_of(column)
             if access == "dot_field" and not allow_unresolvable_aliases_as_structured_columns:
@@ -177,20 +348,12 @@ def resolve_columns_to_source_tables(
             # Anything else is a CTE or derived table, whose columns are its own
             # projections - nothing to fabricate a declaration for.
 
-    # print()
-    # print("columns_per_table", columns_per_table)
-    # print()
-    # print("unresolvable_columns", unresolvable_columns)
-    # print()
-    # print(
-    #     "columns_read_with_unsupported_dot_notation",
-    #     columns_read_with_unsupported_dot_notation,
-    # )
-
     return ResolvedColumns(
         columns_per_table=columns_per_table,
         unresolvable_columns=unresolvable_columns,
         columns_read_with_unsupported_dot_notation=columns_read_with_unsupported_dot_notation,
+        ambiguous_columns=ambiguous_columns,
+        guessed_columns=guessed_columns,
     )
 
 
@@ -312,7 +475,14 @@ def validate_schema(
 
         for statement in parsed:
             _check_statement(
-                statement, declared_schema, dialect_name, metadata, model, source, positions
+                statement,
+                declared_schema,
+                dialect_name,
+                metadata,
+                model,
+                source,
+                positions,
+                cfg.general.warn_on_column_without_source,
             )
 
 
@@ -324,8 +494,9 @@ def _check_statement(
     model: Model,
     source: SourceDoc,
     positions: Positions,
+    warn_on_column_without_source: bool = True,
 ) -> None:
-    
+
     # Step 2a: a probe qualification resolves every column to the source it reads from.
     # This is necessary to get the sources for columns without an alias but which MUST
     # come from a source because no other source has that column.
@@ -333,7 +504,9 @@ def _check_statement(
     #       select a from t1 join t2 on t1.id = t2.id;
     # Here, 'a' must come from either t1, since t2 only has 'id'.
     try:
-        resolved = resolve_columns_to_source_tables(statement, dialect_name)
+        resolved = resolve_columns_to_source_tables(
+            statement, dialect_name, declared_schema=declared_schema
+        )
     except OptimizeError as e:
         print(f"error: {model.relative_path}: {e}")
         return
@@ -343,26 +516,33 @@ def _check_statement(
     # same mistake is strictly harder to act on than the one built here.
     findings = [
         *findings_for_unresolvable_columns(resolved.unresolvable_columns, positions),
+        *findings_for_ambiguous_columns(resolved.ambiguous_columns, positions),
         *findings_for_columns_read_with_unsupported_dot_notation(
             resolved.columns_read_with_unsupported_dot_notation, positions, dialect_name
         ),
     ]
+    if warn_on_column_without_source:
+        findings += findings_for_columns_without_a_source(
+            resolved.guessed_columns, positions
+        )
 
     # Step 2b: match the resolved tables against the source declarations to fill in
     # declared type information.
     declared_types_per_table = get_declared_types_per_table(
         declared_schema, resolved.columns_per_table
     )
-    print(declared_types_per_table)
     findings += findings_for_columns_declared_as_scalar_but_read_as_structured(
         declared_schema, resolved.columns_per_table, positions
     )
     print_findings(findings, str(model.relative_path))
 
-    # An unresolvable column is the one finding that has to stop the statement: it belongs
-    # to no table, so no fabricated schema can cover it and `qualify` raises. A dotted read
-    # is harvested despite its finding, so the rest of the statement is still checked.
-    if resolved.unresolvable_columns:
+    # Two findings have to stop the statement. An unresolvable column belongs to no table,
+    # so no fabricated schema can cover it and `qualify` raises. An ambiguous one belongs
+    # to two, and committing to either would hand `qualify` an attribution that is as
+    # likely wrong as right - every type inferred downstream would inherit the choice. A
+    # dotted read and a guessed column are both harvested despite their findings, so the
+    # rest of the statement is still checked.
+    if resolved.unresolvable_columns or resolved.ambiguous_columns:
         return
 
     logger.debug("declared_types_per_table: %s", declared_types_per_table)

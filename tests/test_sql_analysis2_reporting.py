@@ -3,13 +3,18 @@
 Every fixture here is an inline SQL string, per `tests/README.md`.
 """
 
+import pytest
 import sqlglot
 
 from sqlr.sql_analysis2 import resolve_columns_to_source_tables
 from sqlr.sql_analysis2.reporting import (
+    ColumnFinding,
+    findings_for_ambiguous_columns,
     findings_for_columns_declared_as_scalar_but_read_as_structured,
     findings_for_columns_read_with_unsupported_dot_notation,
+    findings_for_columns_without_a_source,
     findings_for_unresolvable_columns,
+    print_findings,
 )
 from sqlr.sql_analysis2.sourcedoc import Positions, SourceSpan
 
@@ -88,6 +93,72 @@ def test_one_finding_per_read_site() -> None:
     )
     # The bracket read is legal in Postgres, so only the two dotted ones are findings.
     assert [str(finding.span) for finding in findings] == ["2:3", "4:3"]
+
+
+# --------------------------------------------- columns written without a source
+JOINED_TO_A_CTE = (
+    "with src as (select test_id, name from mydatabase.myschema.other)\n"
+    "select {selection}\n"
+    "from mydatabase.myschema.test\n"
+    "inner join src on test.id = src.test_id"
+)
+
+
+def test_an_ambiguous_column_names_every_candidate() -> None:
+    sql = JOINED_TO_A_CTE.format(selection="name")
+    resolved = resolve_columns_to_source_tables(
+        sqlglot.parse_one(sql, read=DIALECT),
+        DIALECT,
+        declared_schema={"test": {"id": "int", "name": "varchar(20)"}},
+    )
+    (finding,) = findings_for_ambiguous_columns(
+        resolved.ambiguous_columns, Positions(sql)
+    )
+    assert finding.code == "ambiguous-column"
+    assert finding.severity == "error"
+    assert text_at(sql, finding.span) == "name"
+    assert finding.message == (
+        "column 'name' is ambiguous: 'src' and 'test' both declare it; "
+        "qualify it with a source alias"
+    )
+
+
+def test_a_guessed_column_names_what_it_was_read_from() -> None:
+    """Naming the source that was *not* ruled out is what makes the warning actionable:
+    it is the difference between "add a qualifier" and "declare that table"."""
+    sql = JOINED_TO_A_CTE.format(selection="name")
+    resolved = resolve_columns_to_source_tables(
+        sqlglot.parse_one(sql, read=DIALECT), DIALECT, declared_schema={}
+    )
+    (finding,) = findings_for_columns_without_a_source(
+        resolved.guessed_columns, Positions(sql)
+    )
+    assert finding.code == "column-without-source"
+    assert finding.severity == "warning"
+    assert text_at(sql, finding.span) == "name"
+    assert finding.message == (
+        "column 'name' has no source alias and 'test' does not declare its columns; "
+        "reading it from 'src'"
+    )
+
+
+def test_the_printer_takes_its_prefix_from_the_severity(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    findings = [
+        ColumnFinding(code="unresolvable-column", column_name="a", message="gone"),
+        ColumnFinding(
+            code="column-without-source",
+            column_name="b",
+            message="guessed",
+            severity="warning",
+        ),
+    ]
+    print_findings(findings, "models/x.sql")
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "error: models/x.sql: gone\nwarning: models/x.sql: guessed\n"
+    )
 
 
 # --------------------------------------------------- structured column declarations

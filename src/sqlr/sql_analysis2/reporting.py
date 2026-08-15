@@ -11,8 +11,10 @@ from sqlglot import exp
 
 from sqlr.sql_analysis2.sourcedoc import Positions, SourceSpan
 from sqlr.sql_analysis2.types import (
+    AmbiguousColumn,
     ColumnName,
     ColumnTypeName,
+    GuessedColumn,
     ParsedColumn,
     TableName,
 )
@@ -22,7 +24,13 @@ type FindingCode = Literal[
     "unresolvable-column",
     "dot-access-unsupported",
     "structured-column-declared-scalar",
+    "ambiguous-column",
+    "column-without-source",
 ]
+
+type FindingSeverity = Literal["error", "warning"]
+"""How much a finding costs. An `error` means the statement cannot be checked further; a
+`warning` means it can, but the reader should know what was assumed to get there."""
 
 
 class ColumnFinding(BaseModel):
@@ -35,6 +43,7 @@ class ColumnFinding(BaseModel):
     code: FindingCode
     column_name: ColumnName
     message: str
+    severity: FindingSeverity = "error"
     span: SourceSpan | None = None
     access_span: SourceSpan | None = None
 
@@ -72,6 +81,65 @@ def findings_for_unresolvable_columns(
             span=positions.span_of(column),
         )
         for column in columns
+    ]
+
+
+def _as_a_list_of_names(names: list[TableName]) -> str:
+    """`'a'`, `'a' and 'b'`, `'a', 'b' and 'c'` - a list a person can read aloud."""
+    quoted = [f"'{name}'" for name in names]
+    if len(quoted) <= 1:
+        return "".join(quoted)
+    return f"{', '.join(quoted[:-1])} and {quoted[-1]}"
+
+
+def findings_for_ambiguous_columns(
+    ambiguous: list[AmbiguousColumn], positions: Positions
+) -> list[ColumnFinding]:
+    """A bare column that two sources each certainly own.
+
+    There is no tie-break to apply and no default worth printing, so the message offers
+    the candidates and asks for a qualifier rather than announcing a pick.
+    """
+    return [
+        ColumnFinding(
+            code="ambiguous-column",
+            column_name=column.name,
+            message=(
+                f"column '{column.name}' is ambiguous: "
+                f"{_as_a_list_of_names(candidate_sources)} "
+                f"{'both' if len(candidate_sources) == 2 else 'all'} declare it; "
+                "qualify it with a source alias"
+            ),
+            span=positions.span_of(column),
+        )
+        for column, candidate_sources in ambiguous
+    ]
+
+
+def findings_for_columns_without_a_source(
+    guessed: list[GuessedColumn], positions: Positions
+) -> list[ColumnFinding]:
+    """A bare column attributed while some other source could still have owned it.
+
+    The attribution stands - it is the best answer available - so the message names it.
+    Saying which source was *not* ruled out is what makes the warning actionable: it is
+    the difference between "add a qualifier" and "declare that table's columns".
+    """
+    return [
+        ColumnFinding(
+            code="column-without-source",
+            column_name=column.name,
+            severity="warning",
+            message=(
+                f"column '{column.name}' has no source alias and "
+                f"{_as_a_list_of_names(open_sources)} "
+                f"{'does' if len(open_sources) == 1 else 'do'} not declare "
+                f"{'its' if len(open_sources) == 1 else 'their'} columns; "
+                f"reading it from '{resolved_source}'"
+            ),
+            span=positions.span_of(column),
+        )
+        for column, resolved_source, open_sources in guessed
     ]
 
 
@@ -119,24 +187,27 @@ def findings_for_columns_declared_as_scalar_but_read_as_structured(
             written = declared.get(table_name, {}).get(column.name)
             if written is None or resolve_type_name(written) == "unknown":
                 continue
-            findings.extend(
-                ColumnFinding(
-                    code="structured-column-declared-scalar",
-                    column_name=column.name,
-                    message=(
-                        f"column '{column.name}' of '{table_name}' is declared "
-                        f"'{written}', but is read as a structured value; declare it as "
-                        "a struct, json, map or variant type"
-                    ),
-                    span=positions.span_of(node),
-                    access_span=span_of_access(node, positions),
-                )
-                for _, node in column.structured_access
+            message = (
+                f"column '{column.name}' of '{table_name}' is declared "
+                f"'{written}', but is read as a structured value; declare it as "
+                "a struct, json, map or variant type"
             )
+            for _, node in column.structured_access:
+                findings.append(
+                    ColumnFinding(
+                        code="structured-column-declared-scalar",
+                        column_name=column.name,
+                        message=message,
+                        span=positions.span_of(node),
+                        access_span=span_of_access(node, positions),
+                    )
+                )
     return findings
 
 
 def print_findings(findings: list[ColumnFinding], relative_path: str) -> None:
     """The CLI's view. An editor consumes the findings themselves instead."""
     for finding in findings:
-        print(f"error: {relative_path}{finding.where()}: {finding.message}")
+        print(
+            f"{finding.severity}: {relative_path}{finding.where()}: {finding.message}"
+        )

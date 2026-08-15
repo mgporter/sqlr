@@ -11,6 +11,7 @@ from sqlr.config.defaults import (
     DEFAULT_SQL_FILE_GLOBS,
     DEFAULT_STAR_OVER_JOIN_BEHAVIOR,
     DEFAULT_VERSION,
+    DEFAULT_WARN_ON_COLUMN_WITHOUT_SOURCE,
 )
 
 StarOverJoinBehavior = Literal["error", "guess"]
@@ -32,6 +33,19 @@ class GeneralConfig(BaseModel):
     sql_file_globs: list[str] = Field(default_factory=lambda: list(DEFAULT_SQL_FILE_GLOBS))
     sql_dialect: str | None = DEFAULT_SQL_DIALECT
     star_over_join_behavior: StarOverJoinBehavior = DEFAULT_STAR_OVER_JOIN_BEHAVIOR  # type: ignore[assignment]
+    warn_on_column_without_source: bool = DEFAULT_WARN_ON_COLUMN_WITHOUT_SOURCE
+    """Whether to warn when an unqualified column is attributed by guesswork.
+
+    A scope with several sources can still attribute a bare column with certainty, and
+    those stay silent. The warning is for the case where certainty is unreachable: some
+    source in the scope has an *unknown* column set, so the name might have come from it
+    instead of from the source it was credited to.
+
+    A source's column set is known when it is a CTE or derived table - its projections are
+    the whole set - or when it is a table declared in a `sources.yml` with at least one
+    column, which is read as the complete list rather than a sample. A table that is
+    undeclared, or declared with no columns at all, is the unknown case that triggers this.
+    """
     model_paths: list[str] | None = DEFAULT_MODEL_PATHS
     """Directories, relative to the project root, that hold models.
 
