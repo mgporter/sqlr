@@ -2,7 +2,7 @@ with src as (
   select test_id, name from mydatabase.myschema.table_in_cte
 )
 select
-  id,
+  mistyped_table.id,
   name,
   date_trunc('day', modified_at) as modified_at,
   list_extract(titles, 1) as first_title,

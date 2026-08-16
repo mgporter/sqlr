@@ -82,6 +82,11 @@ class ResolvedColumns(NamedTuple):
     were read, which columns no source can own, and which were attributed uncertainly."""
 
     columns_per_table: dict[TableName, dict[ColumnName, ParsedColumn]]
+    source_table_names: set[TableName]
+    """Every real table the statement reads, whether or not it names a column of it.
+
+    A `select *` names none, so the table would otherwise be absent from the gap-filled
+    schema entirely and step 3 would have nothing to expand the star against."""
     unresolvable_columns: list[exp.Column]
     columns_read_with_unsupported_dot_notation: list[exp.Column]
     """Dotted names absorbed as struct reads by a dialect that has no such syntax. Still
@@ -94,3 +99,8 @@ class ResolvedColumns(NamedTuple):
     guessed_columns: list[GuessedColumn]
     """Harvested normally. The guess is the best answer available, and dropping it would
     only cost the column its declared type."""
+    offsets_of_columns_written_without_a_source: set[tuple[int, int]]
+    """The token hull of every column the user wrote bare, recorded before the probe
+    qualified them. Offsets survive qualification, so this is what tells a qualifier the
+    user typed apart from one the resolution supplied - the distinction is gone from the
+    tree itself, and re-deriving it later would need the pre-probe statement back."""

@@ -3,7 +3,7 @@ with src as (
 )
 select
   id,
-  name,
+  table1.name,
   date_trunc('day', modified_at) as modified_at,
   list_extract(titles, 1) as first_title,
   structured_col['myfield'] as my_field,

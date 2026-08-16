@@ -4,20 +4,21 @@ Every fixture here is an inline SQL string, per `tests/README.md`.
 """
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 import sqlglot
 from sqlglot import exp
+from sqlglot.optimizer.qualify import qualify
+from sqlglot.schema import ensure_schema
 
-from sqlr import sql_analysis2
 from sqlr.catalog.types import SqlFile
 from sqlr.selection.types import Model
-from sqlr.sql_analysis2 import (
+from sqlr.sql_analysis2.qualify import QualifiedModel, qualify_one_model
+from sqlr.sql_analysis2.resolve import (
     get_declared_types_per_table,
     resolve_columns_to_source_tables,
 )
-from sqlr.sql_analysis2.annotate import expression_metadata
-from sqlr.sql_analysis2.sourcedoc import Positions, SourceDoc
 from sqlr.sql_analysis2.types import (
     ColumnName,
     ColumnTypeName,
@@ -526,81 +527,75 @@ def test_no_declarations_means_no_verdicts() -> None:
     assert guessed_names(resolved) == []
 
 
-def check_one_statement(
+def qualify_one_statement(
     sql: str,
     declared: dict[TableName, dict[ColumnName, ColumnTypeName]],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
     warn_on_column_without_source: bool = True,
-) -> tuple[list[str], bool]:
-    """Run the per-statement pipeline. Returns its output and whether step 4 was reached.
+) -> QualifiedModel:
+    """Run steps 1-3 over one file.
 
-    Annotation is the first step past `qualify`, so patching it out is how a test sees
-    that a finding stopped the statement rather than merely being printed alongside it.
+    `statement is None` is how a test sees that a finding *stopped* the model rather than
+    merely being reported alongside it: step 3 is the first thing a stopping finding skips.
     """
-    reached_annotation = False
-
-    def record(tree: exp.Expr, **_: object) -> exp.Expr:
-        nonlocal reached_annotation
-        reached_annotation = True
-        return tree
-
-    monkeypatch.setattr(sql_analysis2, "annotate_types", record)
-
+    path = tmp_path / "x.sql"
+    path.write_text(sql)
     model = Model(
         name="x",
-        file=SqlFile(path=Path("x.sql"), relative_path="x.sql", mtime=0.0, content_hash=""),
+        file=SqlFile(path=path, relative_path="x.sql", mtime=0.0, content_hash=""),
     )
-    sql_analysis2._check_statement(  # pyright: ignore[reportPrivateUsage]
-        sqlglot.parse_one(sql, read=DIALECT),
-        declared,
-        DIALECT,
-        expression_metadata(DIALECT),
-        model,
-        SourceDoc(path=Path("x.sql"), text=sql),
-        Positions(sql),
-        warn_on_column_without_source,
-    )
-    return capsys.readouterr().out.splitlines(), reached_annotation
+    return qualify_one_model(model, declared, DIALECT, warn_on_column_without_source)
 
 
-def test_an_ambiguous_column_stops_the_statement(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_an_ambiguous_column_stops_the_statement(tmp_path: Path) -> None:
     """Committing to either source would hand `qualify` an attribution as likely wrong as
     right, and every type inferred downstream would inherit the choice."""
-    output, reached_annotation = check_one_statement(
+    result = qualify_one_statement(
         JOINED_TO_A_CTE.format(selection="name"),
         {"test": {"id": "varchar(20)", "name": "varchar(20)"}},
-        monkeypatch,
-        capsys,
+        tmp_path,
     )
-    assert any(line.startswith("error: x.sql:") and "ambiguous" in line for line in output)
-    assert not reached_annotation
+    assert [finding.code for finding in result.findings] == ["ambiguous-column"]
+    assert result.has_errors
+    assert result.statement is None
 
 
-def test_a_guessed_column_does_not_stop_the_statement(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    output, reached_annotation = check_one_statement(
-        JOINED_TO_A_CTE.format(selection="name"), {}, monkeypatch, capsys
+def test_a_guessed_column_does_not_stop_the_statement(tmp_path: Path) -> None:
+    result = qualify_one_statement(
+        JOINED_TO_A_CTE.format(selection="name"), {}, tmp_path
     )
-    assert any(line.startswith("warning: x.sql:") for line in output)
-    assert reached_annotation
+    assert [finding.severity for finding in result.findings] == ["warning"]
+    assert not result.has_errors
+    assert result.statement is not None
 
 
-def test_the_guess_warning_can_be_switched_off(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    output, reached_annotation = check_one_statement(
+def test_the_guess_warning_can_be_switched_off(tmp_path: Path) -> None:
+    result = qualify_one_statement(
         JOINED_TO_A_CTE.format(selection="name"),
         {},
-        monkeypatch,
-        capsys,
+        tmp_path,
         warn_on_column_without_source=False,
     )
-    assert output == []
-    assert reached_annotation
+    assert result.findings == []
+    assert result.statement is not None
+
+
+def test_a_file_holding_two_statements_is_reported(tmp_path: Path) -> None:
+    """A model is one projection, so two statements have no single answer to what the
+    model produces. Checking the last one and calling it the model's schema described the
+    wrong thing silently."""
+    result = qualify_one_statement(
+        "select id from test; select id from test;", {}, tmp_path
+    )
+    assert result.statement is None
+    assert result.has_errors
+    assert "2 statements" in result.errors[0]
+
+
+def test_a_file_that_does_not_parse_is_reported(tmp_path: Path) -> None:
+    result = qualify_one_statement("select from from", {}, tmp_path)
+    assert result.statement is None
+    assert result.has_errors
 
 
 def test_an_ambiguous_column_keeps_its_source_position() -> None:
@@ -616,13 +611,14 @@ def test_an_ambiguous_column_keeps_its_source_position() -> None:
 
 # ------------------------------------------------------------- schema fabrication
 def test_declared_types_fill_in_and_gaps_become_unknown() -> None:
-    declared = {"test": {"id": "varchar(20)", "unused": "int"}}
+    declared = {"test": {"id": "varchar(20)"}}
     fabricated = get_declared_types_per_table(
         declared,
         {
             "test": parsed(["id", "modified_at"]),
             "other": parsed(["fk"]),
         },
+        {"test", "other"},
     )
     assert fabricated == {
         "test": {"id": "varchar(20)", "modified_at": "UNKNOWN"},
@@ -630,35 +626,63 @@ def test_declared_types_fill_in_and_gaps_become_unknown() -> None:
     }
 
 
-def test_fabricated_schema_only_covers_columns_the_sql_reads() -> None:
-    """A declared column the SQL never mentions stays out of the schema: the schema
-    exists to make `qualify` resolve what is written, not to mirror the declaration."""
+def test_fabricated_schema_covers_declared_columns_the_sql_never_names() -> None:
+    """A star names no column, so a schema holding only the harvested ones leaves the
+    table empty and `select *` survives step 3 unexpanded."""
     fabricated = get_declared_types_per_table(
-        {"test": {"id": "int", "never_selected": "int"}}, {"test": parsed(["id"])}
+        {"test": {"id": "int", "never_selected": "int"}}, {"test": parsed(["id"])}, {"test"}
     )
-    assert fabricated == {"test": {"id": "int"}}
+    assert fabricated == {"test": {"id": "int", "never_selected": "int"}}
+
+
+def test_a_table_with_nothing_known_about_it_stays_out_of_the_schema() -> None:
+    """Declaring it empty would turn every read of it into an error, where the truth is
+    that nobody can enumerate it."""
+    fabricated = get_declared_types_per_table({}, {}, {"undeclared"})
+    assert fabricated == {}
+
+
+def qualified_projection_names(
+    sql: str, declared: dict[TableName, dict[ColumnName, ColumnTypeName]]
+) -> list[str]:
+    """Steps 2 and 3 by hand, reporting what the statement ends up projecting."""
+    statement = sqlglot.parse_one(sql, read=DIALECT)
+    resolved = resolve_columns_to_source_tables(statement, DIALECT)
+    fabricated = get_declared_types_per_table(
+        declared, resolved.columns_per_table, resolved.source_table_names
+    )
+    schema = ensure_schema(cast("dict[str, object]", fabricated), dialect=DIALECT)
+
+    qualified = qualify(statement, schema=schema, dialect=DIALECT)
+
+    assert isinstance(qualified, exp.Select)
+    return [projection.alias_or_name for projection in qualified.selects]
 
 
 def test_fabricated_schema_lets_qualify_succeed() -> None:
     """End to end: the point of all of the above is that `qualify` stops raising."""
-    from sqlglot.optimizer.qualify import qualify
-    from sqlglot.schema import ensure_schema
-
     sql = """
     with src as (select test_id, name from mydatabase.myschema.table_in_cte)
     select id, test.name, modified_at
     from mydatabase.myschema.test
     inner join src on test.id = src.test_id
     """
-    statement = sqlglot.parse_one(sql, read=DIALECT)
-    resolved = resolve_columns_to_source_tables(statement, DIALECT)
-    fabricated = get_declared_types_per_table(
-        {"test": {"id": "varchar(20)"}}, resolved.columns_per_table
+    assert set(qualified_projection_names(sql, {"test": {"id": "varchar(20)"}})) == {
+        "id",
+        "name",
+        "modified_at",
+    }
+
+
+def test_a_star_expands_against_the_declared_columns() -> None:
+    """The whole reason the schema carries declared columns the SQL never names."""
+    names = qualified_projection_names(
+        "select * from test", {"test": {"id": "int", "name": "varchar(20)"}}
     )
-    schema = ensure_schema(fabricated, dialect=DIALECT)
+    assert names == ["id", "name"]
 
-    qualified = qualify(statement, schema=schema, dialect=DIALECT)
 
-    assert {
-        projection.alias_or_name for projection in qualified.selects
-    } == {"id", "name", "modified_at"}
+def test_a_star_over_an_undeclared_table_stays_a_star() -> None:
+    """Nothing can enumerate it, so step 3 leaves the star alone rather than inventing a
+    projection list. This is the undeclared path the design keeps first-class."""
+    assert qualified_projection_names("select * from test", {}) == ["*"]

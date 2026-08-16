@@ -6,7 +6,7 @@ Every fixture here is an inline SQL string, per `tests/README.md`.
 import pytest
 import sqlglot
 
-from sqlr.sql_analysis2 import resolve_columns_to_source_tables
+from sqlr.sql_analysis2.resolve import resolve_columns_to_source_tables
 from sqlr.sql_analysis2.reporting import (
     ColumnFinding,
     findings_for_ambiguous_columns,

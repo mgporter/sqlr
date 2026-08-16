@@ -12,7 +12,6 @@ from sqlr.declared import (
     check_sql_file_links,
     ignored_models_warning,
     load_declared_schemas,
-    near_miss_warnings,
 )
 from sqlr.declared.types import DeclaredSchemas
 from sqlr.schema_resolution import resolve_schema
@@ -26,11 +25,8 @@ from sqlr.selection import (
 )
 from sqlr.selection.types import ModelIndex
 from sqlr.sql_analysis import analyze_file
-from sqlr.validation import render_errors, render_validation, validate_schema
-from sqlr.validation.types import StatementValidation
-
-
-from sqlr.sql_analysis2 import validate_schema
+from sqlr.sql_analysis2 import any_model_has_errors, qualify_schema, validate_schema
+from sqlr.sql_analysis2.render import print_qualification
 
 app = typer.Typer(no_args_is_help=True)
 logger = logging.getLogger("sqlr")
@@ -85,6 +81,46 @@ def infer_schema(
 
 
 @app.command(
+    "qualify-schema",
+    context_settings={"allow_extra_args": True},
+)
+def qualify(
+    ctx: typer.Context,
+    select: list[str] = typer.Option(
+        [],
+        "--select",
+        "-s",
+        help="Model names to operate on, e.g. `--select orders customers`. "
+        "Omit to operate on every model.",
+    ),
+    project_dir: Path | None = typer.Option(
+        None, "--project-dir", help="Path to the root of the project."
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Enable debug logging."
+    ),
+) -> None:
+    """Resolve every column in the selected models to the source it reads from.
+
+    The first half of `validate-schema`, on its own: stars are expanded and every column
+    is attributed, but nothing is typed and nothing is compared against a declaration.
+
+    Exits non-zero when a column cannot be attributed at all.
+    """
+    _configure_logging(verbose)
+
+    root, cfg = _load_project(project_dir)
+    index, models = _select(root, cfg, [*select, *ctx.args])
+    declared = _load_declarations(root, index)
+
+    qualified = qualify_schema(cfg, declared, models)
+    print_qualification(qualified)
+
+    if any_model_has_errors(qualified):
+        raise typer.Exit(code=1)
+
+
+@app.command(
     "validate-schema",
     context_settings={"allow_extra_args": True},
 )
@@ -103,11 +139,10 @@ def validate(
     verbose: bool = typer.Option(
         False, "--verbose", "-v", help="Enable debug logging."
     ),
-    output_format: str = typer.Option(
-        "table", "--format", help="Validation output format: table or json."
-    ),
 ) -> None:
-    """Infer the schema of the selected models and check it against what they declare.
+    """Type every expression in the selected models and check it against what they declare.
+
+    Runs `qualify-schema`'s resolution first, then annotates types on top of it.
 
     Exits non-zero when a column's inferred and declared types cannot both be true.
     """
@@ -121,44 +156,9 @@ def validate(
     # report whichever of the two happened to be read first as though it were the rule.
     declared = _load_declarations(root, index)
 
-    validate_schema(cfg, declared, models)
+    results = validate_schema(cfg, declared, models)
 
-
-
-    return
-
-    analyzed = _analyze(cfg, models)
-
-    # Near misses are a property of the run, not of one file: the declaration a reference
-    # was meant to reach can sit in any yml, and whether anything else uses it is only
-    # knowable once every selected model has been read.
-    relations = [table.name for _, schema in analyzed for table in schema.tables]
-    for warning in near_miss_warnings(declared, relations):
-        typer.echo(f"warning: {warning}", err=True)
-
-    validations: list[StatementValidation] = [
-        validate_schema(schema, declared, model.path) for model, schema in analyzed
-    ]
-
-    if output_format == "json":
-        typer.echo(
-            json.dumps(
-                [validation.model_dump(mode="json") for validation in validations],
-                indent=2,
-            )
-        )
-    else:
-        console = Console()
-        for validation in validations:
-            console.print(render_validation(validation), new_line_start=True)
-
-        # Errors go last, after every model's table, so the summary is the last thing on
-        # screen rather than buried above the grids it refers to.
-        errors = render_errors(validations)
-        if errors is not None:
-            console.print(errors, new_line_start=True)
-
-    if any(validation.has_errors for validation in validations):
+    if any_model_has_errors(results):
         raise typer.Exit(code=1)
 
 
