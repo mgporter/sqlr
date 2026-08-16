@@ -21,11 +21,14 @@ from rich.text import Text
 from sqlr.sql_analysis2.qualify import (
     ColumnQualifierOrigin,
     ColumnReference,
+    ColumnSource,
+    ProjectedColumn,
     QualifiedModel,
     ScopeColumns,
-    column_references_per_scope,
+    columns_per_scope,
 )
 from sqlr.sql_analysis2.reporting import ColumnFinding
+from sqlr.sql_analysis2.types import TableName
 
 __all__ = ["print_qualification", "render_qualification"]
 
@@ -53,7 +56,7 @@ def render_qualification(result: QualifiedModel) -> RenderableType:
         blocks.append(Text("not qualified", style=_UNKNOWN))
         return Group(*blocks)
 
-    scopes = column_references_per_scope(result.statement)
+    scopes = columns_per_scope(result.statement)
     if not scopes:
         blocks.append(Text("no columns read", style=_UNKNOWN))
         return Group(*blocks)
@@ -93,13 +96,13 @@ def _scope_blocks(scope: ScopeColumns) -> list[RenderableType]:
 
     blocks: list[RenderableType] = [Text(), title]
     if scope.projected:
-        blocks.append(_column_table("projected", scope.projected))
+        blocks.append(_projected_table(scope.projected))
     if scope.non_projected:
-        blocks.append(_column_table("non-projected", scope.non_projected))
+        blocks.append(_non_projected_table(scope.non_projected))
     return blocks
 
 
-def _column_table(section: str, columns: list[ColumnReference]) -> RenderableType:
+def _grid(section: str) -> Table:
     grid = Table(
         title=Text(section, style="bold"),
         title_justify="left",
@@ -112,30 +115,56 @@ def _column_table(section: str, columns: list[ColumnReference]) -> RenderableTyp
     grid.add_column("source", overflow="fold")
     grid.add_column("qualifier")
     grid.add_column("declared")
+    return grid
 
+
+def _projected_table(columns: list[ProjectedColumn]) -> RenderableType:
+    """The scope's output schema, in projection order."""
+    grid = _grid("projected")
     for column in columns:
+        name = Text(column.name)
+        if column.engine_named:
+            # The name is the dialect's rule applied to an unnamed projection, not
+            # something in the file. A reader quoting it downstream should know that.
+            name.append("  (engine-named)", style=_UNKNOWN)
         grid.add_row(
-            Text(column.name),
-            _source_cell(column),
+            name,
+            _sources_cell([read.source for read in column.reads]),
             Text(column.origin, style=_ORIGIN_STYLE[column.origin]),
             Text("declared") if column.declared else Text("-", style=_UNKNOWN),
         )
     return Padding(grid, (0, 0, 0, 2))
 
 
-def _source_cell(column: ColumnReference) -> Text:
-    """The alias the column carries, plus whatever the alias is hiding.
+def _non_projected_table(columns: list[ColumnReference]) -> RenderableType:
+    grid = _grid("non-projected")
+    for column in columns:
+        grid.add_row(
+            Text(column.name),
+            _sources_cell([column.source]),
+            Text(column.origin, style=_ORIGIN_STYLE[column.origin]),
+            Text("declared") if column.declared else Text("-", style=_UNKNOWN),
+        )
+    return Padding(grid, (0, 0, 0, 2))
 
-    An alias that is also the table name says everything already; one that is not hides
-    the relation the reader is looking for, and a CTE alias hides that it is not a table
-    at all.
+
+def _sources_cell(sources: list[ColumnSource]) -> Text:
+    """Every relation the column reads, deduplicated, or `-` when it reads none.
+
+    `1 + 1` reads nothing and gets the dash; `a.x + b.y` reads two and names both, because
+    the column depends on both relations and a single answer would have to pick one.
     """
-    if not column.source_alias:
-        return Text("-", style=_UNKNOWN)
-
-    text = Text(column.source_alias)
-    if column.source_name is not None:
-        text.append(f" ({column.source_name})", style=_UNKNOWN)
-    elif column.source_kind != "table":
-        text.append(f" ({column.source_kind})", style=_UNKNOWN)
-    return text
+    text = Text()
+    seen: set[TableName] = set()
+    for source in sources:
+        if not source.alias or source.alias in seen:
+            continue
+        seen.add(source.alias)
+        if text:
+            text.append(", ", style=_UNKNOWN)
+        text.append(source.alias)
+        if source.name is not None:
+            text.append(f" ({source.name})", style=_UNKNOWN)
+        elif source.kind != "table":
+            text.append(f" ({source.kind})", style=_UNKNOWN)
+    return text if text else Text("-", style=_UNKNOWN)

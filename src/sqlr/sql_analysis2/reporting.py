@@ -14,8 +14,11 @@ from sqlr.sql_analysis2.types import (
     AmbiguousColumn,
     ColumnName,
     ColumnTypeName,
+    DuplicateProjection,
     GuessedColumn,
     ParsedColumn,
+    ProjectionSite,
+    ScopeKind,
     TableName,
 )
 from sqlr.typemap import resolve_type_name
@@ -26,6 +29,7 @@ type FindingCode = Literal[
     "structured-column-declared-scalar",
     "ambiguous-column",
     "column-without-source",
+    "duplicate-projected-column",
 ]
 
 type FindingSeverity = Literal["error", "warning"]
@@ -165,6 +169,52 @@ def findings_for_columns_read_with_unsupported_dot_notation(
         )
         for column in columns
     ]
+
+
+def _describe_scope(name: str, kind: ScopeKind) -> str:
+    """`CTE 'src'`, `the final projection` - a scope named the way a reader would say it."""
+    if kind == "final":
+        return "the final projection"
+    if kind == "branch":
+        return "a set operation branch"
+    return f"{'CTE' if kind == 'cte' else 'derived table'} '{name}'"
+
+
+def _describe_projection_site(site: ProjectionSite) -> str:
+    """How one projection came to carry the name, and where to look for it."""
+    if site.from_star:
+        return f"expanded from the '*' at {site.span}" if site.span else "expanded from a '*'"
+    return f"written at {site.span}" if site.span else "written"
+
+
+def findings_for_duplicate_projected_columns(
+    duplicates: list[DuplicateProjection],
+) -> list[ColumnFinding]:
+    """A scope projecting one name twice - usually a star overlapping written columns.
+
+    The span points at a written occurrence when there is one, because that is the half a
+    user can delete; a pair of star-expanded duplicates has only the stars to point at.
+    Either way the message lists every site, since fixing it means knowing which two
+    projections collided.
+    """
+    findings: list[ColumnFinding] = []
+    for scope_name, scope_kind, column_name, sites in duplicates:
+        written = [site for site in sites if not site.from_star and site.span is not None]
+        located = written or [site for site in sites if site.span is not None]
+        findings.append(
+            ColumnFinding(
+                code="duplicate-projected-column",
+                column_name=column_name,
+                message=(
+                    f"column '{column_name}' is projected {len(sites)} times by "
+                    f"{_describe_scope(scope_name, scope_kind)} "
+                    f"({', '.join(_describe_projection_site(site) for site in sites)}); "
+                    "a relation cannot have two columns with the same name"
+                ),
+                span=located[0].span if located else None,
+            )
+        )
+    return findings
 
 
 def findings_for_columns_declared_as_scalar_but_read_as_structured(

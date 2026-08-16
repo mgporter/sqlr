@@ -14,7 +14,11 @@ from sqlglot.schema import ensure_schema
 
 from sqlr.catalog.types import SqlFile
 from sqlr.selection.types import Model
-from sqlr.sql_analysis2.qualify import QualifiedModel, qualify_one_model
+from sqlr.sql_analysis2.qualify import (
+    QualifiedModel,
+    columns_per_scope,
+    qualify_one_model,
+)
 from sqlr.sql_analysis2.resolve import (
     get_declared_types_per_table,
     resolve_columns_to_source_tables,
@@ -532,6 +536,7 @@ def qualify_one_statement(
     declared: dict[TableName, dict[ColumnName, ColumnTypeName]],
     tmp_path: Path,
     warn_on_column_without_source: bool = True,
+    dialect_name: str = DIALECT,
 ) -> QualifiedModel:
     """Run steps 1-3 over one file.
 
@@ -544,7 +549,9 @@ def qualify_one_statement(
         name="x",
         file=SqlFile(path=path, relative_path="x.sql", mtime=0.0, content_hash=""),
     )
-    return qualify_one_model(model, declared, DIALECT, warn_on_column_without_source)
+    return qualify_one_model(
+        model, declared, dialect_name, warn_on_column_without_source
+    )
 
 
 def test_an_ambiguous_column_stops_the_statement(tmp_path: Path) -> None:
@@ -686,3 +693,268 @@ def test_a_star_over_an_undeclared_table_stays_a_star() -> None:
     """Nothing can enumerate it, so step 3 leaves the star alone rather than inventing a
     projection list. This is the undeclared path the design keeps first-class."""
     assert qualified_projection_names("select * from test", {}) == ["*"]
+
+
+# --------------------------------------------------- what each scope reads, per bucket
+TEST_COLUMNS = {"test": {"id": "int", "name": "varchar(20)", "status": "varchar(20)"}}
+
+
+def scope_buckets(
+    sql: str, tmp_path: Path
+) -> dict[str, tuple[list[tuple[str, str]], list[tuple[str, str]]]]:
+    """Each scope's output schema and its other reads, as `(name, origin)` pairs."""
+    result = qualify_one_statement(sql, TEST_COLUMNS, tmp_path)
+    assert result.statement is not None, result.findings
+    return {
+        scope.name: (
+            [(column.name, column.origin) for column in scope.projected],
+            [(column.name, column.origin) for column in scope.non_projected],
+        )
+        for scope in columns_per_scope(result.statement)
+    }
+
+
+def test_a_projected_column_is_never_also_reported_as_non_projected(
+    tmp_path: Path,
+) -> None:
+    """The two lists are disjoint in the result itself, not only in the printed table:
+    a downstream pass reading them as two sets must not have to subtract one from the
+    other."""
+    projected, non_projected = scope_buckets(
+        "select test.id from test where test.id > 0", tmp_path
+    )["<final>"]
+    assert projected == [("id", "written")]
+    assert non_projected == []
+
+
+def test_a_projected_column_keeps_the_origin_it_was_projected_by(tmp_path: Path) -> None:
+    """`select * from t where t.id > 0` projects `id` by expanding the star. The written
+    read in the WHERE does not change where the projection came from."""
+    projected, non_projected = scope_buckets(
+        "select * from test where test.id > 0", tmp_path
+    )["<final>"]
+    assert ("id", "star") in projected
+    assert non_projected == []
+
+
+def test_a_computed_column_is_a_separate_output_from_the_column_it_reads(
+    tmp_path: Path,
+) -> None:
+    """`upper(name) as loud` and the `name` a star also projects are two columns of the
+    relation. Collapsing them onto the name they share loses one output entirely."""
+    projected, _ = scope_buckets(
+        "select test.*, upper(test.name) as loud from test", tmp_path
+    )["<final>"]
+    assert projected == [
+        ("id", "star"),
+        ("name", "star"),
+        ("status", "star"),
+        ("loud", "written"),
+    ]
+
+
+def test_a_column_only_read_in_a_filter_is_non_projected(tmp_path: Path) -> None:
+    projected, non_projected = scope_buckets(
+        "select test.id from test where status = 'x'", tmp_path
+    )["<final>"]
+    assert projected == [("id", "written")]
+    assert non_projected == [("status", "inferred")]
+
+
+def test_the_same_name_from_two_sources_stays_two_columns(tmp_path: Path) -> None:
+    """Identity is `(name, source)`, so a projected `a.id` does not swallow a filter on
+    `b.id`."""
+    sql = """
+    with src as (select id from mydatabase.myschema.other)
+    select test.id from mydatabase.myschema.test
+    inner join src on test.id = src.id
+    where src.id > 0
+    """
+    projected, non_projected = scope_buckets(sql, tmp_path)["<final>"]
+    assert [name for name, _ in projected] == ["id"]
+    assert [name for name, _ in non_projected] == ["id"]
+
+
+# ------------------------------------------------------------ duplicate projections
+def duplicate_messages(sql: str, tmp_path: Path) -> list[str]:
+    result = qualify_one_statement(sql, TEST_COLUMNS, tmp_path)
+    return [
+        finding.message
+        for finding in result.findings
+        if finding.code == "duplicate-projected-column"
+    ]
+
+
+def test_a_star_overlapping_a_written_column_is_an_error(tmp_path: Path) -> None:
+    """The projection list is impossible, and sqlglot will not say so - it quietly stops
+    expanding stars over the broken relation several scopes away instead."""
+    result = qualify_one_statement("select id, * from test", TEST_COLUMNS, tmp_path)
+    assert result.statement is None
+    assert result.has_errors
+    (message,) = [
+        finding.message
+        for finding in result.findings
+        if finding.code == "duplicate-projected-column"
+    ]
+    assert "'id' is projected 2 times" in message
+    assert "written at 1:8" in message
+    assert "expanded from the '*' at 1:12" in message
+
+
+def test_a_duplicate_written_without_any_star_is_an_error(tmp_path: Path) -> None:
+    (message,) = duplicate_messages("select id, name as id from test", tmp_path)
+    assert "written at 1:8" in message
+    assert "written at 1:12" in message
+    assert "'*'" not in message
+
+
+def test_two_stars_are_each_blamed_for_their_own_column(tmp_path: Path) -> None:
+    """`select a.*, b.*` collides on every name, and the message has to say which star
+    produced which half or there is nothing to act on."""
+    sql = """
+    select a.*, b.*
+    from mydatabase.myschema.test as a
+    inner join mydatabase.myschema.test as b on a.id = b.id
+    """
+    messages = duplicate_messages(sql, tmp_path)
+    assert len(messages) == 3
+    assert all(
+        "expanded from the '*' at 2:12, expanded from the '*' at 2:17" in message
+        for message in messages
+    )
+
+
+def test_a_duplicate_inside_a_cte_names_the_cte(tmp_path: Path) -> None:
+    sql = """
+    with src as (select id, name as id from mydatabase.myschema.test)
+    select src.id from src
+    """
+    (message,) = duplicate_messages(sql, tmp_path)
+    assert "CTE 'src'" in message
+
+
+def test_two_unexpanded_stars_are_not_a_duplicate(tmp_path: Path) -> None:
+    """Both projections are named `*` because neither table can be enumerated - nothing
+    declares them and the SQL names no column of either. They are one unexpanded star
+    each, not two columns in collision."""
+    sql = """
+    select a.*, b.*
+    from mydatabase.myschema.undeclared as a
+    cross join mydatabase.myschema.also_undeclared as b
+    """
+    assert duplicate_messages(sql, tmp_path) == []
+
+
+def test_distinct_projection_names_are_not_a_duplicate(tmp_path: Path) -> None:
+    assert duplicate_messages("select id, name from test", tmp_path) == []
+
+
+# ------------------------------------------------- output names and output schema
+def projected_columns(sql: str, tmp_path: Path, dialect: str = DIALECT) -> list[str]:
+    """The final scope's output schema, as the names a downstream reference must quote."""
+    result = qualify_one_statement(sql, TEST_COLUMNS, tmp_path, dialect_name=dialect)
+    assert result.statement is not None, (result.errors, result.findings)
+    scopes = columns_per_scope(result.statement)
+    return [column.name for column in scopes[-1].projected]
+
+
+def test_an_aliased_expression_survives_beside_the_column_it_reads(
+    tmp_path: Path,
+) -> None:
+    """The projected list is the scope's *schema*, so it is keyed by output name. Keying
+    it by the underlying column would drop `first_name_upper` on the floor."""
+    sql = """
+    with src as (select id, first_name, last_name from mydatabase.myschema.test)
+    select *, upper(first_name) as first_name_upper from src
+    """
+    assert projected_columns(sql, tmp_path) == [
+        "id",
+        "first_name",
+        "last_name",
+        "first_name_upper",
+    ]
+
+
+def test_an_unaliased_expression_is_named_the_way_the_engine_names_it(
+    tmp_path: Path,
+) -> None:
+    """sqlglot labels it `_col_1`, which no engine produces. DuckDB echoes the text as
+    written, so that is what a downstream reference has to quote."""
+    assert projected_columns("select upper(name) from test", tmp_path) == ["upper(name)"]
+
+
+def test_snowflake_folds_the_derived_name(tmp_path: Path) -> None:
+    """The name is case-sensitive, and Snowflake folds it like any unquoted identifier."""
+    names = projected_columns("select upper(name) from test", tmp_path, "snowflake")
+    assert names == ["UPPER(NAME)"]
+
+
+def test_postgres_names_a_derived_column_after_its_function(tmp_path: Path) -> None:
+    names = projected_columns("select upper(name), id + 1 from test", tmp_path, "postgres")
+    assert names == ["upper", "?column?"]
+
+
+def test_two_postgres_unnamed_columns_are_not_a_duplicate(tmp_path: Path) -> None:
+    """`?column?` is Postgres declining to name the projection, not a name. It returns two
+    of them side by side and only objects when something references one."""
+    result = qualify_one_statement(
+        "select id + 1, id + 2 from test", TEST_COLUMNS, tmp_path, dialect_name="postgres"
+    )
+    assert result.statement is not None
+    assert result.findings == []
+
+
+def test_a_derived_name_still_collides_with_a_written_one(tmp_path: Path) -> None:
+    """The duplicate check reads the same names, so an alias colliding with a derived name
+    is caught even though sqlglot called one of them `_col_1`."""
+    result = qualify_one_statement(
+        "select upper(name), id as 'upper(name)' from test", TEST_COLUMNS, tmp_path
+    )
+    assert result.statement is None
+    assert [finding.code for finding in result.findings] == ["duplicate-projected-column"]
+
+
+def test_a_projection_reading_two_sources_reports_both(tmp_path: Path) -> None:
+    sql = """
+    select a.id + b.id as total
+    from mydatabase.myschema.test as a
+    inner join mydatabase.myschema.other as b on a.id = b.id
+    """
+    result = qualify_one_statement(sql, TEST_COLUMNS, tmp_path)
+    assert result.statement is not None
+    (total,) = [
+        column
+        for column in columns_per_scope(result.statement)[-1].projected
+        if column.name == "total"
+    ]
+    assert sorted(read.source.alias for read in total.reads) == ["a", "b"]
+    assert total.column is None
+
+
+def test_a_projection_reading_no_column_reports_no_source(tmp_path: Path) -> None:
+    result = qualify_one_statement("select 1 + 1 from test", TEST_COLUMNS, tmp_path)
+    assert result.statement is not None
+    (only,) = columns_per_scope(result.statement)[-1].projected
+    assert only.reads == []
+    assert only.engine_named
+
+
+def test_a_renamed_column_is_still_that_column(tmp_path: Path) -> None:
+    """`select test.id as ident ... where test.id > 0` reads one column and projects it
+    renamed, so the filter read adds nothing new."""
+    projected, non_projected = scope_buckets(
+        "select test.id as ident from test where test.id > 0", tmp_path
+    )["<final>"]
+    assert projected == [("ident", "written")]
+    assert non_projected == []
+
+
+def test_a_column_read_only_inside_an_expression_stays_non_projected(
+    tmp_path: Path,
+) -> None:
+    """No output column is named `status`, so the filter read is still worth reporting."""
+    projected, non_projected = scope_buckets(
+        "select upper(test.status) as loud from test where test.status > 'a'", tmp_path
+    )["<final>"]
+    assert projected == [("loud", "written")]
+    assert non_projected == [("status", "written")]

@@ -8,9 +8,20 @@ from typing import Literal, NamedTuple
 
 from sqlglot import exp
 
+from sqlr.sql_analysis2.sourcedoc import SourceSpan
+
 type TableName = str
 type ColumnName = str
 type ColumnTypeName = str
+
+type ScopeKind = Literal["cte", "derived", "final", "branch"]
+"""What a scope is, for a reader looking at a report.
+
+- `cte`     - a named `WITH` term.
+- `derived` - a subquery in a FROM or JOIN, named by its alias.
+- `final`   - the statement's own projection, the one the model is.
+- `branch`  - one arm of a set operation, or a scope with no name of its own.
+"""
 
 type StructuredAccessKind = Literal["dot_field", "bracket_key", "bracket_index"]
 """How a column was read into, at the *first* level only.
@@ -75,6 +86,31 @@ class GuessedColumn(NamedTuple):
     """The source the column was credited to."""
     open_sources: list[TableName]
     """Sources whose column set is unknown, sorted - the reason this is a guess."""
+
+
+class ProjectionSite(NamedTuple):
+    """One place a scope's projection list produces an output column."""
+
+    from_star: bool
+    span: SourceSpan | None
+    """The text responsible for the projection: the projection itself when it was written
+    out, and the `*` it came from when it was not. None when neither can be located."""
+
+
+class DuplicateProjection(NamedTuple):
+    """One output name a scope projects more than once.
+
+    Impossible SQL: a relation has one column per name, so nothing downstream can say
+    which of the two a later reference means. sqlglot does not raise on it - it simply
+    stops expanding stars over the relation, which turns the mistake into a silently
+    empty projection several scopes away.
+    """
+
+    scope_name: str
+    scope_kind: ScopeKind
+    column_name: ColumnName
+    sites: list[ProjectionSite]
+    """Every projection carrying the name, in projection-list order."""
 
 
 class ResolvedColumns(NamedTuple):
