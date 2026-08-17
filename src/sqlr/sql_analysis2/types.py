@@ -23,6 +23,40 @@ type ScopeKind = Literal["cte", "derived", "final", "branch"]
 - `branch`  - one arm of a set operation, or a scope with no name of its own.
 """
 
+type ArgumentIndex = int
+"""A zero-based position in a call's argument list, in sqlglot's node order. Reported to
+the user one-based, because that is how a person counts arguments."""
+
+type PredicateOperator = Literal[
+    "=",
+    "!=",
+    ">",
+    "<",
+    ">=",
+    "<=",
+    "in",
+    "not_in",
+    "like",
+    "ilike",
+    "between",
+    "is_null",
+    "is_not_null",
+]
+
+type LiteralKind = Literal["int", "float", "string", "boolean", "mixed"]
+"""The one kind every literal in a predicate shares, or `mixed`. Coarser than a type on
+purpose: it describes what was *written*, which is what fixture generation reproduces."""
+
+type NullabilityReason = Literal[
+    "is_null_predicate",
+    "is_not_null_predicate",
+    "coalesce_argument",
+    "outer_join_padded",
+    "inner_join_key",
+]
+
+type CardinalityKind = Literal["group_by", "distinct", "partition_by", "window_order_by"]
+
 type StructuredAccessKind = Literal["dot_field", "bracket_key", "bracket_index"]
 """How a column was read into, at the *first* level only.
 

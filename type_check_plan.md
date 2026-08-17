@@ -1005,3 +1005,194 @@ Per the existing rule in `tests/README.md`, all fixtures live with the tests. No
 | Q7 | Which tree does `build_graph` receive? | 3 | the fully-qualified one; **highest-risk integration point** |
 | Q8 | Backward evidence through sqlr's weighting? | 5 | yes, not `setdefault` |
 | Q9 | Diagnostic codes and which sink | 7 | F001–F003 → `diagnostics`; contradictions → `validation` |
+
+---
+
+# Revision — facts as the single mechanism
+
+Status: **agreed, being implemented.** Everything above still describes the pipeline
+correctly; this section replaces the *shape* of steps 5 and 7, and moves fact extraction.
+Where the two disagree, this section wins.
+
+## The one rule
+
+> **A fact is a claim about a value. A claim contradicted by that value's actual type is an
+> error; a claim about a value with no type at all is the inference.**
+
+The checker does not care whether `node.type` came from a declaration, from a CTE's
+computed projection, or from an earlier inference. That is what makes "declared is the
+source of truth" a property of the *data* rather than a branch in the code.
+
+### What this replaces
+
+The plan above had two mechanisms doing one job. Step 5 read the catalog backwards to
+produce evidence, and step 7 read the tree forwards to produce F003 — the same
+argument-position knowledge, walked twice, reported in two vocabularies. `round(status, 2)`
+with `status` declared `varchar` produced an F003 finding *and* a contradiction, at the same
+span, in different words.
+
+They are now one walk. Step 5's `backward_evidence` and F003 both disappear into
+`extract_facts_from_annotated_tree`.
+
+### Declared vs undeclared, stated as data
+
+| Column | `node.type` after step 4 | What a fact does to it |
+|---|---|---|
+| declared in `sources.yml` | the declared type | contradiction → **error at the usage site** |
+| produced by a CTE | computed bottom-up by sqlglot | contradiction → **error at the usage site** |
+| undeclared source column | `UNKNOWN` | claims collected → **inference**, or conflict → error |
+
+There is never an inferred-vs-declared comparison. A declaration is not a hypothesis to be
+checked against the SQL; it is the type, and the SQL either agrees with it or is wrong.
+
+## Two fact shapes
+
+**Claim** — *this node must be family F.* `upper(x)` arg 0, `where x`, `x * 2`.
+
+**Link** — *these two nodes share a domain.* No family named. When one end has a type and
+the other is UNKNOWN, the type crosses. `a.x > b.y`, `coalesce(a, b)`, a UNION's arms.
+
+A fact's subject is a **node**, with a column as an optional attachment:
+
+```python
+class ValueSite(NamedTuple):
+    node: exp.Expr
+    column: ColumnReference | None   # the case inference and generation care about
+    span: SourceSpan | None
+```
+
+Keying a fact on a column instead would mean `round(upper(x))` — no column anywhere — is
+reported by different code from `round(x)`, for the same defect. The column is what a fact
+*lands on*, not what it is about.
+
+## Operators are catalog entries
+
+Comparisons, arithmetic and `coalesce` are not three hand-written tables. They are
+overloaded signatures, and every rule falls out of `pick_overload`:
+
+```
+"+":  (NUMERIC, NUMERIC) -> @arg0 | (TEMPORAL, NUMERIC) -> @arg0 | (TEMPORAL, INTERVAL) -> @arg0
+"*":  (NUMERIC, NUMERIC) -> @arg0
+"=":  (@T, @T) -> BOOLEAN
+```
+
+`@T` is a type variable: it accepts anything, and two positions sharing one variable are a
+link.
+
+| Situation | Falls out as |
+|---|---|
+| a position no candidate overload leaves open | **claim**, carrying *every* family any candidate accepts there |
+| every overload binds two positions to one type variable | **link** |
+| any candidate accepts `ANY` at a position | **nothing** — a claim that cannot be contradicted is not a claim |
+
+**A claim names a set of families, not one.** DuckDB's `*` takes `(NUMERIC, NUMERIC)` and
+`(INTERVAL, NUMERIC)`, so `x * 2` says *numeric or interval* and nothing narrower. The two
+readings of a claim respect that asymmetrically, and both have to:
+
+- a **contradiction** needs the value to be in **no** family — so `interval '1 day' * 3` is
+  silent and `'abc' * 3` is reported.
+- an **inference** needs exactly **one** family to choose from — so `x * 2` types nothing.
+  Picking one of two would be the coin-flip this whole design exists to avoid.
+
+This is why there is no separate "no overload survived" branch, and no F003: `round('x', 2)`
+contradicts `{NUMERIC}` and `'abc' + 5` contradicts `{NUMERIC, TEMPORAL, INTERVAL}` by the
+same test. An earlier draft of this section claimed only where all candidates *agreed*,
+which reported strictly less and needed a second code path to report the rest.
+
+`a + b + c` needs no n-ary signature: it parses `Add(Add(a, b), c)` and annotation is
+bottom-up, so the inner node's type feeds the outer one.
+
+### ⚠️ Claims attach to the operator node, never to the expression
+
+"This expression contains a `*`, so its operands are numeric" leaks across the `+`:
+`order_date + (n * 2)` would claim `order_date` is NUMERIC. So would "this `+` has an
+integer literal, so every operand is an integer" — and `date + integer` is a real DuckDB
+overload, not an autocast. Both are the `date_trunc` gotcha in a new costume: a confident
+error on valid SQL. The catalog encodes which of these the dialect actually has, per
+operator node, which is strictly better than any hand rule.
+
+### ⚠️ Operator signatures are for facts only — never installed as annotators
+
+sqlglot already types `+`, `/` and `>` correctly, `TYPED_DIVISION` and DECIMAL precision
+included. The plan's "keep the catalog a gap-filler" rule stands. So the catalog has two
+consumers:
+
+- `expression_metadata` — annotation. Functions with coverage gaps only. Operator keys are
+  skipped for free: `exp.FUNCTION_BY_NAME` has no `"+"`, so no class is ever found for them.
+- the fact walk — everything, operators included.
+
+Operators have no `sql_name()` (they are `exp.Binary`, not `exp.Func`), so a small explicit
+`{exp.Add: "+", ...}` map is the one place a class name appears. That is deliberate and
+commented; these classes are core and older than any dialect module.
+
+## Ordering — facts move out of step 3b
+
+Fact extraction runs **after annotation pass 1**, not beside `build_graph`.
+
+Step 5 above proves why: before pass 1 every `.type` is `None`, so `in_family` cannot tell
+"undeclared" from "declared and fine", and every argument position generates a claim — the
+spurious `order_ts -> TEMPORAL`. That was harmless while evidence was internal. Facts are
+now shown to the user with a span attached, so the same over-claim would be a lie in a
+report.
+
+Facts hold **node references, not snapshotted types**. The checking pass therefore reads
+post-step-6 types off the same mutated tree, and nothing has to be re-extracted after
+widening.
+
+```
+step 4  annotate pass 1        establishes what is already known
+facts   extract                claims, links, predicates, joins, nullability, cardinality
+step 5  infer                  claims/links on UNKNOWN source columns -> types, or conflict
+step 6  annotate pass 2        same tree, widened schema, in place
+step 7  check                  F001, F002, and every contradicted claim
+```
+
+### Conflicting facts on an undeclared column
+
+Error at **every** conflicting site, and the column **stays UNKNOWN**. Not a warning: sqlr's
+position is that engine autocasting is never something to rely on, so `upper(x)` beside
+`x > 5` is a defect, not a dialect feature. Staying UNKNOWN is what stops a guess from
+cascading — UNKNOWN is absorbing, so everything downstream goes quiet instead of inheriting
+a coin-flip.
+
+## What survives as its own finding
+
+F001 (unknown function) and F002 (arity) stay separate, and that is the right seam: they are
+**structural**, need no types at all, and are about the *call*. F003 was never about the
+call — it was always about the value flowing into it, which is what a fact is.
+
+## Decisions settled in this revision
+
+| Question | Decision | Reason |
+|---|---|---|
+| `cast(x as date)` — a claim about `x`? | **No claim.** The cast types its result only. | `cast(order_id as varchar)` does not make `order_id` a varchar, and `x::date` on a string column is the commonest cast written. v1 recorded it; as a user-visible claim it becomes a false-positive generator. |
+| Column-to-column comparison | **Link, all six operators.** `!=` included. | Without autocasting, comparing two columns requires a common domain — `!=` demands it exactly as much as `=`. |
+| A config for `!=` | **No.** | It would switch between a result and the same result — the argument already made for the steps 5+6 skip. Where `!=` genuinely differs is *relationship* inference (`=` suggests a foreign key, `!=` suggests nothing), so the join fact stays `=`-only and needs no knob. |
+| Cross-scope links (set-op arms, `IN (subquery)`) | **In.** | ~25 lines given the node→scope index the fact walk builds anyway. |
+| Transitive link propagation | **Out.** One round. | A link off a *just-inferred* column does not chain. Convergence in one round is what keeps widening monotone; a fixpoint needs its own proof. |
+| `models:` declaration vs projected type | **Out, this round.** | Computed-vs-declared is a different comparison from anything here, and runs on `annotate_types`' returned data. |
+| Facts as pydantic models | **No — frozen dataclasses.** | They hold live `exp.Expr` references on purpose, so step 7 reads current types. A serialisable view is a projection of them, later. |
+
+## Modules
+
+| Module | Contents |
+|---|---|
+| `catalog.py` | signatures, functions and operators; `@T` variables; variadic marker |
+| `annotate.py` | step 0 wiring, families, `pick_overload` — unchanged in shape |
+| `facts.py` | `extract_facts_from_annotated_tree` — claims, links, predicates, joins, nullability, cardinality |
+| `infer.py` | verdicts per undeclared source column, `widen_schema_with_inferred_types` |
+| `check.py` | `findings_for_unknown_functions`, `findings_for_calls_with_wrong_arity`, `findings_for_contradicted_claims` |
+| `annotate_types.py` | steps 4-7 for one model and for a run; sqlglot's own imported as `annotate_types_with_sqlglot` |
+
+## Tests
+
+1. Catalog arity matches each class's `arg_types`.
+2. Coverage debt does not grow.
+3. Monotone widening — `widen(s, facts) == s` when `s` has no UNKNOWN.
+4. Skip equivalence — steps 5+6 forced on vs skipped on a fully-declared schema.
+5. Three-valued discipline — undeclared column into a catalogued function, zero findings.
+6. `order_date + 7` produces **no** claim about `order_date`.
+7. A position where matching-arity overloads disagree infers nothing, and still contradicts
+   a value in none of their families.
+8. Conflicting facts → error at every site, column stays UNKNOWN.
+9. Link propagation across a join, and across a UNION's arms.

@@ -56,6 +56,42 @@ class ColumnFinding(BaseModel):
         return f":{self.span}" if self.span is not None else ""
 
 
+type TypeFindingCode = Literal[
+    "unknown-function",
+    "function-arity",
+    "contradicted-type",
+    "conflicting-usage",
+]
+"""What went wrong with a *value*, as opposed to with a column's attribution.
+
+`unknown-function` and `function-arity` are structural - they need no types at all and are
+about the call. The other two are the two readings of one fact: a claim contradicted by a
+type that is already known, and claims that disagree about a column with no type at all.
+"""
+
+
+class TypeFinding(BaseModel):
+    """One reportable problem with a value, and where in the SQL it was written.
+
+    Not `FunctionFinding`: most of these are about the value flowing into a call rather
+    than about the call itself, and some involve no call at all. `function` and
+    `argument_index` are filled when a call is what made the claim.
+    """
+
+    code: TypeFindingCode
+    message: str
+    severity: FindingSeverity = "error"
+    span: SourceSpan | None = None
+    context_span: SourceSpan | None = None
+    function: str | None = None
+    argument_index: int | None = None
+    column_name: ColumnName | None = None
+
+    def where(self) -> str:
+        """`:10:3`, or nothing when the node carries no position."""
+        return f":{self.span}" if self.span is not None else ""
+
+
 def span_of_access(column: exp.Column, positions: Positions) -> SourceSpan | None:
     """The span of the read a column sits inside - `x.field`, `x['field']`.
 

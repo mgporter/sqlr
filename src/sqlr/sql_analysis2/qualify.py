@@ -12,7 +12,8 @@ reported rather than half-analysed.
 
 import logging
 from pathlib import Path
-from typing import Literal, NamedTuple, cast
+from collections.abc import Sequence
+from typing import Literal, NamedTuple, Protocol, cast
 
 import sqlglot
 from sqlglot import ParseError, exp
@@ -190,7 +191,19 @@ class QualifiedModel(NamedTuple):
         )
 
 
-def any_model_has_errors(results: list[QualifiedModel]) -> bool:
+class ModelResult(Protocol):
+    """Anything a command can exit non-zero over.
+
+    Structural rather than a base class: `QualifiedModel` and the annotated result of steps
+    4-7 answer the same question and are otherwise unrelated - one is a stage of the other,
+    not a subtype of it.
+    """
+
+    @property
+    def has_errors(self) -> bool: ...
+
+
+def any_model_has_errors(results: Sequence[ModelResult]) -> bool:
     """Whether the run should exit non-zero."""
     return any(result.has_errors for result in results)
 
@@ -594,7 +607,7 @@ nowhere in the file, which is the one thing a reader could check and find false.
 """
 
 
-def _reference_to(
+def column_reference_of(
     column: exp.Column, scope: Scope, statement: QualifiedStatement
 ) -> ColumnReference:
     """Describe one `exp.Column` node: where it reads from, and how it got there."""
@@ -639,7 +652,7 @@ def _projected_column(
     for column in projection.find_all(exp.Column):
         if id(column) not in own_columns:
             continue
-        reference = _reference_to(column, scope, statement)
+        reference = column_reference_of(column, scope, statement)
         seen = reads.get((reference.name, reference.source.alias))
         if seen is None or (
             _ORIGIN_PRECEDENCE[reference.origin] < _ORIGIN_PRECEDENCE[seen.origin]
@@ -649,7 +662,7 @@ def _projected_column(
     # A projection that is nothing but a column *is* that column, renamed or not. Anything
     # computed from one is a new column that merely reads it.
     column_read = (
-        _reference_to(inner, scope, statement) if isinstance(inner, exp.Column) else None
+        column_reference_of(inner, scope, statement) if isinstance(inner, exp.Column) else None
     )
     name = output_name_of(projection, statement.engine_named_projections)
     return ProjectedColumn(
@@ -696,7 +709,7 @@ def scope_columns_of(scope: Scope, statement: QualifiedStatement) -> ScopeColumn
     for column in scope.columns:
         if is_in_the_projection_list(column, scope):
             continue
-        reference = _reference_to(column, scope, statement)
+        reference = column_reference_of(column, scope, statement)
         key = (reference.name, reference.source.alias)
         if key in projected_columns:
             continue
