@@ -241,6 +241,9 @@ def resolve_columns_to_source_tables(
         quote_identifiers=False,
     )
 
+    print("PROBE")
+    print(probe)
+
     columns_per_table: dict[TableName, dict[ColumnName, ParsedColumn]] = {}
     source_table_names: set[TableName] = set()
     unresolvable_columns: list[exp.Column] = []
@@ -252,6 +255,7 @@ def resolve_columns_to_source_tables(
     offsets_already_judged: set[tuple[int, int]] = set()
 
     for scope in traverse_scope(probe):
+        # print(f"sources: {scope.sources}\n\n")
         source_table_names.update(
             source.name.lower()
             for source in scope.sources.values()
@@ -259,6 +263,8 @@ def resolve_columns_to_source_tables(
         )
 
         for column in scope.columns:
+
+            print(f"{column.name} -> {column.table}, {column.this}")
 
             if not column.table:
                 # Still bare after qualification. Against an empty schema two tables that

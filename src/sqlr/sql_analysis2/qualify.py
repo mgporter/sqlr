@@ -223,6 +223,7 @@ def qualify_schema(
     # Declarations are read once for the run: they do not vary per model.
     declared_schema = declared_columns(declared)
 
+
     return [
         qualify_one_model(
             model,
@@ -319,6 +320,8 @@ def qualify_one_model(
     )
     findings = findings_without_exact_duplicates(findings)
 
+    print(resolved)
+
     # Two findings have to stop the statement. An unresolvable column belongs to no table,
     # so no fabricated schema can cover it and `qualify` raises. An ambiguous one belongs
     # to two, and committing to either would hand `qualify` an attribution that is as
@@ -344,6 +347,8 @@ def qualify_one_model(
     mapped_schema = ensure_schema(
         cast("dict[str, object]", declared_types_per_table), dialect=dialect_name
     )
+    print()
+    print(mapped_schema.column_names("raw_address"))
 
     # Two things about the projection lists that only exist before step 3. Where the stars
     # are, because step 3 expands them away and a duplicate they cause can only be
@@ -358,6 +363,8 @@ def qualify_one_model(
     # projection list. Prerequisite for all type inference, and 39% of the runtime.
     try:
         qualified = qualify(statement, schema=mapped_schema, dialect=dialect_name)
+        print()
+        print(qualified)
     except OptimizeError as e:
         return failed([str(e)], findings)
 
