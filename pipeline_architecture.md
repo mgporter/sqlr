@@ -4,7 +4,8 @@ Supersedes the *shape* of `type_check_plan.md` steps 2–3. Everything that docu
 steps 4–7, the catalog, three-valued `in_family`, and facts-as-the-single-mechanism still
 stands and is not restated here. Where the two disagree, this one wins.
 
-Status: **design agreed, not implemented.** D1–D3 are settled; see the end.
+Status: **implemented**, except the `validate-schema` half of D3 - see "What was built".
+D1-D3 are settled; see the end.
 
 ---
 
@@ -366,6 +367,44 @@ branch, one pass.
 
 ---
 
+## What was built
+
+Everything above, plus four things the design did not anticipate and one it got wrong.
+
+**Corrected in the design.** Set-operation arms do **not** intersect their names. A set
+operation's schema is positional — the arms are matched by position and the left one supplies
+the names — so `select p from t1 union all select r from t2` produces a column called `p`, and
+`r` is not a column of the union at all. Openness still unions across arms.
+
+**Three bugs the tests forced out, none of which the plan predicted:**
+
+- **The probe erases "written bare".** `qualify` has already attributed every bare column by the
+  time step 4 runs, landing it on whichever source `infer_schema` fell back to. Taking that
+  qualifier at face value turns every fallback into a certainty. `_candidate_relations` reads
+  `offsets_of_columns_written_without_a_source` instead — the pre-probe record of what the user
+  actually typed.
+- **`star_over_join_behavior` is narrower than it looked.** Several *relations* that might own a
+  bare name is a different question from one relation whose star reads several *tables*. The
+  first has a fix the reader can apply — qualify the column — so it stays `unresolvable`; only
+  the second consults the config. Conflating them made `select a.x, mystery from a join b` a
+  silent guess.
+- **Star qualifiers must not be lowercased.** `scope.sources` is keyed the way the probe
+  normalised identifiers, which follows the dialect: Snowflake folds up, DuckDB down.
+  Lowercasing one side matched nothing under Snowflake, so every `select t.*` there projected an
+  empty relation.
+
+**One pre-existing bug fixed on the way.** A correlated subquery reads its outer query's aliases
+— `where exists (select 1 from customer c where c.id = o.customer_id)` names `o`, which belongs
+to the enclosing scope. Looking only at the innermost scope reported every such column as a
+mistyped alias. `RelationClosure.relation_named` walks outward. This is why `sales.sql` never
+worked, and it had nothing to do with transparency.
+
+**Deferred, deliberately.** `ScopeColumns.complete` is computed and propagated, and
+`resolved.relations_read_through_an_unexpandable_star` is recorded and logged — but nothing
+reads the flag yet, because the `models:`-declaration-versus-projection comparison it guards
+does not exist (`type_check_plan.md` put that out of scope for this round). The flag is the data
+that comparison will need; the `projection-incomplete` finding lands with it.
+
 ## Decisions — settled
 
 ### D1 — relation identity is the full name
@@ -468,7 +507,7 @@ raise, and they are evidence of what this file **uses**, never a claim about wha
 The risk is that `select *` expands against them: the star yields the 7 columns this file
 mentions, and the real table may have 30.
 
-**Decided:** INFO log at step 5, always — `raw_address: 0 declared, 7 fabricated from reads`.
+**Decided:** INFO log at step 5, always — `raw_address: 0 declared, 7 inferred`.
 A `projection-incomplete` warning only when the lower bound reaches a model's own projection,
 which is the one place it can produce a wrong answer (`validate-schema` comparing an
 under-approximated projection against a complete `models:` declaration). `address.sql` triggers

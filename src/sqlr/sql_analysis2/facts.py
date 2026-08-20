@@ -52,6 +52,7 @@ from sqlr.sql_analysis2.types import (
     LiteralKind,
     NullabilityReason,
     PredicateOperator,
+    RelationKey,
     TableName,
 )
 
@@ -77,17 +78,20 @@ class ValueSite:
     span: SourceSpan | None
 
     @property
-    def source_table_column(self) -> tuple[TableName, ColumnName] | None:
-        """The real table and column this site reads, or None when it reads neither.
+    def source_table_column(self) -> tuple[RelationKey, ColumnName] | None:
+        """The schema slot this site reads, or None when it reads none.
+
+        Keyed by `RelationKey` and not by the bare table name, so it lines up with the
+        gap-filled schema `infer.py` widens - two schemas may each hold a `raw_department`,
+        and a bare key would merge their column sets.
 
         A CTE's column is deliberately not one: its type is computed from the CTE's own
         projection, so nothing may be inferred for it and no schema slot exists to widen.
         """
         reference = self.column
-        if reference is None or reference.source.kind != "table":
+        if reference is None or reference.source.key is None:
             return None
-        table = reference.source.name or reference.source.alias
-        return table.lower(), reference.name.lower()
+        return reference.source.key, reference.name.lower()
 
     def describe(self) -> str:
         """What to call this site in a message.

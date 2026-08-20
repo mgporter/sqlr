@@ -4,7 +4,7 @@ Every fixture here is an inline SQL string, per `tests/README.md`.
 """
 
 from pathlib import Path
-from typing import cast
+
 
 import pytest
 import sqlglot
@@ -12,59 +12,75 @@ from sqlglot import exp
 from sqlglot.optimizer.qualify import qualify
 from sqlglot.schema import ensure_schema
 
+from declared_helpers import declarations, q
+
 from sqlr.catalog.types import SqlFile
+from sqlr.config.types import StarOverJoinBehavior
+from sqlr.declared.types import DeclaredSchemas
 from sqlr.selection.types import Model
+from sqlr.sql_analysis2.reporting import (
+    findings_for_ambiguous_columns,
+    findings_for_unresolvable_columns,
+)
+from sqlr.sql_analysis2.sourcedoc import Positions
 from sqlr.sql_analysis2.qualify import (
     QualifiedModel,
     columns_per_scope,
     qualify_one_model,
 )
 from sqlr.sql_analysis2.resolve import (
-    get_declared_types_per_table,
+    get_declared_types_per_relation,
+    nested_schema_for_sqlglot,
     resolve_columns_to_source_tables,
 )
 from sqlr.sql_analysis2.types import (
     ColumnName,
     ColumnTypeName,
     ParsedColumn,
+    RelationKey,
     ResolvedColumns,
     StructuredAccessKind,
-    TableName,
 )
-
 DIALECT = "duckdb"
 
 
 def resolve(
     sql: str,
-    declared: dict[TableName, dict[ColumnName, ColumnTypeName]] | None = None,
+    declared: dict[RelationKey, dict[ColumnName, ColumnTypeName]] | None = None,
+    partial: frozenset[RelationKey] = frozenset(),
+    star_over_join_behavior: StarOverJoinBehavior = "guess",
 ) -> ResolvedColumns:
     return resolve_columns_to_source_tables(
-        sqlglot.parse_one(sql, read=DIALECT), DIALECT, declared_schema=declared
-    )
+        sqlglot.parse_one(sql, read=DIALECT),
+        DIALECT,
+        declarations(declared, partial),
+        star_over_join_behavior,
+    )[0]
 
 
-def column_names(resolved: ResolvedColumns) -> dict[TableName, set[ColumnName]]:
+def column_names(resolved: ResolvedColumns) -> dict[RelationKey, set[ColumnName]]:
     """Just the names, for the tests that do not care how a column was read."""
     return {
-        table: set(columns) for table, columns in resolved.columns_per_table.items()
+        relation: set(columns)
+        for relation, columns in resolved.columns_per_relation.items()
     }
 
 
 def kinds(
-    resolved: ResolvedColumns, table: TableName, column: ColumnName
+    resolved: ResolvedColumns, relation: RelationKey, column: ColumnName
 ) -> list[StructuredAccessKind]:
     """How one column was read, one entry per site, in written order."""
     return [
-        kind for kind, _ in resolved.columns_per_table[table][column].structured_access
+        kind
+        for kind, _ in resolved.columns_per_relation[relation][column].structured_access
     ]
 
 
 def unresolvable_names(resolved: ResolvedColumns) -> list[str]:
-    return [column.name for column in resolved.unresolvable_columns]
+    return [entry.column.name for entry in resolved.unresolvable_columns]
 
 
-def ambiguous_names(resolved: ResolvedColumns) -> list[tuple[str, list[TableName]]]:
+def ambiguous_names(resolved: ResolvedColumns) -> list[tuple[str, list[str]]]:
     """Each ambiguous column and the sources it could equally have come from."""
     return [
         (ambiguous.column.name, ambiguous.candidate_sources)
@@ -74,7 +90,7 @@ def ambiguous_names(resolved: ResolvedColumns) -> list[tuple[str, list[TableName
 
 def guessed_names(
     resolved: ResolvedColumns,
-) -> list[tuple[str, TableName, list[TableName]]]:
+) -> list[tuple[str, str, list[str]]]:
     """Each guessed column, what it was credited to, and what was not ruled out."""
     return [
         (guessed.column.name, guessed.resolved_source, guessed.open_sources)
@@ -83,7 +99,7 @@ def guessed_names(
 
 
 def parsed(names: list[ColumnName]) -> dict[ColumnName, ParsedColumn]:
-    """A `columns_per_table` entry, for feeding the schema fabricator directly."""
+    """A `columns_per_relation` entry, for feeding the schema fabricator directly."""
     return {
         name: ParsedColumn(name=name, structured_access=[]) for name in names
     }
@@ -92,13 +108,13 @@ def parsed(names: list[ColumnName]) -> dict[ColumnName, ParsedColumn]:
 # ------------------------------------------------------- columns per real table
 def test_qualified_columns_land_on_their_table() -> None:
     resolved = resolve("select t.id, t.name from mydatabase.myschema.test t")
-    assert column_names(resolved) == {"test": {"id", "name"}}
+    assert column_names(resolved) == {q("test"): {"id", "name"}}
     assert resolved.unresolvable_columns == []
 
 
 def test_bare_columns_land_on_the_only_table() -> None:
     resolved = resolve("select id, name from mydatabase.myschema.test")
-    assert column_names(resolved) == {"test": {"id", "name"}}
+    assert column_names(resolved) == {q("test"): {"id", "name"}}
 
 
 def test_bare_columns_resolve_past_a_joined_cte() -> None:
@@ -124,8 +140,8 @@ def test_bare_columns_resolve_past_a_joined_cte() -> None:
         """
     )
     assert column_names(resolved) == {
-        "test": {"id", "name", "modified_at", "titles"},
-        "table_in_cte": {"test_id", "name"},
+        q("test"): {"id", "name", "modified_at", "titles"},
+        q("table_in_cte"): {"test_id", "name"},
     }
     assert resolved.unresolvable_columns == []
 
@@ -135,7 +151,7 @@ def test_cte_names_are_not_invented_as_table_columns() -> None:
     resolved = resolve(
         "with a as (select 1 as k) select k, extra from a, mydatabase.myschema.test"
     )
-    assert column_names(resolved) == {"test": {"extra"}}
+    assert column_names(resolved) == {q("test"): {"extra"}}
 
 
 def test_correlated_subquery_columns_reach_the_outer_table() -> None:
@@ -147,7 +163,7 @@ def test_correlated_subquery_columns_reach_the_outer_table() -> None:
         )
         """
     )
-    assert column_names(resolved) == {"test": {"id"}, "other": {"fk", "flag"}}
+    assert column_names(resolved) == {q("test"): {"id"}, q("other"): {"fk", "flag"}}
 
 
 def test_scalar_subquery_columns_land_on_their_own_table() -> None:
@@ -157,7 +173,7 @@ def test_scalar_subquery_columns_land_on_their_own_table() -> None:
         from mydatabase.myschema.test
         """
     )
-    assert column_names(resolved) == {"test": {"id"}, "other": {"amt"}}
+    assert column_names(resolved) == {q("test"): {"id"}, q("other"): {"amt"}}
 
 
 def test_using_join_credits_both_tables() -> None:
@@ -167,7 +183,7 @@ def test_using_join_credits_both_tables() -> None:
         join mydatabase.myschema.other o using (id)
         """
     )
-    assert column_names(resolved) == {"test": {"id"}, "other": {"id"}}
+    assert column_names(resolved) == {q("test"): {"id"}, q("other"): {"id"}}
 
 
 def test_set_operation_inside_a_cte() -> None:
@@ -181,7 +197,7 @@ def test_set_operation_inside_a_cte() -> None:
         select id from both
         """
     )
-    assert column_names(resolved) == {"test": {"id"}, "other": {"id"}}
+    assert column_names(resolved) == {q("test"): {"id"}, q("other"): {"id"}}
 
 
 def test_derived_table_shadows_its_source() -> None:
@@ -191,12 +207,12 @@ def test_derived_table_shadows_its_source() -> None:
         from (select id as outer_id from mydatabase.myschema.test) sub
         """
     )
-    assert column_names(resolved) == {"test": {"id"}}
+    assert column_names(resolved) == {q("test"): {"id"}}
 
 
 def test_column_names_are_lowercased() -> None:
     resolved = resolve("select ID, Name from MyDatabase.MySchema.Test")
-    assert column_names(resolved) == {"test": {"id", "name"}}
+    assert column_names(resolved) == {q("test"): {"id", "name"}}
 
 
 # ------------------------------------------------------------ unresolvable columns
@@ -209,7 +225,7 @@ def test_ambiguous_bare_column_across_two_unknown_tables_is_reported() -> None:
         inner join mydatabase.myschema.other b on a.id = b.id
         """
     )
-    assert column_names(resolved) == {"test": {"x", "id"}, "other": {"id"}}
+    assert column_names(resolved) == {q("test"): {"x", "id"}, q("other"): {"id"}}
     assert unresolvable_names(resolved) == ["mystery"]
 
 
@@ -220,7 +236,7 @@ def test_bare_column_with_only_cte_sources_is_reported() -> None:
         select test_id, nonsense from src
         """
     )
-    assert column_names(resolved) == {"table_in_cte": {"test_id"}}
+    assert column_names(resolved) == {q("table_in_cte"): {"test_id"}}
     assert unresolvable_names(resolved) == ["nonsense"]
 
 
@@ -232,8 +248,8 @@ def test_unresolvable_column_keeps_its_source_position() -> None:
         "join mydatabase.myschema.other o on t.id = o.id"
     )
     resolved = resolve(sql)
-    (column,) = resolved.unresolvable_columns
-    identifier = column.this
+    (unresolvable,) = resolved.unresolvable_columns
+    identifier = unresolvable.column.this
     assert isinstance(identifier, exp.Identifier)
     start = identifier.meta["start"]
     end = identifier.meta["end"]
@@ -249,13 +265,14 @@ def test_unknown_qualifier_on_a_lone_source_is_read_as_a_struct_field(
     `test`. DuckDB and Spark really do read bare dotted field access that way, so this is
     a column and not a finding - one that has to hold a structured value.
     """
-    resolved = resolve_columns_to_source_tables(
+    resolved, _ = resolve_columns_to_source_tables(
         sqlglot.parse_one("select ghots.id from mydatabase.myschema.test", read=dialect),
         dialect,
+        DeclaredSchemas(),
     )
-    assert column_names(resolved) == {"test": {"ghots"}}
-    assert kinds(resolved, "test", "ghots") == ["dot_field"]
-    assert resolved.columns_per_table["test"]["ghots"].requires_structured_type
+    assert column_names(resolved) == {q("test"): {"ghots"}}
+    assert kinds(resolved, q("test"), "ghots") == ["dot_field"]
+    assert resolved.columns_per_relation[q("test")]["ghots"].requires_structured_type
     assert resolved.unresolvable_columns == []
     assert resolved.columns_read_with_unsupported_dot_notation == []
 
@@ -270,15 +287,16 @@ def test_unknown_qualifier_is_reported_where_the_dialect_has_no_dot_access(
     The column is still harvested: the finding is already written, and leaving it out of
     the schema only makes step 3 fail with a message about the rewritten tree.
     """
-    resolved = resolve_columns_to_source_tables(
+    resolved, _ = resolve_columns_to_source_tables(
         sqlglot.parse_one("select ghots.id from mydatabase.myschema.test", read=dialect),
         dialect,
+        DeclaredSchemas(),
     )
     assert [
         column.name.lower()
         for column in resolved.columns_read_with_unsupported_dot_notation
     ] == ["ghots"]
-    assert column_names(resolved) == {"test": {"ghots"}}
+    assert column_names(resolved) == {q("test"): {"ghots"}}
     assert resolved.unresolvable_columns == []
 
 
@@ -288,8 +306,11 @@ def test_the_dot_access_gate_can_be_set_against_the_dialect_default() -> None:
     statement = sqlglot.parse_one(
         "select ghots.id from mydatabase.myschema.test", read=DIALECT
     )
-    resolved = resolve_columns_to_source_tables(
-        statement, DIALECT, allow_unresolvable_aliases_as_structured_columns=False
+    resolved, _ = resolve_columns_to_source_tables(
+        statement,
+        DIALECT,
+        DeclaredSchemas(),
+        allow_unresolvable_aliases_as_structured_columns=False,
     )
     assert [
         column.name for column in resolved.columns_read_with_unsupported_dot_notation
@@ -300,29 +321,30 @@ def test_the_dot_access_gate_can_be_set_against_the_dialect_default() -> None:
 def test_bracket_access_survives_a_dialect_without_dot_access() -> None:
     """`ghots['id']` is a subscript, not a qualifier, so nothing rewrites it and every
     dialect here reads it as a column of `test`. Only the dotted form is a finding."""
-    resolved = resolve_columns_to_source_tables(
+    resolved, _ = resolve_columns_to_source_tables(
         sqlglot.parse_one(
             "select ghots['id'] from mydatabase.myschema.test", read="postgres"
         ),
         "postgres",
+        DeclaredSchemas(),
     )
     assert resolved.columns_read_with_unsupported_dot_notation == []
-    assert kinds(resolved, "test", "ghots") == ["bracket_key"]
-    assert resolved.columns_per_table["test"]["ghots"].requires_structured_type
+    assert kinds(resolved, q("test"), "ghots") == ["bracket_key"]
+    assert resolved.columns_per_relation[q("test")]["ghots"].requires_structured_type
 
 
 def test_an_integer_subscript_does_not_demand_a_structured_type() -> None:
     """DuckDB subscripts strings, so `titles[1]` proves `titles` is indexable and nothing
     more. A `varchar` declaration for it is not a contradiction."""
     resolved = resolve("select titles[1] from mydatabase.myschema.test")
-    column = resolved.columns_per_table["test"]["titles"]
-    assert kinds(resolved, "test", "titles") == ["bracket_index"]
+    column = resolved.columns_per_relation[q("test")]["titles"]
+    assert kinds(resolved, q("test"), "titles") == ["bracket_index"]
     assert not column.requires_structured_type
 
 
 def test_a_column_read_plainly_carries_no_structured_access() -> None:
     resolved = resolve("select id from mydatabase.myschema.test")
-    assert resolved.columns_per_table["test"]["id"].structured_access == []
+    assert resolved.columns_per_relation[q("test")]["id"].structured_access == []
 
 
 def test_sites_merge_and_the_strongest_claim_wins() -> None:
@@ -338,7 +360,7 @@ def test_sites_merge_and_the_strongest_claim_wins() -> None:
         from mydatabase.myschema.test
         """
     )
-    assert kinds(resolved, "test", "mistyped") == [
+    assert kinds(resolved, q("test"), "mistyped") == [
         "dot_field",
         "dot_field",
         "bracket_key",
@@ -350,14 +372,14 @@ def test_only_the_first_level_of_a_nested_read_is_modelled() -> None:
     """`a.b.c` says what `a.b` said: `a` is structured. Nothing can declare a type for
     `a.b`, so nothing needs to be recorded about it."""
     resolved = resolve("select a.b.c.d from mydatabase.myschema.test")
-    assert column_names(resolved) == {"test": {"a"}}
-    assert kinds(resolved, "test", "a") == ["dot_field"]
+    assert column_names(resolved) == {q("test"): {"a"}}
+    assert kinds(resolved, q("test"), "a") == ["dot_field"]
 
 
 @pytest.mark.parametrize("dialect", ["duckdb", "snowflake", "postgres", "spark"])
 def test_unknown_qualifier_with_two_sources_is_reported(dialect: str) -> None:
     """The other half: no lone source absorbs the name, so the typo surfaces."""
-    resolved = resolve_columns_to_source_tables(
+    resolved, _ = resolve_columns_to_source_tables(
         sqlglot.parse_one(
             """
             select ghots.id
@@ -367,10 +389,11 @@ def test_unknown_qualifier_with_two_sources_is_reported(dialect: str) -> None:
             read=dialect,
         ),
         dialect,
+        DeclaredSchemas(),
     )
-    assert column_names(resolved) == {"a": {"k"}, "b": {"k"}}
+    assert column_names(resolved) == {q("a"): {"k"}, q("b"): {"k"}}
     # Case follows the dialect's normalisation - Snowflake upper-cases - so compare
-    # case-insensitively. Only `columns_per_table` is lowercased, because it has to match
+    # case-insensitively. Only `columns_per_relation` is lowercased, because it has to match
     # declarations; a reported column is pointed at its source text instead.
     assert [name.lower() for name in unresolvable_names(resolved)] == ["id"]
 
@@ -385,7 +408,7 @@ def test_column_qualified_against_a_cte_is_neither_harvested_nor_reported() -> N
         join src on t.id = src.test_id
         """
     )
-    assert column_names(resolved) == {"test": {"id"}, "table_in_cte": {"test_id"}}
+    assert column_names(resolved) == {q("test"): {"id"}, q("table_in_cte"): {"test_id"}}
     assert resolved.unresolvable_columns == []
 
 
@@ -407,7 +430,7 @@ def test_a_declared_column_set_is_read_as_the_complete_list() -> None:
     """
     resolved = resolve(
         JOINED_TO_A_CTE.format(selection="name"),
-        {"test": {"id": "varchar(20)", "name": "varchar(20)"}},
+        {q("test"): {"id": "varchar(20)", "name": "varchar(20)"}},
     )
     assert ambiguous_names(resolved) == [("name", ["src", "test"])]
     assert guessed_names(resolved) == []
@@ -418,10 +441,10 @@ def test_an_ambiguous_column_is_not_credited_to_either_source() -> None:
     not own the column, and every type inferred from it would inherit the mistake."""
     resolved = resolve(
         JOINED_TO_A_CTE.format(selection="name"),
-        {"test": {"id": "varchar(20)", "name": "varchar(20)"}},
+        {q("test"): {"id": "varchar(20)", "name": "varchar(20)"}},
     )
-    assert "name" not in resolved.columns_per_table["test"]
-    assert "name" not in column_names(resolved)["table_in_cte"] - {"name"}
+    assert "name" not in resolved.columns_per_relation[q("test")]
+    assert "name" not in column_names(resolved)[q("table_in_cte")] - {"name"}
 
 
 def test_two_declared_tables_that_both_own_the_name_are_ambiguous() -> None:
@@ -434,7 +457,10 @@ def test_two_declared_tables_that_both_own_the_name_are_ambiguous() -> None:
         from mydatabase.myschema.test
         inner join mydatabase.myschema.other on test.id = other.id
         """,
-        {"test": {"name": "varchar(20)"}, "other": {"id": "int", "name": "varchar(20)"}},
+        {
+            q("test"): {"id": "int", "name": "varchar(20)"},
+            q("other"): {"id": "int", "name": "varchar(20)"},
+        },
     )
     assert ambiguous_names(resolved) == [("name", ["other", "test"])]
     assert unresolvable_names(resolved) == []
@@ -448,7 +474,7 @@ def test_an_undeclared_table_leaves_the_attribution_a_guess() -> None:
 
 def test_a_declaration_with_no_columns_says_nothing() -> None:
     """An empty column list is an absent answer, not an empty one."""
-    resolved = resolve(JOINED_TO_A_CTE.format(selection="name"), {"test": {}})
+    resolved = resolve(JOINED_TO_A_CTE.format(selection="name"), {q("test"): {}})
     assert guessed_names(resolved) == [("name", "src", ["test"])]
 
 
@@ -457,36 +483,49 @@ def test_a_guessed_column_is_still_credited_to_its_source() -> None:
     it would only cost the column its declared type."""
     resolved = resolve(JOINED_TO_A_CTE.format(selection="id, name"), {})
     assert guessed_names(resolved) == [("name", "src", ["test"])]
-    assert column_names(resolved)["table_in_cte"] == {"test_id", "name"}
+    assert column_names(resolved)[q("table_in_cte")] == {"test_id", "name"}
 
 
 def test_a_source_ruled_out_by_its_declaration_makes_no_noise() -> None:
     """`test` is declared and does not list `name`, so the CTE is the only candidate
     left and the attribution is forced rather than guessed."""
     resolved = resolve(
-        JOINED_TO_A_CTE.format(selection="name"), {"test": {"id": "varchar(20)"}}
+        JOINED_TO_A_CTE.format(selection="name"), {q("test"): {"id": "varchar(20)"}}
     )
     assert guessed_names(resolved) == []
     assert ambiguous_names(resolved) == []
 
 
-def test_a_column_no_declaration_mentions_is_neither_ambiguous_nor_guessed() -> None:
-    """The closed-world reading decides verdicts only. `modified_at` appears in neither
-    the CTE's projections nor `test`'s declaration, yet `test` still absorbs it - a
-    partial declaration has to keep working."""
+def test_a_partly_declared_table_still_absorbs_the_columns_it_omits() -> None:
+    """`declaration_is_partial: true`. `modified_at` appears in neither the CTE's
+    projections nor `test`'s declaration, and the flag is what says `test` may still own
+    it - the declared columns keep their types and the rest is inferred."""
     resolved = resolve(
         JOINED_TO_A_CTE.format(selection="modified_at"),
-        {"test": {"id": "varchar(20)", "name": "varchar(20)"}},
+        {q("test"): {"id": "varchar(20)", "name": "varchar(20)"}},
+        partial=frozenset({q("test")}),
     )
     assert guessed_names(resolved) == []
     assert ambiguous_names(resolved) == []
-    assert "modified_at" in column_names(resolved)["test"]
+    assert "modified_at" in column_names(resolved)[q("test")]
+
+
+def test_a_complete_declaration_makes_an_omitted_column_an_error() -> None:
+    """The payoff for declaring. The same read against the same declaration, without the
+    partial flag: `test` is closed, so `modified_at` is a mistake rather than a column
+    invented from the read that nothing can tell apart from a real one."""
+    resolved = resolve(
+        JOINED_TO_A_CTE.format(selection="modified_at"),
+        {q("test"): {"id": "varchar(20)", "name": "varchar(20)"}},
+    )
+    assert unresolvable_names(resolved) == ["modified_at"]
+    assert column_names(resolved).get(q("test"), set()) == {"id"}
 
 
 def test_a_qualified_column_is_never_judged() -> None:
     resolved = resolve(
         JOINED_TO_A_CTE.format(selection="src.name"),
-        {"test": {"id": "varchar(20)", "name": "varchar(20)"}},
+        {q("test"): {"id": "varchar(20)", "name": "varchar(20)"}},
     )
     assert ambiguous_names(resolved) == []
     assert guessed_names(resolved) == []
@@ -495,7 +534,7 @@ def test_a_qualified_column_is_never_judged() -> None:
 def test_a_lone_source_cannot_be_ambiguous() -> None:
     resolved = resolve(
         "select id, name from mydatabase.myschema.test",
-        {"test": {"id": "varchar(20)", "name": "varchar(20)"}},
+        {q("test"): {"id": "varchar(20)", "name": "varchar(20)"}},
     )
     assert ambiguous_names(resolved) == []
     assert guessed_names(resolved) == []
@@ -506,7 +545,7 @@ def test_a_projection_cloned_into_group_by_is_judged_once() -> None:
     reaches the walk twice. It is one mistake, and gets one finding."""
     resolved = resolve(
         JOINED_TO_A_CTE.format(selection="name, count(*)") + "group by 1",
-        {"test": {"id": "varchar(20)", "name": "varchar(20)"}},
+        {q("test"): {"id": "varchar(20)", "name": "varchar(20)"}},
     )
     assert ambiguous_names(resolved) == [("name", ["src", "test"])]
 
@@ -516,7 +555,7 @@ def test_a_name_written_twice_is_reported_at_both_sites() -> None:
     and an editor underlining only the first would leave the other unmarked."""
     resolved = resolve(
         JOINED_TO_A_CTE.format(selection="name, count(*)") + "group by name",
-        {"test": {"id": "varchar(20)", "name": "varchar(20)"}},
+        {q("test"): {"id": "varchar(20)", "name": "varchar(20)"}},
     )
     assert ambiguous_names(resolved) == [
         ("name", ["src", "test"]),
@@ -524,19 +563,14 @@ def test_a_name_written_twice_is_reported_at_both_sites() -> None:
     ]
 
 
-def test_no_declarations_means_no_verdicts() -> None:
-    """`declared_schema=None` is how every other caller gets the old behaviour."""
-    resolved = resolve(JOINED_TO_A_CTE.format(selection="name"))
-    assert ambiguous_names(resolved) == []
-    assert guessed_names(resolved) == []
-
-
 def qualify_one_statement(
     sql: str,
-    declared: dict[TableName, dict[ColumnName, ColumnTypeName]],
+    declared: dict[RelationKey, dict[ColumnName, ColumnTypeName]],
     tmp_path: Path,
     warn_on_column_without_source: bool = True,
     dialect_name: str = DIALECT,
+    partial: frozenset[RelationKey] = frozenset(),
+    star_over_join_behavior: StarOverJoinBehavior = "guess",
 ) -> QualifiedModel:
     """Run steps 1-3 over one file.
 
@@ -550,7 +584,11 @@ def qualify_one_statement(
         file=SqlFile(path=path, relative_path="x.sql", mtime=0.0, content_hash=""),
     )
     return qualify_one_model(
-        model, declared, dialect_name, warn_on_column_without_source
+        model,
+        declarations(declared, partial),
+        dialect_name,
+        star_over_join_behavior,
+        warn_on_column_without_source,
     )
 
 
@@ -559,7 +597,7 @@ def test_an_ambiguous_column_stops_the_statement(tmp_path: Path) -> None:
     right, and every type inferred downstream would inherit the choice."""
     result = qualify_one_statement(
         JOINED_TO_A_CTE.format(selection="name"),
-        {"test": {"id": "varchar(20)", "name": "varchar(20)"}},
+        {q("test"): {"id": "varchar(20)", "name": "varchar(20)"}},
         tmp_path,
     )
     assert [finding.code for finding in result.findings] == ["ambiguous-column"]
@@ -607,7 +645,7 @@ def test_a_file_that_does_not_parse_is_reported(tmp_path: Path) -> None:
 
 def test_an_ambiguous_column_keeps_its_source_position() -> None:
     sql = JOINED_TO_A_CTE.format(selection="name")
-    resolved = resolve(sql, {"test": {"id": "varchar(20)", "name": "varchar(20)"}})
+    resolved = resolve(sql, {q("test"): {"id": "varchar(20)", "name": "varchar(20)"}})
     (ambiguous,) = resolved.ambiguous_columns
     identifier = ambiguous.column.this
     assert isinstance(identifier, exp.Identifier)
@@ -618,47 +656,52 @@ def test_an_ambiguous_column_keeps_its_source_position() -> None:
 
 # ------------------------------------------------------------- schema fabrication
 def test_declared_types_fill_in_and_gaps_become_unknown() -> None:
-    declared = {"test": {"id": "varchar(20)"}}
-    fabricated = get_declared_types_per_table(
-        declared,
+    fabricated = get_declared_types_per_relation(
+        {q("test"): {"id": "varchar(20)"}},
         {
-            "test": parsed(["id", "modified_at"]),
-            "other": parsed(["fk"]),
+            q("test"): parsed(["id", "modified_at"]),
+            q("other"): parsed(["fk"]),
         },
-        {"test", "other"},
+        {q("test"), q("other")},
     )
     assert fabricated == {
-        "test": {"id": "varchar(20)", "modified_at": "UNKNOWN"},
-        "other": {"fk": "UNKNOWN"},
+        q("test"): {"id": "varchar(20)", "modified_at": "UNKNOWN"},
+        q("other"): {"fk": "UNKNOWN"},
     }
 
 
 def test_fabricated_schema_covers_declared_columns_the_sql_never_names() -> None:
     """A star names no column, so a schema holding only the harvested ones leaves the
     table empty and `select *` survives step 3 unexpanded."""
-    fabricated = get_declared_types_per_table(
-        {"test": {"id": "int", "never_selected": "int"}}, {"test": parsed(["id"])}, {"test"}
+    fabricated = get_declared_types_per_relation(
+        {q("test"): {"id": "int", "never_selected": "int"}},
+        {q("test"): parsed(["id"])},
+        {q("test")},
     )
-    assert fabricated == {"test": {"id": "int", "never_selected": "int"}}
+    assert fabricated == {q("test"): {"id": "int", "never_selected": "int"}}
 
 
 def test_a_table_with_nothing_known_about_it_stays_out_of_the_schema() -> None:
     """Declaring it empty would turn every read of it into an error, where the truth is
     that nobody can enumerate it."""
-    fabricated = get_declared_types_per_table({}, {}, {"undeclared"})
+    fabricated = get_declared_types_per_relation({}, {}, {q("undeclared")})
     assert fabricated == {}
 
 
 def qualified_projection_names(
-    sql: str, declared: dict[TableName, dict[ColumnName, ColumnTypeName]]
+    sql: str,
+    declared: dict[RelationKey, dict[ColumnName, ColumnTypeName]],
+    partial: frozenset[RelationKey] = frozenset(),
 ) -> list[str]:
-    """Steps 2 and 3 by hand, reporting what the statement ends up projecting."""
+    """Steps 2-6 by hand, reporting what the statement ends up projecting."""
     statement = sqlglot.parse_one(sql, read=DIALECT)
-    resolved = resolve_columns_to_source_tables(statement, DIALECT)
-    fabricated = get_declared_types_per_table(
-        declared, resolved.columns_per_table, resolved.source_table_names
+    resolved, closure = resolve_columns_to_source_tables(
+        statement, DIALECT, declarations(declared, partial)
     )
-    schema = ensure_schema(cast("dict[str, object]", fabricated), dialect=DIALECT)
+    fabricated = get_declared_types_per_relation(
+        closure.declared_types, resolved.columns_per_relation, resolved.storage_keys
+    )
+    schema = ensure_schema(nested_schema_for_sqlglot(fabricated), dialect=DIALECT)
 
     qualified = qualify(statement, schema=schema, dialect=DIALECT)
 
@@ -674,7 +717,11 @@ def test_fabricated_schema_lets_qualify_succeed() -> None:
     from mydatabase.myschema.test
     inner join src on test.id = src.test_id
     """
-    assert set(qualified_projection_names(sql, {"test": {"id": "varchar(20)"}})) == {
+    assert set(
+        qualified_projection_names(
+            sql, {q("test"): {"id": "varchar(20)"}}, frozenset({q("test")})
+        )
+    ) == {
         "id",
         "name",
         "modified_at",
@@ -765,8 +812,8 @@ def test_the_same_name_from_two_sources_stays_two_columns(tmp_path: Path) -> Non
     """Identity is `(name, source)`, so a projected `a.id` does not swallow a filter on
     `b.id`."""
     sql = """
-    with src as (select id from mydatabase.myschema.other)
-    select test.id from mydatabase.myschema.test
+    with src as (select id from other)
+    select test.id from test
     inner join src on test.id = src.id
     where src.id > 0
     """
@@ -813,8 +860,8 @@ def test_two_stars_are_each_blamed_for_their_own_column(tmp_path: Path) -> None:
     produced which half or there is nothing to act on."""
     sql = """
     select a.*, b.*
-    from mydatabase.myschema.test as a
-    inner join mydatabase.myschema.test as b on a.id = b.id
+    from test as a
+    inner join test as b on a.id = b.id
     """
     messages = duplicate_messages(sql, tmp_path)
     assert len(messages) == 3
@@ -826,7 +873,7 @@ def test_two_stars_are_each_blamed_for_their_own_column(tmp_path: Path) -> None:
 
 def test_a_duplicate_inside_a_cte_names_the_cte(tmp_path: Path) -> None:
     sql = """
-    with src as (select id, name as id from mydatabase.myschema.test)
+    with src as (select id, name as id from test)
     select src.id from src
     """
     (message,) = duplicate_messages(sql, tmp_path)
@@ -839,8 +886,8 @@ def test_two_unexpanded_stars_are_not_a_duplicate(tmp_path: Path) -> None:
     each, not two columns in collision."""
     sql = """
     select a.*, b.*
-    from mydatabase.myschema.undeclared as a
-    cross join mydatabase.myschema.also_undeclared as b
+    from undeclared as a
+    cross join also_undeclared as b
     """
     assert duplicate_messages(sql, tmp_path) == []
 
@@ -864,15 +911,10 @@ def test_an_aliased_expression_survives_beside_the_column_it_reads(
     """The projected list is the scope's *schema*, so it is keyed by output name. Keying
     it by the underlying column would drop `first_name_upper` on the floor."""
     sql = """
-    with src as (select id, first_name, last_name from mydatabase.myschema.test)
-    select *, upper(first_name) as first_name_upper from src
+    with src as (select id, name, status from test)
+    select *, upper(name) as name_upper from src
     """
-    assert projected_columns(sql, tmp_path) == [
-        "id",
-        "first_name",
-        "last_name",
-        "first_name_upper",
-    ]
+    assert projected_columns(sql, tmp_path) == ["id", "name", "status", "name_upper"]
 
 
 def test_an_unaliased_expression_is_named_the_way_the_engine_names_it(
@@ -917,8 +959,8 @@ def test_a_derived_name_still_collides_with_a_written_one(tmp_path: Path) -> Non
 def test_a_projection_reading_two_sources_reports_both(tmp_path: Path) -> None:
     sql = """
     select a.id + b.id as total
-    from mydatabase.myschema.test as a
-    inner join mydatabase.myschema.other as b on a.id = b.id
+    from test as a
+    inner join other as b on a.id = b.id
     """
     result = qualify_one_statement(sql, TEST_COLUMNS, tmp_path)
     assert result.statement is not None
@@ -958,3 +1000,275 @@ def test_a_column_read_only_inside_an_expression_stays_non_projected(
     )["<final>"]
     assert projected == [("loud", "written")]
     assert non_projected == [("status", "written")]
+
+
+# ------------------------------------------------------------- relation transparency
+def test_a_column_passes_through_a_cte_that_could_not_expand_its_star() -> None:
+    """The bug the whole closure exists for.
+
+    `ranked` projects `['*', 'rn']` because `raw_address` is undeclared, so `street` is
+    read from a relation nobody can enumerate. It belongs to `raw_address`, reachable only
+    through that star - and `rn`, which the CTE really does produce, must not follow it.
+    """
+    resolved = resolve(
+        """
+        with ranked as (
+          select *, row_number() over (partition by person_id) as rn
+          from mydatabase.myschema.raw_address
+        )
+        select person_id, street, city from ranked where rn = 1
+        """
+    )
+    assert column_names(resolved) == {
+        q("raw_address"): {"person_id", "street", "city"}
+    }
+    assert resolved.unresolvable_columns == []
+    assert resolved.relations_read_through_an_unexpandable_star == {q("raw_address")}
+
+
+def test_transparency_chains_through_two_ctes() -> None:
+    """`a` selects `*` from `b`, `b` selects `*` from an undeclared table. A column read
+    off `a` is owned by that table, two hops away."""
+    resolved = resolve(
+        """
+        with b as (select * from mydatabase.myschema.t),
+             a as (select * from b)
+        select far from a
+        """
+    )
+    assert column_names(resolved) == {q("t"): {"far"}}
+    assert resolved.unresolvable_columns == []
+
+
+def test_a_closed_relation_names_what_it_does_project() -> None:
+    """`qualify` reports this against the tree it rewrote. The message built here can name
+    the relation that failed and list what it projects, which is the difference between a
+    reader spotting a typo and a reader guessing."""
+    resolved = resolve(
+        """
+        with src as (select id, name from mydatabase.myschema.test)
+        select src.nonsense from src
+        """
+    )
+    (unresolvable,) = resolved.unresolvable_columns
+    assert unresolvable.reason == "not_projected"
+    assert unresolvable.source_alias == "src"
+    assert unresolvable.projected == ["id", "name"]
+    (finding,) = findings_for_unresolvable_columns(
+        resolved.unresolvable_columns, Positions("")
+    )
+    assert finding.message == (
+        "column 'nonsense' is read from 'src', which projects 'id' and 'name' "
+        "and not 'nonsense'"
+    )
+
+
+STAR_OVER_A_JOIN = """
+with both as (
+  select * from mydatabase.myschema.left_table
+  join mydatabase.myschema.right_table on left_table.k = right_table.k
+)
+select mystery from both
+"""
+
+
+def test_a_star_over_a_join_of_undeclared_tables_is_a_guess_by_default() -> None:
+    resolved = resolve(STAR_OVER_A_JOIN, star_over_join_behavior="guess")
+    assert guessed_names(resolved) == [
+        ("mystery", q("left_table"), [q("right_table")])
+    ]
+    assert ambiguous_names(resolved) == []
+
+
+def test_a_star_over_a_join_of_undeclared_tables_can_be_an_error() -> None:
+    """Qualifying the column fixes nothing here - no relation in the scope projects it
+    under its own steam - so the two settings are a real choice."""
+    resolved = resolve(STAR_OVER_A_JOIN, star_over_join_behavior="error")
+    assert ambiguous_names(resolved) == [
+        ("mystery", [q("left_table"), q("right_table")])
+    ]
+    assert guessed_names(resolved) == []
+    (finding,) = findings_for_ambiguous_columns(
+        resolved.ambiguous_columns, Positions("")
+    )
+    assert "arrives through a '*'" in finding.message
+    assert "star_over_join_behavior" in finding.message
+
+
+def test_declaring_one_side_of_the_join_settles_it() -> None:
+    """The payoff. One table is closed, so the star over it contributes real names and
+    only the other side is still transparent."""
+    resolved = resolve(
+        STAR_OVER_A_JOIN,
+        {q("left_table"): {"k": "int"}},
+        star_over_join_behavior="error",
+    )
+    assert ambiguous_names(resolved) == []
+    assert column_names(resolved)[q("right_table")] == {"k", "mystery"}
+
+
+def test_a_partial_declaration_keeps_its_declared_types_and_stays_open() -> None:
+    """Both halves. A partial table that lost its declared types would pass a test that
+    only checked the open half."""
+    resolved = resolve(
+        "select id, undeclared_one from mydatabase.myschema.test",
+        {q("test"): {"id": "varchar(20)"}},
+        partial=frozenset({q("test")}),
+    )
+    assert column_names(resolved) == {q("test"): {"id", "undeclared_one"}}
+    fabricated = get_declared_types_per_relation(
+        {q("test"): {"id": "varchar(20)"}},
+        resolved.columns_per_relation,
+        resolved.storage_keys,
+    )
+    assert fabricated == {
+        q("test"): {"id": "varchar(20)", "undeclared_one": "UNKNOWN"}
+    }
+
+
+def test_two_relations_with_the_same_table_name_do_not_collide() -> None:
+    """What `RelationKey` is for. A bare key would merge these two column sets, and every
+    type inferred for one would leak into the other."""
+    resolved = resolve(
+        """
+        select a.x, b.y
+        from mydatabase.schema_one.thing a
+        join mydatabase.schema_two.thing b on a.k = b.k
+        """,
+        {
+            "mydatabase.schema_one.thing": {"x": "int", "k": "int"},
+            "mydatabase.schema_two.thing": {"y": "varchar(10)", "k": "int"},
+        },
+    )
+    assert column_names(resolved) == {
+        "mydatabase.schema_one.thing": {"x", "k"},
+        "mydatabase.schema_two.thing": {"y", "k"},
+    }
+
+
+def test_a_set_operation_takes_its_names_from_the_left_arm() -> None:
+    """Arms are matched by position, not by name, so the left arm supplies the schema -
+    and a name only the right arm writes is not a column of the union."""
+    resolved = resolve(
+        """
+        with both as (
+          select p from mydatabase.myschema.t1
+          union all
+          select r from mydatabase.myschema.t2
+        )
+        select r from both
+        """
+    )
+    assert unresolvable_names(resolved) == ["r"]
+
+
+def test_a_set_operation_is_open_when_any_arm_is() -> None:
+    """The left arm enumerates, the right one cannot. Nothing downstream can place a name
+    the left arm does not carry, so the union stays transparent to both."""
+    resolved = resolve(
+        """
+        with both as (
+          select p from mydatabase.myschema.t1
+          union all
+          select * from mydatabase.myschema.t2
+        )
+        select p from both
+        """
+    )
+    assert resolved.unresolvable_columns == []
+    assert "p" in column_names(resolved)[q("t1")]
+
+
+def test_a_correlated_subquery_reads_its_outer_alias() -> None:
+    """`o` belongs to the enclosing scope and appears nowhere in the subquery's sources.
+    Stopping at the innermost scope reported it as a mistyped alias, which is the one thing
+    it certainly is not."""
+    resolved = resolve(
+        """
+        with all_orders as (select * from mydatabase.myschema.orders)
+        select o.order_id
+        from all_orders o
+        where exists (
+          select 1 from mydatabase.myschema.customer c
+          where c.customer_id = o.customer_id
+        )
+        """
+    )
+    assert resolved.unresolvable_columns == []
+    assert column_names(resolved)[q("orders")] == {"order_id", "customer_id"}
+
+
+def test_a_qualified_star_matches_the_dialect_s_own_identifier_case() -> None:
+    """Snowflake folds identifiers up and DuckDB folds them down, and `scope.sources` is
+    keyed whichever way the dialect chose. Lowercasing one side of that comparison matched
+    nothing under Snowflake, so every `select t.*` there projected an empty relation."""
+    resolved, _ = resolve_columns_to_source_tables(
+        sqlglot.parse_one(
+            """
+            with inner_scope as (select * from mydatabase.myschema.raw)
+            select o.* from inner_scope o
+            """,
+            read="snowflake",
+        ),
+        "snowflake",
+        declarations(),
+    )
+    assert resolved.unresolvable_columns == []
+
+
+# ------------------------------------------------------- lower-bound projections
+def test_a_projection_expanded_over_an_undeclared_table_is_a_lower_bound(
+    tmp_path: Path,
+) -> None:
+    """The star yields the columns this file happens to name, never the columns the table
+    has, so nothing may compare it against a complete declaration."""
+    result = qualify_one_statement(
+        "select * from mydatabase.myschema.undeclared where k > 0", {}, tmp_path
+    )
+    assert result.statement is not None
+    assert [scope.complete for scope in columns_per_scope(result.statement)] == [False]
+
+
+def test_incompleteness_propagates_through_a_cte(tmp_path: Path) -> None:
+    """A star over a lower bound is a lower bound. Deciding this per scope would call the
+    outer projection complete because its own source is a CTE, which enumerates fine."""
+    result = qualify_one_statement(
+        """
+        with src as (select * from mydatabase.myschema.undeclared where k > 0)
+        select * from src
+        """,
+        {},
+        tmp_path,
+    )
+    assert result.statement is not None
+    assert [scope.complete for scope in columns_per_scope(result.statement)] == [
+        False,
+        False,
+    ]
+
+
+def test_a_projection_over_a_declared_table_is_complete(tmp_path: Path) -> None:
+    result = qualify_one_statement(
+        "select * from test", TEST_COLUMNS, tmp_path
+    )
+    assert result.statement is not None
+    assert all(scope.complete for scope in columns_per_scope(result.statement))
+
+
+def test_enumerating_the_columns_makes_the_projection_complete_again(
+    tmp_path: Path,
+) -> None:
+    """`address.sql`'s shape: the star inside the CTE is a lower bound, but the CTE that
+    selects from it writes its columns out, so the model's own projection is exact."""
+    result = qualify_one_statement(
+        """
+        with ranked as (select * from mydatabase.myschema.undeclared),
+             named as (select k, v from ranked)
+        select * from named
+        """,
+        {},
+        tmp_path,
+    )
+    assert result.statement is not None
+    complete = {scope.name: scope.complete for scope in columns_per_scope(result.statement)}
+    assert complete == {"ranked": False, "named": True, "<final>": True}

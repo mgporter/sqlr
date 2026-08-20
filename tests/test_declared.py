@@ -596,3 +596,104 @@ def test_the_table_name_carries_its_position(tmp_path: Path) -> None:
     assert table is not None
     assert table.source.slice(table.name_span) == "raw_department"
     assert table.where == "s.yml:8"
+
+
+# ---- declaration_is_partial ----------------------------------------------------------
+PARTIAL_SOURCES = """\
+version: 2
+
+sources:
+  - name: mysource
+    database: mydatabase
+    schema: myschema
+    config:
+      meta:
+        declaration_is_partial: true
+    tables:
+      - name: inherits_it
+        columns:
+          - name: a
+            data_type: integer
+      - name: overrides_it
+        config:
+          meta:
+            declaration_is_partial: false
+        columns:
+          - name: b
+            data_type: integer
+      - name: writes_the_older_spelling
+        meta:
+          declaration_is_partial: false
+        columns:
+          - name: c
+            data_type: integer
+"""
+
+
+def test_a_source_meta_flag_is_inherited_by_its_tables(tmp_path: Path) -> None:
+    """dbt already defines `meta:` on a source as inherited by its tables, so a whole
+    partly-documented source says so in one line rather than once per table."""
+    declared = _load(tmp_path, **{"s.yml": PARTIAL_SOURCES})
+    partial = {
+        table.name: table.declaration_is_partial for table in declared.sources.values()
+    }
+    assert partial == {
+        "inherits_it": True,
+        "overrides_it": False,
+        "writes_the_older_spelling": False,
+    }
+    assert declared.errors == []
+
+
+def test_the_flag_defaults_to_complete(tmp_path: Path) -> None:
+    """Completeness is the payoff for declaring, so it is what a declaration means unless
+    it says otherwise."""
+    declared = _load(tmp_path, **{"s.yml": SOURCES})
+    (table,) = declared.sources.values()
+    assert table.declaration_is_partial is False
+
+
+def test_a_meta_flag_that_is_not_a_boolean_is_warned_about(tmp_path: Path) -> None:
+    """YAML 1.1 reads `yes` as true and sqlr deliberately does not. A flag that quietly
+    did nothing is worse than one that was never written."""
+    declared = _load(
+        tmp_path,
+        **{"s.yml": """\
+version: 2
+
+sources:
+  - name: mysource
+    tables:
+      - name: t
+        config:
+          meta:
+            declaration_is_partial: yes
+        columns:
+          - name: a
+            data_type: integer
+"""},
+    )
+    (table,) = declared.sources.values()
+    assert table.declaration_is_partial is False
+    assert any("is not `true` or `false`" in warning for warning in declared.warnings)
+
+
+def test_a_partial_declaration_with_no_columns_is_warned_about(tmp_path: Path) -> None:
+    declared = _load(
+        tmp_path,
+        **{"s.yml": """\
+version: 2
+
+sources:
+  - name: mysource
+    tables:
+      - name: t
+        config:
+          meta:
+            declaration_is_partial: true
+"""},
+    )
+    assert any(
+        "unnecessary declaration_is_partial flag set for mysource.t" in warning
+        for warning in declared.warnings
+    )

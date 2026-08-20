@@ -18,8 +18,9 @@ from sqlr.sql_analysis2.types import (
     GuessedColumn,
     ParsedColumn,
     ProjectionSite,
+    RelationKey,
     ScopeKind,
-    TableName,
+    UnresolvableColumn,
 )
 from sqlr.typemap import resolve_type_name
 
@@ -109,22 +110,46 @@ def span_of_access(column: exp.Column, positions: Positions) -> SourceSpan | Non
     return span
 
 
+def _unresolvable_message(unresolvable: UnresolvableColumn) -> str:
+    """Why one column belongs to nothing, in terms the reader can act on.
+
+    The two reasons need different sentences because they have different fixes. A qualifier
+    naming no relation is a typo in the alias. A relation that exists and does not project
+    the name is either a typo in the column or a declaration that should be partial - and
+    listing what the relation *does* project is what lets the reader tell which.
+    """
+    name = unresolvable.column.name
+    if unresolvable.reason == "no_such_source" or unresolvable.source_alias is None:
+        return f"column '{name}' could not be resolved to any source"
+
+    projects = (
+        f"projects {_as_a_list_of_names(unresolvable.projected)}"
+        if unresolvable.projected
+        else "projects nothing"
+    )
+    return (
+        f"column '{name}' is read from '{unresolvable.source_alias}', which {projects} "
+        f"and not '{name}'"
+    )
+
+
 def findings_for_unresolvable_columns(
-    columns: list[exp.Column], positions: Positions
+    columns: list[UnresolvableColumn], positions: Positions
 ) -> list[ColumnFinding]:
-    """A column no source can own - a typo, or a missing join."""
+    """A column no relation can own - a typo, a missing join, or a complete declaration
+    that omits a column the SQL reads."""
     return [
         ColumnFinding(
             code="unresolvable-column",
-            column_name=column.name,
-            message=f"column '{column.name}' could not be resolved to any source",
-            span=positions.span_of(column),
+            column_name=unresolvable.column.name,
+            message=_unresolvable_message(unresolvable),
+            span=positions.span_of(unresolvable.column),
         )
-        for column in columns
+        for unresolvable in columns
     ]
 
 
-def _as_a_list_of_names(names: list[TableName]) -> str:
+def _as_a_list_of_names(names: list[str]) -> str:
     """`'a'`, `'a' and 'b'`, `'a', 'b' and 'c'` - a list a person can read aloud."""
     quoted = [f"'{name}'" for name in names]
     if len(quoted) <= 1:
@@ -135,25 +160,40 @@ def _as_a_list_of_names(names: list[TableName]) -> str:
 def findings_for_ambiguous_columns(
     ambiguous: list[AmbiguousColumn], positions: Positions
 ) -> list[ColumnFinding]:
-    """A bare column that two sources each certainly own.
+    """A column two relations could each own.
 
-    There is no tie-break to apply and no default worth printing, so the message offers
-    the candidates and asks for a qualifier rather than announcing a pick.
+    There is no tie-break to apply and no default worth printing, so the message offers the
+    candidates and asks for the fix rather than announcing a pick - and which fix that is
+    depends on why the tie happened. A name two relations both project needs a qualifier. A
+    name arriving through a star over a join of undeclared tables cannot be qualified into
+    existence: one of those tables has to declare its columns.
     """
-    return [
-        ColumnFinding(
-            code="ambiguous-column",
-            column_name=column.name,
-            message=(
+    findings: list[ColumnFinding] = []
+    for column, candidate_sources, kind in ambiguous:
+        if kind == "star_over_join":
+            message = (
+                f"column '{column.name}' arrives through a '*' over "
+                f"{_as_a_list_of_names(candidate_sources)}, "
+                f"{'neither' if len(candidate_sources) == 2 else 'none'} of which "
+                "declares its columns, so nothing says which one owns it; declare one of "
+                "them, or set star_over_join_behavior to 'guess'"
+            )
+        else:
+            message = (
                 f"column '{column.name}' is ambiguous: "
                 f"{_as_a_list_of_names(candidate_sources)} "
-                f"{'both' if len(candidate_sources) == 2 else 'all'} declare it; "
+                f"{'both' if len(candidate_sources) == 2 else 'all'} project it; "
                 "qualify it with a source alias"
-            ),
-            span=positions.span_of(column),
+            )
+        findings.append(
+            ColumnFinding(
+                code="ambiguous-column",
+                column_name=column.name,
+                message=message,
+                span=positions.span_of(column),
+            )
         )
-        for column, candidate_sources in ambiguous
-    ]
+    return findings
 
 
 def findings_for_columns_without_a_source(
@@ -254,8 +294,8 @@ def findings_for_duplicate_projected_columns(
 
 
 def findings_for_columns_declared_as_scalar_but_read_as_structured(
-    declared: dict[TableName, dict[ColumnName, ColumnTypeName]],
-    columns_per_table: dict[TableName, dict[ColumnName, ParsedColumn]],
+    declared: dict[RelationKey, dict[ColumnName, ColumnTypeName]],
+    columns_per_relation: dict[RelationKey, dict[ColumnName, ParsedColumn]],
     positions: Positions,
 ) -> list[ColumnFinding]:
     """A column read as `x.field` or `x['field']` cannot hold a scalar.
@@ -266,7 +306,7 @@ def findings_for_columns_declared_as_scalar_but_read_as_structured(
     too, and is somebody else's finding.
     """
     findings: list[ColumnFinding] = []
-    for table_name, columns in columns_per_table.items():
+    for table_name, columns in columns_per_relation.items():
         for column in columns.values():
             if not column.requires_structured_type:
                 continue

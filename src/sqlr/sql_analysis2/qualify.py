@@ -13,7 +13,7 @@ reported rather than half-analysed.
 import logging
 from pathlib import Path
 from collections.abc import Sequence
-from typing import Literal, NamedTuple, Protocol, cast
+from typing import Literal, NamedTuple, Protocol
 
 import sqlglot
 from sqlglot import ParseError, exp
@@ -22,7 +22,7 @@ from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import Scope, traverse_scope
 from sqlglot.schema import Schema, ensure_schema
 
-from sqlr.config.types import SqlrConfig
+from sqlr.config.types import SqlrConfig, StarOverJoinBehavior
 from sqlr.declared.types import DeclaredSchemas
 from sqlr.selection.types import Model
 from sqlr.sql_analysis2.reporting import (
@@ -39,10 +39,11 @@ from sqlr.sql_analysis2.output_names import (
     is_a_name_meaning_unnamed,
     output_column_namer,
 )
+from sqlr.sql_analysis2.relations import name_and_kind_of_scope, relation_key_of
 from sqlr.sql_analysis2.resolve import (
-    declared_columns,
-    get_declared_types_per_table,
+    get_declared_types_per_relation,
     is_declared,
+    nested_schema_for_sqlglot,
     resolve_columns_to_source_tables,
 )
 from sqlr.sql_analysis2.sourcedoc import (
@@ -56,8 +57,10 @@ from sqlr.sql_analysis2.types import (
     ColumnTypeName,
     DuplicateProjection,
     ProjectionSite,
+    RelationKey,
     ResolvedColumns,
     ScopeKind,
+    SourceKind,
     TableName,
 )
 
@@ -75,18 +78,21 @@ type ColumnQualifierOrigin = Literal["written", "inferred", "star"]
 """
 
 
-type SourceKind = ScopeKind | Literal["table", "unknown"]
-
-
 class ColumnSource(NamedTuple):
-    """Where a column reads from, named the two ways a reader needs it."""
+    """Where a column reads from, named the three ways a reader and a pass need it."""
 
     alias: TableName
-    """The qualifier the column carries after step 3 - an alias, not necessarily a table."""
+    """The qualifier the column carries after step 6 - an alias, not necessarily a table."""
     name: TableName | None
     """The real table behind the alias, when the source is a table and is named
     differently. None when the alias *is* the name, or when the source is a CTE."""
     kind: SourceKind
+    key: RelationKey | None = None
+    """The relation's identity in the gap-filled schema, when it is a real table.
+
+    Not the alias and not the bare name: those are what a reader recognises, while this is
+    what a schema lookup needs, and two schemas may each hold a `raw_department`. None for
+    a CTE or derived table, which has no schema slot at all."""
 
 
 class ColumnReference(NamedTuple):
@@ -141,6 +147,13 @@ class ScopeColumns(NamedTuple):
     a downstream pass reading these as two sets must not have to subtract one from the
     other. A column read only inside a computed projection stays here, because no output
     column carries its name."""
+    complete: bool = True
+    """Whether `projected` is the whole relation or only a lower bound.
+
+    False when a star expanded against a table nobody declared, whose column set was
+    fabricated from the reads in this file rather than read from a yml. Anything comparing
+    this projection against a complete declaration has to check it first, or it reports the
+    declaration's other columns as missing when they are merely unmentioned."""
 
 
 class QualifiedStatement(NamedTuple):
@@ -154,8 +167,9 @@ class QualifiedStatement(NamedTuple):
     mapped_schema: Schema
     """The gap-filled schema as sqlglot wants it. Shared by `qualify` and `annotate_types`
     so neither has to build a `MappingSchema` from a bare dict again."""
-    declared_types_per_table: dict[TableName, dict[ColumnName, ColumnTypeName]]
-    """The same schema as plain data - what step 5 widens and what `needs_inference` reads."""
+    declared_types_per_relation: dict[RelationKey, dict[ColumnName, ColumnTypeName]]
+    """The same schema as plain data - what the inference phase widens and what
+    `needs_inference` reads."""
     resolved: ResolvedColumns
     engine_named_projections: dict[int, ColumnName]
     """What the engine calls each projection nobody named, keyed by the id of its
@@ -220,15 +234,12 @@ def qualify_schema(
     """
     dialect_name = cfg.general.sql_dialect or DEFAULT_DIALECT
 
-    # Declarations are read once for the run: they do not vary per model.
-    declared_schema = declared_columns(declared)
-
-
     return [
         qualify_one_model(
             model,
-            declared_schema,
+            declared,
             dialect_name,
+            cfg.general.star_over_join_behavior,
             cfg.general.warn_on_column_without_source,
         )
         for model in models
@@ -237,8 +248,9 @@ def qualify_schema(
 
 def qualify_one_model(
     model: Model,
-    declared_schema: dict[TableName, dict[ColumnName, ColumnTypeName]],
+    declared: DeclaredSchemas,
     dialect_name: str,
+    star_over_join_behavior: StarOverJoinBehavior = "guess",
     warn_on_column_without_source: bool = True,
 ) -> QualifiedModel:
     """Steps 1-3 for one file. Never raises: every failure comes back in the result."""
@@ -282,20 +294,23 @@ def qualify_one_model(
     statement = parsed[0]
     logger.info("parsed %s", model.relative_path)
 
-    # Step 2a: a probe qualification resolves every column to the source it reads from.
-    # This is necessary to get the sources for columns without an alias but which MUST
-    # come from a source because no other source has that column.
-    # E.g.: with t2 as (select distinct id from mytable)
-    #       select a from t1 join t2 on t1.id = t2.id;
-    # Here, 'a' must come from t1, since t2 only has 'id'.
+    # Steps 2-4: a probe qualification gives every bare column a qualifier, the relation
+    # closure says what each relation projects and what it stays transparent to, and one
+    # verdict table attributes every column to the relation that *owns* it.
+    #
+    # Those are two different questions. The probe answers which relation a column reads
+    # from, which is what lets `select a from t1 join t2 on t1.id = t2.id` credit `a` to
+    # `t1` when `t2` only has `id`. Ownership is transitive: `select street from ranked`,
+    # where `ranked` is `select * from raw_address` over an undeclared table, reads from
+    # `ranked` but is owned by `raw_address`, reachable only through the unexpanded star.
     try:
-        resolved = resolve_columns_to_source_tables(
-            statement, dialect_name, declared_schema=declared_schema
+        resolved, closure = resolve_columns_to_source_tables(
+            statement, dialect_name, declared, star_over_join_behavior
         )
     except OptimizeError as e:
         return failed([str(e)])
 
-    # Everything wrong with the resolution is reported before step 3. `qualify` describes
+    # Everything wrong with the resolution is reported before step 6. `qualify` describes
     # the tree it rewrote rather than the SQL that was written, so its message for the
     # same mistake is strictly harder to act on than the one built here.
     findings = [
@@ -310,17 +325,15 @@ def qualify_one_model(
             resolved.guessed_columns, positions
         )
 
-    # Step 2b: match the resolved tables against the source declarations to fill in
-    # declared type information.
-    declared_types_per_table = get_declared_types_per_table(
-        declared_schema, resolved.columns_per_table, resolved.source_table_names
+    # Step 5: gap-fill. The union of what the SQL names and what the yml declares, with
+    # declared types where the user wrote them and UNKNOWN everywhere else.
+    declared_types_per_relation = get_declared_types_per_relation(
+        closure.declared_types, resolved.columns_per_relation, resolved.storage_keys
     )
     findings += findings_for_columns_declared_as_scalar_but_read_as_structured(
-        declared_schema, resolved.columns_per_table, positions
+        closure.declared_types, resolved.columns_per_relation, positions
     )
     findings = findings_without_exact_duplicates(findings)
-
-    print(resolved)
 
     # Two findings have to stop the statement. An unresolvable column belongs to no table,
     # so no fabricated schema can cover it and `qualify` raises. An ambiguous one belongs
@@ -331,26 +344,29 @@ def qualify_one_model(
     if resolved.unresolvable_columns or resolved.ambiguous_columns:
         return failed([], findings)
 
-    for table, columns in declared_types_per_table.items():
+    for relation, columns in declared_types_per_relation.items():
         declared_count = sum(1 for name in columns.values() if is_declared(name))
         logger.info(
-            "%s: %d of %d columns declared, %d gap-filled UNKNOWN",
-            table,
+            "%s: %d of %d columns declared, %d fabricated from reads%s",
+            relation,
             declared_count,
             len(columns),
             len(columns) - declared_count,
+            # A fabricated column set is a *lower bound* - the columns this file happens to
+            # name, never the columns the table has - so a star expanded over it is one too.
+            " (star expansions over it are a lower bound)"
+            if relation in resolved.relations_read_through_an_unexpandable_star
+            else "",
         )
 
     # Built once and threaded through: `qualify` and `annotate_types` each construct a
-    # MappingSchema from a bare dict otherwise. The cast is the one place our
-    # `{table: {column: type}}` meets sqlglot's invariant `dict[str, object]`.
+    # MappingSchema from a bare dict otherwise. The nesting is what lets sqlglot match a
+    # table node's own catalog/db/name parts - see `nested_schema_for_sqlglot`.
     mapped_schema = ensure_schema(
-        cast("dict[str, object]", declared_types_per_table), dialect=dialect_name
+        nested_schema_for_sqlglot(declared_types_per_relation), dialect=dialect_name
     )
-    print()
-    print(mapped_schema.column_names("raw_address"))
 
-    # Two things about the projection lists that only exist before step 3. Where the stars
+    # Two things about the projection lists that only exist before step 6. Where the stars
     # are, because step 3 expands them away and a duplicate they cause can only be
     # explained by pointing back at them; and what the engine calls the projections nobody
     # named, because step 3 relabels those `_col_1`.
@@ -359,12 +375,10 @@ def qualify_one_model(
         statement, positions, dialect_name
     )
 
-    # Step 3: qualify. Every column names its relation, `select *` becomes a real
+    # Step 6: qualify. Every column names its relation, `select *` becomes a real
     # projection list. Prerequisite for all type inference, and 39% of the runtime.
     try:
         qualified = qualify(statement, schema=mapped_schema, dialect=dialect_name)
-        print()
-        print(qualified)
     except OptimizeError as e:
         return failed([str(e)], findings)
 
@@ -400,7 +414,7 @@ def qualify_one_model(
             qualified=qualified,
             scopes=scopes,
             mapped_schema=mapped_schema,
-            declared_types_per_table=declared_types_per_table,
+            declared_types_per_relation=declared_types_per_relation,
             resolved=resolved,
             engine_named_projections=engine_names,
             dialect_name=dialect_name,
@@ -409,23 +423,6 @@ def qualify_one_model(
 
 
 # ------------------------------------------------------- reading the qualified tree
-def name_and_kind_of_scope(scope: Scope) -> tuple[str, ScopeKind]:
-    """What to call a scope in a report.
-
-    A scope has no name of its own; what names it is the thing that holds it, so the
-    answer comes from the parent node. An unnamed one is a set-operation arm, which is
-    reported as a branch rather than given an invented name.
-    """
-    parent = scope.expression.parent
-    if isinstance(parent, exp.CTE):
-        return parent.alias, "cte"
-    if isinstance(parent, exp.Subquery):
-        return parent.alias or "<subquery>", "derived"
-    if isinstance(parent, exp.SetOperation):
-        return "<branch>", "branch"
-    return "<final>", "final"
-
-
 def qualifier_of_a_star_projection(projection: exp.Expr) -> TableName | None | Literal[False]:
     """The source a `*` projection is qualified by, or False when it is not a star.
 
@@ -593,7 +590,9 @@ def _source_of(column: exp.Column, scope: Scope) -> ColumnSource:
     source = scope.sources.get(column.table)
     if isinstance(source, exp.Table):
         name = source.name if source.name != column.table else None
-        return ColumnSource(alias=column.table, name=name, kind="table")
+        return ColumnSource(
+            alias=column.table, name=name, kind="table", key=relation_key_of(source)
+        )
     if isinstance(source, Scope):
         return ColumnSource(
             alias=column.table, name=None, kind=name_and_kind_of_scope(source)[1]
@@ -630,14 +629,13 @@ def column_reference_of(
     else:
         origin = "written"
 
-    declared_table = source.name or source.alias
     return ColumnReference(
         name=column.name,
         source=source,
         origin=origin,
-        declared=source.kind == "table"
+        declared=source.key is not None
         and is_declared(
-            statement.declared_types_per_table.get(declared_table.lower(), {}).get(
+            statement.declared_types_per_relation.get(source.key, {}).get(
                 column.name.lower()
             )
         ),
@@ -682,7 +680,9 @@ def _projected_column(
     )
 
 
-def scope_columns_of(scope: Scope, statement: QualifiedStatement) -> ScopeColumns:
+def scope_columns_of(
+    scope: Scope, statement: QualifiedStatement, incomplete_scopes: set[int] | None = None
+) -> ScopeColumns:
     """One scope's output schema, and the columns it read that no output carries.
 
     The projection list is taken as written, in order and without deduplication: two
@@ -728,16 +728,58 @@ def scope_columns_of(scope: Scope, statement: QualifiedStatement) -> ScopeColumn
         kind=kind,
         projected=projected,
         non_projected=list(non_projected.values()),
+        complete=projection_is_complete(
+            scope, projected, statement, incomplete_scopes or set()
+        ),
     )
+
+
+def projection_is_complete(
+    scope: Scope,
+    projected: list[ProjectedColumn],
+    statement: QualifiedStatement,
+    incomplete_scopes: set[int],
+) -> bool:
+    """Whether this scope's projection list is the whole relation or only a lower bound.
+
+    A star over a table nobody declared expands to the columns *this file happens to name*,
+    not to the columns the table has - `raw_address` gets seven because `address.sql` writes
+    seven, and the real table may have thirty. Every projection built from such a star
+    inherits that, and so does every projection built from one of those, which is why this
+    propagates rather than being decided per scope.
+
+    Recorded rather than reported here: a lower bound is only wrong when something compares
+    it against a complete declaration, and that comparison belongs to `validate-schema`.
+
+    `incomplete_scopes` is filled in dependency order by `columns_per_scope`, so every
+    source of this scope has already been decided.
+    """
+    for entry in projected:
+        if entry.origin != "star" or entry.column is None:
+            continue
+        source = entry.column.source
+        if source.key in statement.resolved.relations_read_through_an_unexpandable_star:
+            return False
+        inner = scope.sources.get(source.alias)
+        if isinstance(inner, Scope) and id(inner.expression) in incomplete_scopes:
+            return False
+    return True
 
 
 def columns_per_scope(statement: QualifiedStatement) -> list[ScopeColumns]:
     """Every scope with columns to report, in the order sqlglot resolves them.
 
     That order is dependency order - a CTE before whatever selects from it - so the final
-    projection comes last, which is where a reader looks for it. Scopes with nothing in
-    either list are dropped: a set-operation wrapper has no columns of its own, and an
-    empty table under its name only asks the reader to work out why it is empty.
+    projection comes last, which is where a reader looks for it, and every scope's sources
+    have been described before it is. Scopes with nothing in either list are dropped: a
+    set-operation wrapper has no columns of its own, and an empty table under its name only
+    asks the reader to work out why it is empty.
     """
-    scopes = [scope_columns_of(scope, statement) for scope in statement.scopes]
-    return [scope for scope in scopes if scope.projected or scope.non_projected]
+    incomplete_scopes: set[int] = set()
+    described: list[ScopeColumns] = []
+    for scope in statement.scopes:
+        columns = scope_columns_of(scope, statement, incomplete_scopes)
+        if not columns.complete:
+            incomplete_scopes.add(id(scope.expression))
+        described.append(columns)
+    return [scope for scope in described if scope.projected or scope.non_projected]

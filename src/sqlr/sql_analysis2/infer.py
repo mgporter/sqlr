@@ -28,7 +28,7 @@ from sqlr.sql_analysis2.catalog import DialectName, FamilyName
 from sqlr.sql_analysis2.facts import Facts, ValueSite
 from sqlr.sql_analysis2.resolve import is_declared
 from sqlr.sql_analysis2.sourcedoc import SourceSpan
-from sqlr.sql_analysis2.types import ColumnName, ColumnTypeName, TableName
+from sqlr.sql_analysis2.types import ColumnName, ColumnTypeName, RelationKey
 
 
 @dataclass(frozen=True)
@@ -50,7 +50,7 @@ class TypeEvidence:
 
 @dataclass(frozen=True)
 class InferredColumnType:
-    table: TableName
+    table: RelationKey
     column: ColumnName
     type_name: ColumnTypeName
     """What goes into the widened schema - concrete, because sqlglot's schema speaks types
@@ -63,7 +63,7 @@ class InferredColumnType:
 class ColumnTypeConflict:
     """One undeclared column whose facts disagree. Infers nothing, reports every site."""
 
-    table: TableName
+    table: RelationKey
     column: ColumnName
     evidence: list[TypeEvidence]
 
@@ -85,20 +85,20 @@ class Inference:
         default_factory=list[ColumnTypeConflict]
     )
 
-    def types_per_table(self) -> dict[TableName, dict[ColumnName, InferredColumnType]]:
-        out: dict[TableName, dict[ColumnName, InferredColumnType]] = {}
+    def types_per_table(self) -> dict[RelationKey, dict[ColumnName, InferredColumnType]]:
+        out: dict[RelationKey, dict[ColumnName, InferredColumnType]] = {}
         for entry in self.inferred:
             out.setdefault(entry.table, {})[entry.column] = entry
         return out
 
 
 def undeclared_column_slots(
-    declared_types_per_table: dict[TableName, dict[ColumnName, ColumnTypeName]],
-) -> set[tuple[TableName, ColumnName]]:
+    declared_types_per_relation: dict[RelationKey, dict[ColumnName, ColumnTypeName]],
+) -> set[tuple[RelationKey, ColumnName]]:
     """Every schema slot step 2 gap-filled rather than read from a yml."""
     return {
         (table, column)
-        for table, columns in declared_types_per_table.items()
+        for table, columns in declared_types_per_relation.items()
         for column, type_name in columns.items()
         if not is_declared(type_name)
     }
@@ -106,15 +106,15 @@ def undeclared_column_slots(
 
 def evidence_per_undeclared_column(
     facts: Facts,
-    declared_types_per_table: dict[TableName, dict[ColumnName, ColumnTypeName]],
-) -> dict[tuple[TableName, ColumnName], list[TypeEvidence]]:
+    declared_types_per_relation: dict[RelationKey, dict[ColumnName, ColumnTypeName]],
+) -> dict[tuple[RelationKey, ColumnName], list[TypeEvidence]]:
     """Collect what every fact says about the columns nobody described.
 
     Facts about anything else are collected too - fixture generation reads them - they just
     have no schema slot to fill, so they are skipped here.
     """
-    undeclared = undeclared_column_slots(declared_types_per_table)
-    evidence: dict[tuple[TableName, ColumnName], list[TypeEvidence]] = {}
+    undeclared = undeclared_column_slots(declared_types_per_relation)
+    evidence: dict[tuple[RelationKey, ColumnName], list[TypeEvidence]] = {}
 
     for claim in facts.type_claims:
         key = claim.site.source_table_column
@@ -157,14 +157,14 @@ def evidence_per_undeclared_column(
 
 def infer_types_for_undeclared_columns(
     facts: Facts,
-    declared_types_per_table: dict[TableName, dict[ColumnName, ColumnTypeName]],
+    declared_types_per_relation: dict[RelationKey, dict[ColumnName, ColumnTypeName]],
     dialect_name: DialectName,
 ) -> Inference:
     """One verdict per undeclared column: a type, or a conflict."""
     inference = Inference()
 
     for (table, column), evidence in sorted(
-        evidence_per_undeclared_column(facts, declared_types_per_table).items()
+        evidence_per_undeclared_column(facts, declared_types_per_relation).items()
     ):
         families = {item.family for item in evidence}
         if len(families) > 1:
@@ -201,16 +201,16 @@ def type_name_for_evidence(
 
 
 def widen_schema_with_inferred_types(
-    declared_types_per_table: dict[TableName, dict[ColumnName, ColumnTypeName]],
+    declared_types_per_relation: dict[RelationKey, dict[ColumnName, ColumnTypeName]],
     inference: Inference,
-) -> dict[TableName, dict[ColumnName, ColumnTypeName]]:
+) -> dict[RelationKey, dict[ColumnName, ColumnTypeName]]:
     """The gap-filled schema with inferred types written into its UNKNOWN slots.
 
     ONLY fills UNKNOWN slots. Never overwrites a declared type. This is what makes the
     step-5/6 skip sound, and what makes widening converge in one round. Breaking it breaks
     both - see the revision section of `type_check_plan.md`.
     """
-    widened = {table: dict(columns) for table, columns in declared_types_per_table.items()}
+    widened = {table: dict(columns) for table, columns in declared_types_per_relation.items()}
     for entry in inference.inferred:
         current = widened.get(entry.table, {}).get(entry.column)
         if current is None or is_declared(current):

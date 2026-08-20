@@ -14,6 +14,20 @@ type TableName = str
 type ColumnName = str
 type ColumnTypeName = str
 
+type RelationKey = str
+"""A relation's identity: the parts the SQL has to write, lowercased and dotted -
+`mydatabase.myschema.raw_address`, or bare `employee` when the yml declares neither part.
+
+The full name and not the bare one, because two sources may each have a `raw_department`
+as long as they land in different schemas, and a bare key silently merges their column
+sets. The same string `DeclaredSourceTable.key` produces, so both sides of a declaration
+lookup are spelled the same way.
+"""
+
+type RelationAlias = str
+"""The name a column qualifies itself with inside one scope. An alias, a CTE name or a
+table name - which of those it is, is `RelationColumnSet.kind`."""
+
 type ScopeKind = Literal["cte", "derived", "final", "branch"]
 """What a scope is, for a reader looking at a report.
 
@@ -22,6 +36,9 @@ type ScopeKind = Literal["cte", "derived", "final", "branch"]
 - `final`   - the statement's own projection, the one the model is.
 - `branch`  - one arm of a set operation, or a scope with no name of its own.
 """
+
+type SourceKind = ScopeKind | Literal["table", "unknown"]
+"""What a column's qualifier turned out to name."""
 
 type ArgumentIndex = int
 """A zero-based position in a call's argument list, in sqlglot's node order. Reported to
@@ -94,32 +111,71 @@ class ParsedColumn(NamedTuple):
         )
 
 
-class AmbiguousColumn(NamedTuple):
-    """A bare column that two or more sources are each known to own.
+type AmbiguityKind = Literal["projected_by_several", "star_over_join"]
+"""Which of the two dead ends an ambiguous column hit.
 
-    "Known" is the whole point: a CTE's projections and a declared table's column list are
-    both complete answers, so a name appearing in two of them has no correct attribution
-    at all. Nothing can break the tie, which is why this stops the statement.
+- `projected_by_several` - two relations are each *known* to project the name. A CTE's
+  projections and a complete declaration are both complete answers, so a name appearing in
+  two of them has no correct attribution at all. Qualifying the column fixes it.
+- `star_over_join` - the name passes through a star over a join of relations nobody can
+  enumerate, and `star_over_join_behavior` is `error`. Qualifying it fixes nothing, because
+  no relation in the scope projects the name under its own steam; declaring one of the
+  tables does.
+"""
+
+
+class AmbiguousColumn(NamedTuple):
+    """A column that two or more relations could each own, with no way to choose.
+
+    Nothing can break the tie, which is why this stops the statement - committing to either
+    would hand step 6 an attribution as likely wrong as right, and every type inferred
+    downstream would inherit the choice.
     """
 
     column: exp.Column
     candidate_sources: list[TableName]
-    """Every source known to own the name, sorted - the choices offered to the reader."""
+    """Every relation that could own the name, sorted - the choices offered to the reader."""
+    kind: AmbiguityKind = "projected_by_several"
 
 
 class GuessedColumn(NamedTuple):
-    """A bare column attributed by elimination rather than by proof.
+    """A column attributed by elimination rather than by proof.
 
-    One source is known to own the name (or is the only one left standing), while some
-    other source in the scope has an unknown column set and might own it too. The
-    attribution is the best available answer and is used, but the reader is told.
+    One relation is known to project the name (or is the only one left standing), while
+    some other relation in the scope cannot enumerate its columns and might project it
+    too. The attribution is the best available answer and is used, but the reader is told.
     """
 
     column: exp.Column
     resolved_source: TableName
-    """The source the column was credited to."""
+    """The relation the column was credited to."""
     open_sources: list[TableName]
-    """Sources whose column set is unknown, sorted - the reason this is a guess."""
+    """Relations whose column set is unknown, sorted - the reason this is a guess."""
+
+
+type UnresolvableReason = Literal["no_such_source", "not_projected"]
+"""Why a column belongs to nothing.
+
+- `no_such_source` - its qualifier names no relation in the scope: a mistyped alias.
+- `not_projected`  - the relation it names is closed and does not project it: a mistyped
+  column, or a declaration that is complete when it should be partial.
+"""
+
+
+class UnresolvableColumn(NamedTuple):
+    """A column no relation can own, and enough context to say why.
+
+    `qualify` reports the same mistake against the tree it rewrote rather than the SQL that
+    was written, so its message is strictly harder to act on than one built here: this can
+    name the relation that failed to project the column and list what it projects instead.
+    """
+
+    column: exp.Column
+    reason: UnresolvableReason
+    source_alias: TableName | None
+    """The relation the column named, when it named one that exists."""
+    projected: list[ColumnName]
+    """What that relation projects, sorted. Empty when there is no relation to ask."""
 
 
 class ProjectionSite(NamedTuple):
@@ -151,21 +207,32 @@ class ResolvedColumns(NamedTuple):
     """What the probe pass learned: which columns each real table is asked for, how they
     were read, which columns no source can own, and which were attributed uncertainly."""
 
-    columns_per_table: dict[TableName, dict[ColumnName, ParsedColumn]]
-    source_table_names: set[TableName]
+    columns_per_relation: dict[RelationKey, dict[ColumnName, ParsedColumn]]
+    """Keyed by the full relation name, not the bare table name - see `RelationKey`. A
+    column reaches a relation here either by being read off it directly or by passing
+    through an open relation's star, which is the only way `address.sql` resolves at all."""
+    storage_keys: set[RelationKey]
     """Every real table the statement reads, whether or not it names a column of it.
 
     A `select *` names none, so the table would otherwise be absent from the gap-filled
-    schema entirely and step 3 would have nothing to expand the star against."""
-    unresolvable_columns: list[exp.Column]
+    schema entirely and step 6 would have nothing to expand the star against."""
+    unresolvable_columns: list[UnresolvableColumn]
     columns_read_with_unsupported_dot_notation: list[exp.Column]
     """Dotted names absorbed as struct reads by a dialect that has no such syntax. Still
     harvested into `columns_per_table` - the report is the point, and dropping them only
     makes step 3 fail with a worse message."""
     ambiguous_columns: list[AmbiguousColumn]
-    """Deliberately *not* harvested into `columns_per_table`: recording the probe's pick
+    """Deliberately *not* harvested into `columns_per_relation`: recording the probe's pick
     would fabricate a declaration slot on a table that may not own the column, and every
     type inferred from it downstream would inherit the mistake."""
+    relations_read_through_an_unexpandable_star: set[RelationKey]
+    """Tables whose column set was fabricated from reads rather than declared.
+
+    What the schema ends up saying about these is a *lower bound* - the columns this file
+    happens to name, not the columns the table has - so any projection expanded from a star
+    over one of them is a lower bound too. `qualify.py` propagates that through the scope
+    graph; `validate-schema` needs it to avoid reporting a complete declaration's columns
+    as missing from an under-approximated projection."""
     guessed_columns: list[GuessedColumn]
     """Harvested normally. The guess is the best answer available, and dropping it would
     only cost the column its declared type."""

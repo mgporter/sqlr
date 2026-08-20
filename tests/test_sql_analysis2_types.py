@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 from sqlglot import exp
 
+from declared_helpers import declarations
+
 from sqlr.catalog.types import SqlFile
 from sqlr.selection.types import Model
 from sqlr.sql_analysis2.annotate import (
@@ -24,7 +26,7 @@ from sqlr.sql_analysis2.annotate_types import AnnotatedModel, annotate_one_model
 from sqlr.sql_analysis2.catalog import CATALOG, Sig
 from sqlr.sql_analysis2.infer import widen_schema_with_inferred_types
 from sqlr.sql_analysis2.qualify import qualify_one_model
-from sqlr.sql_analysis2.types import ColumnName, ColumnTypeName, TableName
+from sqlr.sql_analysis2.types import ColumnName, ColumnTypeName, RelationKey
 
 DIALECT = "duckdb"
 METADATA = expression_metadata(DIALECT)
@@ -32,7 +34,7 @@ METADATA = expression_metadata(DIALECT)
 
 def annotate(
     sql: str,
-    declared: dict[TableName, dict[ColumnName, ColumnTypeName]],
+    declared: dict[RelationKey, dict[ColumnName, ColumnTypeName]],
     tmp_path: Path,
 ) -> AnnotatedModel:
     """Steps 1-7 over one file, the way `validate-schema` runs them."""
@@ -42,14 +44,14 @@ def annotate(
         name="x",
         file=SqlFile(path=path, relative_path="x.sql", mtime=0.0, content_hash=""),
     )
-    return annotate_one_model(qualify_one_model(model, declared, DIALECT), METADATA)
+    return annotate_one_model(qualify_one_model(model, declarations(declared), DIALECT), METADATA)
 
 
 def codes(result: AnnotatedModel) -> list[str]:
     return [finding.code for finding in result.findings]
 
 
-def inferred_types(result: AnnotatedModel) -> dict[tuple[TableName, ColumnName], str]:
+def inferred_types(result: AnnotatedModel) -> dict[tuple[RelationKey, ColumnName], str]:
     return {
         (entry.table, entry.column): entry.type_name
         for entry in result.inference.inferred
@@ -205,7 +207,7 @@ def test_a_declared_type_is_never_overwritten(tmp_path: Path) -> None:
     assert statement is not None
 
     widened = widen_schema_with_inferred_types(
-        statement.declared_types_per_table, result.inference
+        statement.declared_types_per_relation, result.inference
     )
     assert widened["orders"]["status"] == "varchar"
 

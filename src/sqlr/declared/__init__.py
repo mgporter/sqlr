@@ -30,6 +30,29 @@ name the user wrote. An unmatched relation is not fatal - its columns simply hav
 to check against - but `near_miss_warnings` catches the case that is almost always a typo:
 a reference whose table name matches a declaration nothing else uses.
 
+A declaration's `columns:` is the *complete* list of what the relation has, which is what
+makes a name the SQL reads and the yml omits an error rather than a column invented from
+the read. A relation that is only partly described says so under `config: meta:`:
+
+```yml
+sources:
+  - name: mysource
+    config:
+      meta:
+        declaration_is_partial: true      # every table below is partly described...
+    tables:
+      - name: raw_address
+        config:
+          meta:
+            declaration_is_partial: true  # ...or just this one
+        columns:
+          - name: person_id
+            data_type: varchar(20)        # typed; everything else is inferred
+```
+
+`meta:` is where every sqlr-specific setting goes, and inherits source-to-table the way dbt
+already defines it - see `META_KEY`.
+
 Discovery is decoupled from interpretation. `DeclarationProvider` is the seam: this module
 implements it over yml files, and a future dbt `manifest.json` reader can implement it
 without any consumer changing.
@@ -77,6 +100,31 @@ SOURCES_KEY = "sources"
 
 MAX_LISTED = 10
 """How many entries a warning names before it summarises the rest."""
+
+CONFIG_KEY = "config"
+META_KEY = "meta"
+"""Where sqlr's own settings are written: `config: meta:`, or a bare `meta:`.
+
+dbt validates the keys it knows and rejects the ones it does not, but `meta:` is free-form
+by design and carries any key through untouched. A setting written there leaves the file a
+valid dbt file, so a real dbt project can be checked without editing its yml. Every
+sqlr-specific setting that attaches to a declaration goes here, for that reason.
+
+Both spellings are read because dbt moved `meta:` under `config:` in 1.10 and still accepts
+the older top-level form. `config: meta:` wins where a file writes both, matching which one
+dbt itself would apply.
+"""
+
+DECLARATION_IS_PARTIAL_KEY = "declaration_is_partial"
+
+BOOLEANS = {"true": True, "false": False}
+"""The only two words a sqlr `meta:` flag accepts, case-insensitively.
+
+`yaml.compose` leaves a scalar as text rather than a Python value, so the resolution is
+ours to make. YAML 1.1's wider set - `yes`, `on`, `1` - is deliberately not honoured:
+anything else is warned about and ignored, which tells a user their setting did nothing
+instead of silently reading `on` as False.
+"""
 
 
 class Declarations(BaseModel):
@@ -191,6 +239,11 @@ class YamlDeclarationProvider:
                     label=label,
                     source=source,
                     columns=self._columns(entry, label, name, positions, found),
+                    declaration_is_partial=bool(
+                        _meta_flag(
+                            entry, DECLARATION_IS_PARTIAL_KEY, label, name, found
+                        )
+                    ),
                     span=_span(positions, entry),
                     name_span=_span(positions, name_node),
                 )
@@ -252,11 +305,27 @@ class YamlDeclarationProvider:
             # the SQL does not write, not one to be filled in from somewhere else.
             schema = name
 
+        # dbt already defines a source's `meta:` as inherited by its tables, with a
+        # table's own entry winning. Following that rule rather than inventing one is what
+        # lets a whole partially-documented source say so in a single line.
+        inherited_partial = _meta_flag(
+            node, DECLARATION_IS_PARTIAL_KEY, label, f"source {name!r}", found
+        )
+
         for entry in tables_node.value:
             if not isinstance(entry, yaml.MappingNode):
                 continue
             table = self._table(
-                entry, name, database, schema, path, label, source, positions, found
+                entry,
+                name,
+                database,
+                schema,
+                inherited_partial,
+                path,
+                label,
+                source,
+                positions,
+                found,
             )
             if table is not None:
                 found.source_tables.append(table)
@@ -267,6 +336,7 @@ class YamlDeclarationProvider:
         source_name: str,
         database: str | None,
         schema: str | None,
+        inherited_partial: bool | None,
         path: Path,
         label: str,
         source: SourceDoc,
@@ -289,6 +359,23 @@ class YamlDeclarationProvider:
             # spellings naming the same file should not be two different answers.
             sql_file = Path(sql_file).stem
 
+        own_partial = _meta_flag(
+            node, DECLARATION_IS_PARTIAL_KEY, label, f"{source_name}.{name}", found
+        )
+        declaration_is_partial = bool(
+            own_partial if own_partial is not None else inherited_partial
+        )
+
+        columns = self._columns(node, label, f"{source_name}.{name}", positions, found)
+        if declaration_is_partial and not columns:
+            # A partial declaration with nothing in it describes the relation exactly as
+            # well as no declaration at all.
+            found.warnings.append(
+                f"{label}:{_line(node)}: unnecessary declaration_is_partial flag set for "
+                f"{source_name}.{name} - no columns are declared so this flag will have "
+                f"no effect"
+            )
+
         return DeclaredSourceTable(
             name=name,
             path=path,
@@ -300,9 +387,8 @@ class YamlDeclarationProvider:
             identifier=_scalar(_entry(node, "identifier")),
             sql_file=sql_file,
             sql_file_span=_span(positions, sql_file_node),
-            columns=self._columns(
-                node, label, f"{source_name}.{name}", positions, found
-            ),
+            columns=columns,
+            declaration_is_partial=declaration_is_partial,
             span=_span(positions, node),
             name_span=_span(positions, name_node),
         )
@@ -596,6 +682,53 @@ def _scalar(node: yaml.Node | None) -> str | None:
         return None
     value = str(node.value).strip()
     return value or None
+
+
+def _meta_entry(node: yaml.MappingNode | None, key: str) -> yaml.Node | None:
+    """One key of an entry's `meta:` mapping, under `config:` or at the top level.
+
+    dbt moved `meta:` under `config:` in 1.10 and still accepts the older spelling, so both
+    are read and `config: meta:` wins - which is the one dbt itself would apply.
+    """
+    if node is None:
+        return None
+    for owner in (_entry(node, CONFIG_KEY), node):
+        if not isinstance(owner, yaml.MappingNode):
+            continue
+        meta = _entry(owner, META_KEY)
+        if isinstance(meta, yaml.MappingNode) and (found := _entry(meta, key)) is not None:
+            return found
+    return None
+
+
+def _meta_flag(
+    node: yaml.MappingNode | None,
+    key: str,
+    label: str,
+    owner: str,
+    found: Declarations,
+) -> bool | None:
+    """One boolean out of an entry's `meta:` mapping, or None when it is not written there.
+
+    None is not False: it means the key was absent, which is what lets a table's `meta:`
+    fall back to its source's rather than overriding it with a default.
+
+    A value that is neither `true` nor `false` is a warning and reads as absent. A flag
+    that quietly did nothing is worse than one that was never written - the user believes
+    the setting is in effect and every finding that follows looks like a different bug.
+    """
+    value_node = _meta_entry(node, key)
+    if value_node is None:
+        return None
+
+    written = _scalar(value_node)
+    resolved = BOOLEANS.get(written.lower()) if written is not None else None
+    if resolved is None:
+        found.warnings.append(
+            f"{label}:{_line(value_node)}: `meta.{key}` of {owner} is "
+            f"{written!r}, which is not `true` or `false`; ignored"
+        )
+    return resolved
 
 
 def _span(positions: Positions, node: yaml.Node | None) -> SourceSpan | None:

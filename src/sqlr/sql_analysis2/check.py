@@ -39,7 +39,7 @@ from sqlr.sql_analysis2.infer import ColumnTypeConflict, TypeEvidence
 from sqlr.sql_analysis2.reporting import TypeFinding
 from sqlr.sql_analysis2.resolve import is_declared
 from sqlr.sql_analysis2.sourcedoc import Positions, SourceSpan
-from sqlr.sql_analysis2.types import ColumnName, ColumnTypeName, TableName
+from sqlr.sql_analysis2.types import ColumnName, ColumnTypeName, RelationKey
 
 
 def span_of_call_name(node: exp.Expr, positions: Positions) -> SourceSpan | None:
@@ -133,14 +133,14 @@ def claim_is_contradicted(claim: TypeClaim, actual: exp.DataType) -> bool:
 
 def _declared_type_of_claim(
     claim: TypeClaim,
-    declared_types_per_table: dict[TableName, dict[ColumnName, ColumnTypeName]],
+    declared_types_per_relation: dict[RelationKey, dict[ColumnName, ColumnTypeName]],
 ) -> ColumnTypeName | None:
     """What the user declared for the column this claim landed on, if anything."""
     key = claim.site.source_table_column
     if key is None:
         return None
     table, column = key
-    written = declared_types_per_table.get(table, {}).get(column)
+    written = declared_types_per_relation.get(table, {}).get(column)
     return written if is_declared(written) else None
 
 
@@ -164,7 +164,7 @@ def _contradiction_message(
 
 def findings_for_contradicted_claims(
     facts: Facts,
-    declared_types_per_table: dict[TableName, dict[ColumnName, ColumnTypeName]],
+    declared_types_per_relation: dict[RelationKey, dict[ColumnName, ColumnTypeName]],
 ) -> list[TypeFinding]:
     """Every claim the value it is about definitely does not satisfy.
 
@@ -181,7 +181,7 @@ def findings_for_contradicted_claims(
             TypeFinding(
                 code="contradicted-type",
                 message=_contradiction_message(
-                    claim, actual, _declared_type_of_claim(claim, declared_types_per_table)
+                    claim, actual, _declared_type_of_claim(claim, declared_types_per_relation)
                 ),
                 span=claim.site.span,
                 context_span=claim.site.span,

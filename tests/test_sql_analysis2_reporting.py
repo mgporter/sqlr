@@ -6,6 +6,8 @@ Every fixture here is an inline SQL string, per `tests/README.md`.
 import pytest
 import sqlglot
 
+from declared_helpers import declarations, q
+
 from sqlr.sql_analysis2.resolve import resolve_columns_to_source_tables
 from sqlr.sql_analysis2.reporting import (
     ColumnFinding,
@@ -34,8 +36,8 @@ def test_an_unresolvable_column_points_at_its_own_name() -> None:
         "from mydatabase.myschema.test t\n"
         "join mydatabase.myschema.other o on t.id = o.id"
     )
-    resolved = resolve_columns_to_source_tables(
-        sqlglot.parse_one(sql, read=DIALECT), DIALECT
+    resolved, _ = resolve_columns_to_source_tables(
+        sqlglot.parse_one(sql, read=DIALECT), DIALECT, declarations()
     )
     (finding,) = findings_for_unresolvable_columns(
         resolved.unresolvable_columns, Positions(sql)
@@ -53,8 +55,8 @@ def test_a_dotted_read_reports_the_name_and_the_whole_access() -> None:
     nodes it reuses are the ones the parser positioned.
     """
     sql = "select mistyped.col1 as col1\nfrom mydatabase.myschema.test"
-    resolved = resolve_columns_to_source_tables(
-        sqlglot.parse_one(sql, read="postgres"), "postgres"
+    resolved, _ = resolve_columns_to_source_tables(
+        sqlglot.parse_one(sql, read="postgres"), "postgres", declarations()
     )
     (finding,) = findings_for_columns_read_with_unsupported_dot_notation(
         resolved.columns_read_with_unsupported_dot_notation, Positions(sql), "postgres"
@@ -68,8 +70,8 @@ def test_a_dotted_read_reports_the_name_and_the_whole_access() -> None:
 def test_a_nested_read_spans_only_its_first_level() -> None:
     """`a.b.c` is recorded as the read `a.b`, matching what `structured_access` models."""
     sql = "select mistyped.col2.jsonfield from mydatabase.myschema.test"
-    resolved = resolve_columns_to_source_tables(
-        sqlglot.parse_one(sql, read="postgres"), "postgres"
+    resolved, _ = resolve_columns_to_source_tables(
+        sqlglot.parse_one(sql, read="postgres"), "postgres", declarations()
     )
     (finding,) = findings_for_columns_read_with_unsupported_dot_notation(
         resolved.columns_read_with_unsupported_dot_notation, Positions(sql), "postgres"
@@ -85,8 +87,8 @@ def test_one_finding_per_read_site() -> None:
         "  mistyped.col4 as col4\n"
         "from mydatabase.myschema.test"
     )
-    resolved = resolve_columns_to_source_tables(
-        sqlglot.parse_one(sql, read="postgres"), "postgres"
+    resolved, _ = resolve_columns_to_source_tables(
+        sqlglot.parse_one(sql, read="postgres"), "postgres", declarations()
     )
     findings = findings_for_columns_read_with_unsupported_dot_notation(
         resolved.columns_read_with_unsupported_dot_notation, Positions(sql), "postgres"
@@ -106,10 +108,10 @@ JOINED_TO_A_CTE = (
 
 def test_an_ambiguous_column_names_every_candidate() -> None:
     sql = JOINED_TO_A_CTE.format(selection="name")
-    resolved = resolve_columns_to_source_tables(
+    resolved, _ = resolve_columns_to_source_tables(
         sqlglot.parse_one(sql, read=DIALECT),
         DIALECT,
-        declared_schema={"test": {"id": "int", "name": "varchar(20)"}},
+        declarations({q("test"): {"id": "int", "name": "varchar(20)"}}),
     )
     (finding,) = findings_for_ambiguous_columns(
         resolved.ambiguous_columns, Positions(sql)
@@ -118,7 +120,7 @@ def test_an_ambiguous_column_names_every_candidate() -> None:
     assert finding.severity == "error"
     assert text_at(sql, finding.span) == "name"
     assert finding.message == (
-        "column 'name' is ambiguous: 'src' and 'test' both declare it; "
+        "column 'name' is ambiguous: 'src' and 'test' both project it; "
         "qualify it with a source alias"
     )
 
@@ -127,8 +129,8 @@ def test_a_guessed_column_names_what_it_was_read_from() -> None:
     """Naming the source that was *not* ruled out is what makes the warning actionable:
     it is the difference between "add a qualifier" and "declare that table"."""
     sql = JOINED_TO_A_CTE.format(selection="name")
-    resolved = resolve_columns_to_source_tables(
-        sqlglot.parse_one(sql, read=DIALECT), DIALECT, declared_schema={}
+    resolved, _ = resolve_columns_to_source_tables(
+        sqlglot.parse_one(sql, read=DIALECT), DIALECT, declarations({})
     )
     (finding,) = findings_for_columns_without_a_source(
         resolved.guessed_columns, Positions(sql)
@@ -164,11 +166,11 @@ def test_the_printer_takes_its_prefix_from_the_severity(
 # --------------------------------------------------- structured column declarations
 def test_a_scalar_declaration_contradicts_a_structured_read() -> None:
     sql = "select mistyped.col1, mistyped['col3'] from mydatabase.myschema.test"
-    resolved = resolve_columns_to_source_tables(
-        sqlglot.parse_one(sql, read=DIALECT), DIALECT
+    resolved, _ = resolve_columns_to_source_tables(
+        sqlglot.parse_one(sql, read=DIALECT), DIALECT, declarations()
     )
     findings = findings_for_columns_declared_as_scalar_but_read_as_structured(
-        {"test": {"mistyped": "varchar(50)"}}, resolved.columns_per_table, Positions(sql)
+        {q("test"): {"mistyped": "varchar(50)"}}, resolved.columns_per_relation, Positions(sql)
     )
     assert [finding.code for finding in findings] == [
         "structured-column-declared-scalar"
@@ -183,13 +185,13 @@ def test_a_scalar_declaration_contradicts_a_structured_read() -> None:
 def test_a_structured_declaration_is_not_contradicted() -> None:
     """`json`, `struct(...)`, `map` and `variant` all sit off the scalar lattice."""
     sql = "select mistyped.col1 from mydatabase.myschema.test"
-    resolved = resolve_columns_to_source_tables(
-        sqlglot.parse_one(sql, read=DIALECT), DIALECT
+    resolved, _ = resolve_columns_to_source_tables(
+        sqlglot.parse_one(sql, read=DIALECT), DIALECT, declarations()
     )
     for written in ("json", "struct(col1 int)", "map(varchar, int)", "variant"):
         assert (
             findings_for_columns_declared_as_scalar_but_read_as_structured(
-                {"test": {"mistyped": written}}, resolved.columns_per_table, Positions(sql)
+                {q("test"): {"mistyped": written}}, resolved.columns_per_relation, Positions(sql)
             )
             == []
         )
@@ -197,12 +199,12 @@ def test_a_structured_declaration_is_not_contradicted() -> None:
 
 def test_an_undeclared_column_is_not_contradicted() -> None:
     sql = "select mistyped.col1 from mydatabase.myschema.test"
-    resolved = resolve_columns_to_source_tables(
-        sqlglot.parse_one(sql, read=DIALECT), DIALECT
+    resolved, _ = resolve_columns_to_source_tables(
+        sqlglot.parse_one(sql, read=DIALECT), DIALECT, declarations()
     )
     assert (
         findings_for_columns_declared_as_scalar_but_read_as_structured(
-            {"test": {"id": "int"}}, resolved.columns_per_table, Positions(sql)
+            {q("test"): {"id": "int"}}, resolved.columns_per_relation, Positions(sql)
         )
         == []
     )
@@ -211,12 +213,12 @@ def test_an_undeclared_column_is_not_contradicted() -> None:
 def test_an_integer_subscript_does_not_contradict_a_string_declaration() -> None:
     """DuckDB subscripts strings, so `titles[1]` says nothing about `varchar`."""
     sql = "select titles[1] from mydatabase.myschema.test"
-    resolved = resolve_columns_to_source_tables(
-        sqlglot.parse_one(sql, read=DIALECT), DIALECT
+    resolved, _ = resolve_columns_to_source_tables(
+        sqlglot.parse_one(sql, read=DIALECT), DIALECT, declarations()
     )
     assert (
         findings_for_columns_declared_as_scalar_but_read_as_structured(
-            {"test": {"titles": "varchar"}}, resolved.columns_per_table, Positions(sql)
+            {q("test"): {"titles": "varchar"}}, resolved.columns_per_relation, Positions(sql)
         )
         == []
     )

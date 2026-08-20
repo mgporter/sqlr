@@ -141,7 +141,7 @@ def annotate_one_model(
         )
 
     dialect_name = statement.dialect_name
-    schema = statement.declared_types_per_table
+    schema = statement.declared_types_per_relation
 
     # Step 4 - annotate, pass 1. Types every expression from what is currently known, and
     # equally importantly establishes what is ALREADY known, so the fact walk does not
@@ -283,7 +283,7 @@ def provenance_of_projection(
 
     table = source.name.lower()
     column = inner.name.lower()
-    if is_declared(statement.declared_types_per_table.get(table, {}).get(column)):
+    if is_declared(statement.declared_types_per_relation.get(table, {}).get(column)):
         return "declared"
     if column in inferred.get(table, {}):
         return "inferred"
@@ -303,7 +303,7 @@ def types_per_source_column(
     inferred = inference.types_per_table()
     return [
         _source_column_type(table, column, written, inferred)
-        for table, columns in sorted(statement.declared_types_per_table.items())
+        for table, columns in sorted(statement.declared_types_per_relation.items())
         for column, written in sorted(columns.items())
     ]
 

@@ -53,6 +53,19 @@ class DeclaredRelation(BaseModel):
     columns: list[DeclaredColumn] = []
     span: SourceSpan | None = None
     name_span: SourceSpan | None = None
+    declaration_is_partial: bool = False
+    """Whether `columns:` lists *some* of this relation's columns rather than all of them.
+
+    False - the default - makes the declaration the complete list, which is the entire
+    payoff for writing one: a name the SQL reads and the yml omits becomes an error naming
+    this entry, instead of a column slot invented from the read that nothing can tell apart
+    from a real one.
+
+    True reopens the relation. Its declared columns keep their types and everything else is
+    inferred, exactly as for a relation nobody declared at all.
+
+    Written under `meta:` so the yml stays a valid dbt file - see the loader.
+    """
 
     @property
     def display_name(self) -> str:
