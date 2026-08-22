@@ -61,7 +61,7 @@ def qualify(
     _configure_logging(verbose)
 
     root, cfg = _load_project(project_dir)
-    index, models = _select(root, cfg, [*select, *ctx.args])
+    index, models = _select(root, cfg, _selectors(select, ctx.args))
     declared = _load_declarations(root, index)
 
     qualified = qualify_schema(cfg, declared, models)
@@ -100,7 +100,7 @@ def validate(
     _configure_logging(verbose)
 
     root, cfg = _load_project(project_dir)
-    index, models = _select(root, cfg, [*select, *ctx.args])
+    index, models = _select(root, cfg, _selectors(select, ctx.args))
 
     # Declarations are loaded before anything is analysed: a yml that describes one
     # relation twice has no right answer to pick, and running the comparison anyway would
@@ -169,6 +169,26 @@ def _load_declarations(root: Path, index: ModelIndex) -> DeclaredSchemas:
         raise typer.Exit(code=1)
 
     return declared
+
+
+def _selectors(select: list[str], extra_args: list[str]) -> list[str]:
+    """The model names to operate on, or exit 1 with the reason.
+
+    Click has no variadic option, so `--select a b` parses `a` onto the option and leaves
+    `b` in the extra args; both are selectors, and anything starting with `-` still fails
+    as an unknown option. A repeated flag is rejected rather than merged: one flag listing
+    every model is the spelling, and `--select a --select b` is more often a mistaken
+    second flag than a deliberate one.
+    """
+    if len(select) > 1:
+        typer.echo(
+            "only one --select flag is allowed; list every model on it, "
+            "e.g. `--select orders customers`",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    return [*select, *extra_args]
 
 
 def _select(

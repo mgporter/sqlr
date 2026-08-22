@@ -73,6 +73,137 @@ def test_validate_schema_passes_when_nothing_is_declared(tmp_path: Path) -> None
     assert result.exit_code == 0
 
 
+# ---- selection and project root ---------------------------------------------------------
+#
+# `selection` has its own tests for what a selector resolves to; these are about the wiring
+# between the flags and that module - which root the run starts from, what Click leaves in
+# the extra args, and which of its errors reach the user as a message not a traceback.
+
+
+def test_validate_schema_accepts_space_separated_selectors(
+    tmp_path: Path, wide: None
+) -> None:
+    """Click parses `b` out of `--select a b` as an extra arg; it is a selector too."""
+    _project(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "validate-schema",
+            "--project-dir",
+            str(tmp_path),
+            "--select",
+            "customers",
+            "products",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "models/customers.sql" in result.output
+    assert "models/products.sql" in result.output
+
+
+def test_validate_schema_defaults_to_the_current_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, wide: None
+) -> None:
+    """Omitting `--project-dir` finds the project, not just the failure above it."""
+    _project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["validate-schema", "--select", "products"])
+
+    assert result.exit_code == 0
+    assert "models/products.sql" in result.output
+    # Only the selected model ran; the default root did not widen the selection.
+    assert "models/customers.sql" not in result.output
+
+
+def test_validate_schema_rejects_a_repeated_select_flag(tmp_path: Path) -> None:
+    """One flag lists every model; a second one is a mistake, not a second selection."""
+    _project(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "validate-schema",
+            "--project-dir",
+            str(tmp_path),
+            "--select",
+            "customers",
+            "--select",
+            "products",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "only one --select flag is allowed" in result.output
+    # It failed before analysing anything.
+    assert "models/customers.sql" not in result.output
+
+
+def test_qualify_schema_rejects_a_repeated_select_flag(tmp_path: Path) -> None:
+    """Both commands read selectors through the same helper, so both refuse the same way."""
+    _project(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "qualify-schema",
+            "--project-dir",
+            str(tmp_path),
+            "--select",
+            "customers",
+            "--select",
+            "products",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "only one --select flag is allowed" in result.output
+
+
+def test_validate_schema_without_a_selector_covers_every_model(
+    tmp_path: Path, wide: None
+) -> None:
+    _project(tmp_path)
+
+    result = runner.invoke(app, ["validate-schema", "--project-dir", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "models/customers.sql" in result.output
+    assert "models/products.sql" in result.output
+
+
+def test_validate_schema_errors_on_duplicate_model_names(tmp_path: Path) -> None:
+    _project(tmp_path)
+    nested = tmp_path / "models" / "staging"
+    nested.mkdir()
+    (nested / "customers.sql").write_text(SCHEMA_SQL)
+
+    result = runner.invoke(
+        app,
+        ["validate-schema", "--project-dir", str(tmp_path), "--select", "customers"],
+    )
+
+    assert result.exit_code == 1
+    assert "found 2 models named 'customers'" in result.output
+
+
+def test_validate_schema_errors_on_unparseable_sql(tmp_path: Path, wide: None) -> None:
+    _project(tmp_path)
+    (tmp_path / "models" / "broken.sql").write_text("select from from where;")
+
+    result = runner.invoke(
+        app,
+        ["validate-schema", "--project-dir", str(tmp_path), "--select", "broken"],
+    )
+
+    assert result.exit_code == 1
+    assert "Expected table name" in result.output
+    assert "not typed - fix the errors above" in result.output
+
+
+# ---- validation ------------------------------------------------------------------------
 
 INCOMPLETE_DECLARATION_YML = """\
 version: 2
