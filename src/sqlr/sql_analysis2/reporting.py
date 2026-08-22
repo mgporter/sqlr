@@ -21,6 +21,7 @@ from sqlr.sql_analysis2.types import (
     RelationKey,
     ScopeKind,
     UnresolvableColumn,
+    UnresolvableRelation,
 )
 from sqlr.typemap import resolve_type_name
 
@@ -110,39 +111,117 @@ def span_of_access(column: exp.Column, positions: Positions) -> SourceSpan | Non
     return span
 
 
-def _unresolvable_message(unresolvable: UnresolvableColumn) -> str:
+def written_text_of(node: exp.Expr, positions: Positions) -> str:
+    """The name as the user typed it, falling back to the name sqlglot holds.
+
+    Worth the lookup because the probe normalises identifiers to the dialect's case, and
+    Snowflake's is upper: a message built from the tree calls the user's `updated_at`
+    `UPDATED_AT`, and then lists the declared columns beside it in the lower case the yml
+    used. One sentence, two spellings of the same convention, and neither is what the reader
+    can search their file for.
+    """
+    # A `Column`'s hull covers its qualifier too, so spanning the node would quote
+    # `src.nonsense` where the sentence is about `nonsense`. The identifier under it is the
+    # name on its own.
+    named = node.this if isinstance(node, exp.Column) and node.this is not None else node
+    span = positions.span_of(named)
+    if span is None:
+        return node.name
+    return positions.text[span.start : span.end] or node.name
+
+
+def _describe_relation(relation: UnresolvableRelation) -> str:
+    """`table 'mydatabase.myschema.raw_address'`, `CTE 'ranked'` - what a reader calls it."""
+    kinds = {"table": "table", "cte": "CTE", "derived": "derived table"}
+    return f"{kinds.get(relation.kind, 'relation')} '{relation.display_name}'"
+
+
+def _declare_it_clause(relations: list[UnresolvableRelation]) -> str:
+    """` Declare it on 'x' at schema.yml:12, or ...` - the fix, when a yml holds one.
+
+    Names the declared relation and not only the file, because the two are often different
+    things: a column failing against a CTE has to be declared on whatever that CTE reads
+    through its `*`, and a reader sent to the file alone still has to guess which entry.
+
+    Empty for a relation closed by its own projection list. A CTE that writes out its
+    columns has no declaration behind it, and telling that reader to set
+    `declaration_is_partial` sends them to a file with nothing in it to change.
+    """
+    entries = " or ".join(
+        dict.fromkeys(
+            f"'{entry.relation_name}' at {entry.where}"
+            for relation in relations
+            for entry in relation.closing_declarations
+        )
+    )
+    if not entries:
+        return ""
+    return f" Declare it on {entries}, or set 'declaration_is_partial' to 'true' there."
+
+
+def _unresolvable_message(
+    unresolvable: UnresolvableColumn, positions: Positions
+) -> str:
     """Why one column belongs to nothing, in terms the reader can act on.
 
-    The two reasons need different sentences because they have different fixes. A qualifier
-    naming no relation is a typo in the alias. A relation that exists and does not project
-    the name is either a typo in the column or a declaration that should be partial - and
-    listing what the relation *does* project is what lets the reader tell which.
+    Three reasons, three sentences, because they have three different fixes:
+
+    - `no_such_source` is a typo in the qualifier, and no yml would change that.
+    - `not_projected` is a name every relation in scope rules out: a mistyped column, or a
+      declaration that is complete when it should be partial. When a declaration is what
+      closed the relation, the sentence names the file and line to edit - the reader cannot
+      find it otherwise, because the yml that made the read an error is not the yml the
+      relation was written in.
+    - `several_undeclared_sources` is not a mistake in the SQL at all. Nothing can place the
+      name because two or more relations leave their columns undeclared.
     """
-    name = unresolvable.column.name
-    if unresolvable.reason == "no_such_source" or unresolvable.source_alias is None:
+    name = written_text_of(unresolvable.column, positions)
+    relations = unresolvable.relations
+
+    if unresolvable.reason == "several_undeclared_sources":
+        listed = _as_a_list_of_names([r.display_name for r in relations])
+        return (
+            f"column '{name}' has no source alias and could come from {listed}. Qualify "
+            "it, or declare the columns of the table that owns it."
+        )
+
+    if unresolvable.reason == "no_such_source" or not relations:
+        qualifier = unresolvable.column.table
+        if qualifier:
+            return (
+                f"column '{name}' is qualified with '{qualifier.lower()}', which matches "
+                "no relation in this statement"
+            )
         return f"column '{name}' could not be resolved to any source"
 
-    projects = (
-        f"projects {_as_a_list_of_names(unresolvable.projected)}"
-        if unresolvable.projected
-        else "projects nothing"
-    )
+    # `not_projected`. One relation is the ordinary case - a qualified column, or a bare one
+    # over a single source; several means a bare column over a join where every relation
+    # ruled it out, and each of them is a place the reader might have meant it to come from.
+    if len(relations) == 1:
+        return (
+            f"found undeclared column '{name}' in {_describe_relation(relations[0])}."
+            f"{_declare_it_clause(relations)}"
+        )
+
+    # No column lists here, unlike the one-relation case. A bare name over a join can be
+    # ruled out by several relations at once, and printing what each of them declares means
+    # printing most of the schema to say one thing.
     return (
-        f"column '{name}' is read from '{unresolvable.source_alias}', which {projects} "
-        f"and not '{name}'"
+        f"column '{name}' is projected by none of the relations in scope. Declare it on a "
+        "source, or set 'declaration_is_partial' to 'true' for one of the relations."
     )
 
 
 def findings_for_unresolvable_columns(
     columns: list[UnresolvableColumn], positions: Positions
 ) -> list[ColumnFinding]:
-    """A column no relation can own - a typo, a missing join, or a complete declaration
-    that omits a column the SQL reads."""
+    """A column no relation can own - a typo, a missing join, a complete declaration that
+    omits a column the SQL reads, or a name no undeclared table can be credited with."""
     return [
         ColumnFinding(
             code="unresolvable-column",
             column_name=unresolvable.column.name,
-            message=_unresolvable_message(unresolvable),
+            message=_unresolvable_message(unresolvable, positions),
             span=positions.span_of(unresolvable.column),
         )
         for unresolvable in columns
@@ -361,7 +440,7 @@ def findings_without_exact_duplicates(
 
 
 def print_findings(findings: list[ColumnFinding], relative_path: str) -> None:
-    """The CLI's view. An editor consumes the findings themselves instead."""
+    """The plain-text view. An editor consumes the findings themselves instead."""
     for finding in findings_without_exact_duplicates(findings):
         print(
             f"{finding.severity}: {relative_path}{finding.where()}: {finding.message}"

@@ -41,6 +41,7 @@ from sqlr.sql_analysis2.types import TableName
 __all__ = [
     "print_annotations",
     "print_qualification",
+    "problem_blocks",
     "render_annotation",
     "render_qualification",
 ]
@@ -64,17 +65,30 @@ _ORIGIN_STYLE: dict[ColumnQualifierOrigin, str] = {
 }
 
 
+def problem_blocks(result: QualifiedModel) -> list[RenderableType]:
+    """Everything steps 1-3 found wrong with one model: its errors, then its findings.
+
+    Shared by both renderers because both commands run steps 1-3, and a reader of either
+    needs the same answer. `render_annotation` used to build its own prelude and print only
+    the *type* findings, which left a file that failed qualification saying `not typed` and
+    nothing else - the errors existed, on the carried `QualifiedModel`, and reached nobody.
+    """
+    blocks: list[RenderableType] = [
+        Text(f"error: {error}", style="bold red") for error in result.errors
+    ]
+    blocks.extend(_finding_line(finding) for finding in result.findings)
+    return blocks
+
+
 def render_qualification(result: QualifiedModel) -> RenderableType:
     """One model: its findings, then its scopes."""
     blocks: list[RenderableType] = [
         Text(str(result.model.relative_path), style="bold white")
     ]
-
-    blocks.extend(Text(f"error: {error}", style="bold red") for error in result.errors)
-    blocks.extend(_finding_line(finding) for finding in result.findings)
+    blocks.extend(problem_blocks(result))
 
     if result.statement is None:
-        blocks.append(Text("not qualified", style=_UNKNOWN))
+        blocks.append(_not_reached("not qualified", result))
         return Group(*blocks)
 
     scopes = columns_per_scope(result.statement)
@@ -102,6 +116,17 @@ def _finding_line(finding: ColumnFinding) -> Text:
         (f"{where}: ", _UNKNOWN),
         (finding.message, ""),
     )
+
+
+def _not_reached(what: str, result: QualifiedModel) -> Text:
+    """Why a model has no tables under it.
+
+    Bare `not qualified` reads as a bug when it stands alone; pointing at the errors above
+    says the run did its job and the file has a problem.
+    """
+    if result.errors or result.findings:
+        return Text(f"{what} - fix the errors above", style=_UNKNOWN)
+    return Text(what, style=_UNKNOWN)
 
 
 def _scope_blocks(scope: ScopeColumns) -> list[RenderableType]:
@@ -203,10 +228,13 @@ def render_annotation(result: AnnotatedModel) -> RenderableType:
     blocks: list[RenderableType] = [
         Text(str(result.qualified.model.relative_path), style="bold white")
     ]
+    # Steps 1-3 first. A type finding is unreadable next to a column that never resolved,
+    # and a model that failed step 3 has *only* these.
+    blocks.extend(problem_blocks(result.qualified))
     blocks.extend(_type_finding_line(finding) for finding in result.findings)
 
     if result.qualified.statement is None:
-        blocks.append(Text("not typed", style=_UNKNOWN))
+        blocks.append(_not_reached("not typed", result.qualified))
         return Group(*blocks)
 
     if result.source_columns:

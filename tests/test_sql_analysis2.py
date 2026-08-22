@@ -1040,6 +1040,119 @@ def test_transparency_chains_through_two_ctes() -> None:
     assert resolved.unresolvable_columns == []
 
 
+def closing_declarations_of(resolved: ResolvedColumns) -> list[list[RelationKey]]:
+    """What each unresolvable column's relations blame, one list per relation."""
+    return [
+        [entry.relation_name for entry in relation.closing_declarations]
+        for unresolvable in resolved.unresolvable_columns
+        for relation in unresolvable.relations
+    ]
+
+
+def test_closedness_carries_its_cause_through_a_cte_star() -> None:
+    """`ranked` is closed only because `raw_address` is, and the reader can only fix the
+    latter. Losing the hop leaves a message pointing at a CTE with no answer in it."""
+    resolved = resolve(
+        """
+        with ranked as (select * from mydatabase.myschema.raw_address)
+        select street from ranked
+        """,
+        {q("raw_address"): {"person_id": "varchar(20)"}},
+    )
+    assert unresolvable_names(resolved) == ["street"]
+    assert closing_declarations_of(resolved) == [[q("raw_address")]]
+
+
+def test_closedness_carries_its_cause_through_two_ctes() -> None:
+    """The same walk `open_origins` does, and for the same reason: transparency chains, so
+    the blame has to chain with it."""
+    resolved = resolve(
+        """
+        with b as (select * from mydatabase.myschema.t),
+             a as (select * from b)
+        select far from a
+        """,
+        {q("t"): {"near": "int"}},
+    )
+    assert unresolvable_names(resolved) == ["far"]
+    assert closing_declarations_of(resolved) == [[q("t")]]
+
+
+def test_closedness_carries_every_arm_of_a_set_operation() -> None:
+    """A name missing from a union is missing from each arm that could have supplied it,
+    and a reader fixing it has to know about all of them - not only the left one, which is
+    the only arm that supplies the *names*."""
+    resolved = resolve(
+        """
+        with both as (
+          select * from mydatabase.myschema.left_table
+          union all
+          select * from mydatabase.myschema.right_table
+        )
+        select mystery from both
+        """,
+        {
+            q("left_table"): {"k": "int"},
+            q("right_table"): {"k": "int"},
+        },
+    )
+    assert unresolvable_names(resolved) == ["mystery"]
+    assert closing_declarations_of(resolved) == [
+        [q("left_table"), q("right_table")]
+    ]
+
+
+def test_a_cte_that_writes_its_own_projection_list_blames_no_declaration() -> None:
+    """Closed because the SQL enumerates it, not because any yml says so. Offering a yml
+    fix here would send the reader to a file that has nothing to do with the mistake."""
+    resolved = resolve(
+        """
+        with src as (select id from mydatabase.myschema.test)
+        select src.nonsense from src
+        """,
+        {q("test"): {"id": "int"}},
+    )
+    assert closing_declarations_of(resolved) == [[]]
+
+
+def test_a_bare_name_over_two_undeclared_tables_says_it_cannot_choose() -> None:
+    """Not `no_such_source`: the qualifier is fine, there just isn't one. Its own reason
+    because its fix is the only one of the three that is not an edit to the SQL's names."""
+    resolved = resolve(
+        """
+        select mystery
+        from mydatabase.myschema.test a
+        join mydatabase.myschema.other b on a.id = b.id
+        """
+    )
+    (unresolvable,) = resolved.unresolvable_columns
+    assert unresolvable.reason == "several_undeclared_sources"
+    assert [relation.display_name for relation in unresolvable.relations] == [
+        q("test"),
+        q("other"),
+    ]
+
+
+def test_a_closed_relation_beside_an_undeclared_one_is_not_offered_as_a_fix() -> None:
+    """`test` declares its columns and does not project `mystery`, so it is ruled out for
+    certain. Naming it beside `other` would offer a fix that changes nothing."""
+    resolved = resolve(
+        """
+        select mystery
+        from mydatabase.myschema.test a
+        join mydatabase.myschema.other b on a.id = b.id
+        join mydatabase.myschema.third c on a.id = c.id
+        """,
+        {q("test"): {"id": "int"}},
+    )
+    (unresolvable,) = resolved.unresolvable_columns
+    assert unresolvable.reason == "several_undeclared_sources"
+    assert [relation.display_name for relation in unresolvable.relations] == [
+        q("other"),
+        q("third"),
+    ]
+
+
 def test_a_closed_relation_names_what_it_does_project() -> None:
     """`qualify` reports this against the tree it rewrote. The message built here can name
     the relation that failed and list what it projects, which is the difference between a
@@ -1052,15 +1165,17 @@ def test_a_closed_relation_names_what_it_does_project() -> None:
     )
     (unresolvable,) = resolved.unresolvable_columns
     assert unresolvable.reason == "not_projected"
-    assert unresolvable.source_alias == "src"
-    assert unresolvable.projected == ["id", "name"]
+    (relation,) = unresolvable.relations
+    assert relation.display_name == "src"
+    assert relation.kind == "cte"
+    assert relation.projected_columns == ["id", "name"]
+    # The CTE writes its own projection list, so nothing in any yml closed it and there is
+    # no file to send the reader to - the name is simply a typo.
+    assert relation.closing_declarations == []
     (finding,) = findings_for_unresolvable_columns(
         resolved.unresolvable_columns, Positions("")
     )
-    assert finding.message == (
-        "column 'nonsense' is read from 'src', which projects 'id' and 'name' "
-        "and not 'nonsense'"
-    )
+    assert finding.message == "found undeclared column 'nonsense' in CTE 'src'."
 
 
 STAR_OVER_A_JOIN = """

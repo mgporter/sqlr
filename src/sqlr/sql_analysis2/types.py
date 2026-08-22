@@ -153,13 +153,50 @@ class GuessedColumn(NamedTuple):
     """Relations whose column set is unknown, sorted - the reason this is a guess."""
 
 
-type UnresolvableReason = Literal["no_such_source", "not_projected"]
-"""Why a column belongs to nothing.
+type UnresolvableReason = Literal[
+    "no_such_source", "not_projected", "several_undeclared_sources"
+]
+"""Why a column belongs to nothing. Three reasons, and no two share a fix.
 
-- `no_such_source` - its qualifier names no relation in the scope: a mistyped alias.
-- `not_projected`  - the relation it names is closed and does not project it: a mistyped
-  column, or a declaration that is complete when it should be partial.
+- `no_such_source`            - its qualifier names no relation in the scope: a mistyped
+  alias, and nothing in any yml would change that.
+- `not_projected`             - every relation it could read from is closed and none
+  projects it: a mistyped column, or a declaration that is complete when it should be
+  partial. `UnresolvableRelation.closing_declarations` says which yml entry closed it.
+- `several_undeclared_sources` - nothing projects it and *two or more* relations in scope
+  leave their columns undeclared, so no one table can be credited with it. Unlike the
+  other two this is not a mistake in the SQL: qualifying the column resolves it outright,
+  because a single open relation absorbs a name it cannot rule out.
 """
+
+
+class ClosingDeclaration(NamedTuple):
+    """One yml entry whose complete column list is why some relation is closed.
+
+    The entry a reader has to edit, which is not always the relation the SQL named: a CTE
+    over `select *` is closed only because the tables under that star are, and telling the
+    reader to fix the CTE would send them somewhere they cannot fix anything.
+    """
+
+    relation_name: RelationKey
+    where: str
+    """`project/sources.yml:46` - the file and line the entry was written at."""
+    declared_columns: list[ColumnName]
+    """What the entry says the relation has, sorted and lowercased."""
+
+
+class UnresolvableRelation(NamedTuple):
+    """One relation a column could have been read from, described for a message."""
+
+    display_name: str
+    """The relation as the reader would write it: the full table name when there is one,
+    the alias otherwise. What to name when the fix is to edit a yml."""
+    kind: SourceKind
+    projected_columns: list[ColumnName]
+    """What it is known to project, sorted. Empty when it enumerates nothing."""
+    closing_declarations: list[ClosingDeclaration]
+    """Why it is closed, empty when it is open. Several when a star over a join closed it,
+    and transitive - see `ClosingDeclaration`."""
 
 
 class UnresolvableColumn(NamedTuple):
@@ -167,15 +204,19 @@ class UnresolvableColumn(NamedTuple):
 
     `qualify` reports the same mistake against the tree it rewrote rather than the SQL that
     was written, so its message is strictly harder to act on than one built here: this can
-    name the relation that failed to project the column and list what it projects instead.
+    name the relation that failed to project the column, list what it projects instead, and
+    point at the yml entry that made the omission an error rather than an open question.
     """
 
     column: exp.Column
     reason: UnresolvableReason
-    source_alias: TableName | None
-    """The relation the column named, when it named one that exists."""
-    projected: list[ColumnName]
-    """What that relation projects, sorted. Empty when there is no relation to ask."""
+    relations: list[UnresolvableRelation]
+    """The relations the reason is about, in the order the SQL brought them in.
+
+    `not_projected`: the closed relations that failed to project the name.
+    `several_undeclared_sources`: the open relations that could each have owned it.
+    `no_such_source`: empty - the qualifier named nothing to describe.
+    """
 
 
 class ProjectionSite(NamedTuple):

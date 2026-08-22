@@ -1,9 +1,7 @@
-# import json
 import logging
 from pathlib import Path
 
 import typer
-# from rich.console import Console
 
 from sqlr import config as config_module
 from sqlr.catalog import find_yaml_files
@@ -14,9 +12,6 @@ from sqlr.declared import (
     load_declared_schemas,
 )
 from sqlr.declared.types import DeclaredSchemas
-# from sqlr.schema_resolution import resolve_schema
-# from sqlr.schema_resolution.render import render_schema
-# from sqlr.schema_resolution.types import StatementSchema
 from sqlr.selection import (
     Model,
     SelectionError,
@@ -24,7 +19,6 @@ from sqlr.selection import (
     select_models,
 )
 from sqlr.selection.types import ModelIndex
-# from sqlr.sql_analysis import analyze_file
 from sqlr.sql_analysis2 import any_model_has_errors, qualify_schema, validate_schema
 from sqlr.sql_analysis2.render import print_annotations, print_qualification
 
@@ -35,49 +29,6 @@ logger = logging.getLogger("sqlr")
 def _configure_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
-
-# To be removed
-# @app.command(
-#     "infer-schema",
-#     context_settings={"allow_extra_args": True},
-# )
-# def infer_schema(
-#     ctx: typer.Context,
-#     select: list[str] = typer.Option(
-#         [],
-#         "--select",
-#         "-s",
-#         help="Model names to operate on, e.g. `--select orders customers`. "
-#         "Omit to operate on every model.",
-#     ),
-#     project_dir: Path | None = typer.Option(
-#         None, "--project-dir", help="Path to the root of the project."
-#     ),
-#     verbose: bool = typer.Option(
-#         False, "--verbose", "-v", help="Enable debug logging."
-#     ),
-#     output_format: str = typer.Option(
-#         "table", "--format", help="Schema output format: table or json."
-#     ),
-# ) -> None:
-#     """Infer and print the schema of the selected models."""
-#     _configure_logging(verbose)
-
-#     root, cfg = _load_project(project_dir)
-#     # Click has no variadic option, so `--select a b` leaves `b` in the extra args. They
-#     # are selectors too; anything starting with `-` still fails as an unknown option.
-#     _, models = _select(root, cfg, [*select, *ctx.args])
-#     schemas = [schema for _, schema in _analyze(cfg, models)]
-
-#     if output_format == "json":
-#         typer.echo(
-#             json.dumps([schema.model_dump(mode="json") for schema in schemas], indent=2)
-#         )
-#         return
-
-#     console = Console()
-#     for schema in schemas:
-#         console.print(render_schema(schema), new_line_start=True)
 
 
 @app.command(
@@ -218,46 +169,6 @@ def _load_declarations(root: Path, index: ModelIndex) -> DeclaredSchemas:
         raise typer.Exit(code=1)
 
     return declared
-
-
-# def _analyze(
-#     cfg: SqlrConfig, models: list[Model]
-# ) -> list[tuple[Model, StatementSchema]]:
-#     """Analyse each model and resolve its schema.
-
-#     The whole of `infer-schema`; `validate-schema` is this plus a comparison. An analysis
-#     error is fatal for the run rather than skipped, because a schema resolved from a
-#     statement that did not parse would be quietly wrong rather than visibly absent.
-#     """
-#     analyzed: list[tuple[Model, StatementSchema]] = []
-
-#     for model in models:
-#         logger.debug("analyzing %s", model.relative_path)
-#         result = analyze_file(
-#             model.path,
-#             dialect=cfg.general.sql_dialect,
-#             star_over_join_behavior=cfg.general.star_over_join_behavior,
-#         )
-
-#         for warning in result.warnings:
-#             logger.warning("%s: %s", model.relative_path, warning)
-
-#         if result.errors:
-#             for error in result.errors:
-#                 typer.echo(f"error: {model.relative_path}: {error}", err=True)
-#             raise typer.Exit(code=1)
-
-#         logger.info(
-#             "analysis of %s: %d relations, %d external sources, %d projected columns",
-#             model.relative_path,
-#             len(result.relations),
-#             len(result.sources),
-#             len(result.projection),
-#         )
-
-#         analyzed.append((model, resolve_schema(result)))
-
-#     return analyzed
 
 
 def _select(

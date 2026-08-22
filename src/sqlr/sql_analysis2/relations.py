@@ -91,6 +91,17 @@ class RelationColumnSet(NamedTuple):
     and that is the entire payoff for declaring a table's columns. Non-empty means a name
     not in `known` belongs to one of these instead.
     """
+    closed_by: tuple[RelationKey, ...] = ()
+    """Storage tables whose complete declaration is *why* this relation is closed.
+
+    `open_origins` says a relation is closed; this says who to blame for it, which is what
+    a message needs to name a yml entry the reader can edit. Transitive for the same reason
+    `open_origins` is: a CTE projecting `select *` over a fully declared table is closed
+    only because that table is, so the entry to point at is the table's.
+
+    Empty for a relation closed by its own written projection list - a CTE that names its
+    columns is closed because the SQL says so, and no declaration is involved.
+    """
 
     @property
     def is_open(self) -> bool:
@@ -172,6 +183,7 @@ def _column_set_of_table(
         declaration=declaration,
         known=names,
         open_origins=() if is_closed else (key,),
+        closed_by=(key,) if is_closed else (),
     )
 
 
@@ -218,44 +230,69 @@ def _aliases_covered_by_a_star(
     return list(dict.fromkeys(covered))
 
 
+type OwnColumnSet = tuple[frozenset[ColumnName], tuple[RelationKey, ...], tuple[RelationKey, ...]]
+"""What a scope projects, what it stays transparent to, and what closed it - the three
+fields of `RelationColumnSet` a scope computes for itself, in that order."""
+
+
 def _own_column_set_of_select(
     scope: Scope, sources: dict[RelationAlias, RelationColumnSet]
-) -> tuple[frozenset[ColumnName], tuple[RelationKey, ...]]:
-    """What one SELECT projects, and what it stays transparent to.
+) -> OwnColumnSet:
+    """What one SELECT projects, what it stays transparent to, and what closed it.
 
     A star over a *closed* source contributes that source's names, which is the expansion
     step 6 will perform once the schema exists. A star over an open one contributes its
     origins instead, and that is what makes transparency chain.
+
+    A star over a closed source also inherits *why* it was closed, so a CTE that fails to
+    project a name can send the reader to the declaration responsible rather than to
+    itself. A projection list with no star at all inherits nothing: it is closed because
+    the SQL enumerates it, and no yml entry has anything to do with that.
     """
     select = scope.expression
     assert isinstance(select, exp.Select)
     known = {name.lower() for name in select.named_selects if name != "*"}
     open_origins: list[RelationKey] = []
+    closed_by: list[RelationKey] = []
     for alias in _aliases_covered_by_a_star(select, aliases_a_bare_column_could_read(scope)):
         source = sources.get(alias)
         if source is None:
             continue
         known.update(source.known)
         open_origins.extend(source.open_origins)
-    return frozenset(known), tuple(dict.fromkeys(open_origins))
+        closed_by.extend(source.closed_by)
+    return (
+        frozenset(known),
+        tuple(dict.fromkeys(open_origins)),
+        tuple(dict.fromkeys(closed_by)),
+    )
 
 
 def _own_column_set_of_set_operation(
     scope: Scope, own_sets: dict[int, RelationColumnSet]
-) -> tuple[frozenset[ColumnName], tuple[RelationKey, ...]]:
+) -> OwnColumnSet:
     """What a UNION and friends project.
 
     A set operation's schema is **positional**: the arms are matched by position and the
     left one supplies the names. So the names are the left arm's, not an intersection - and
     the relation is open if *any* arm is, because a name the left arm cannot enumerate is
     one nothing downstream can place.
+
+    Every arm's `closed_by` is carried, not only the left one's: a name missing from a
+    union is missing from each arm that could have supplied it, and a reader fixing it has
+    to know about all of them.
     """
     arms = [own_sets.get(id(arm.expression)) for arm in scope.union_scopes]
     present = [arm for arm in arms if arm is not None]
     if not present:
-        return frozenset(), ()
+        return frozenset(), (), ()
     open_origins = [origin for arm in present for origin in arm.open_origins]
-    return present[0].known, tuple(dict.fromkeys(open_origins))
+    closed_by = [key for arm in present for key in arm.closed_by]
+    return (
+        present[0].known,
+        tuple(dict.fromkeys(open_origins)),
+        tuple(dict.fromkeys(closed_by)),
+    )
 
 
 def relation_closure(scopes: list[Scope], declared: DeclaredSchemas) -> RelationClosure:
@@ -293,6 +330,7 @@ def relation_closure(scopes: list[Scope], declared: DeclaredSchemas) -> Relation
                     declaration=None,
                     known=computed.known if computed else frozenset(),
                     open_origins=computed.open_origins if computed else (),
+                    closed_by=computed.closed_by if computed else (),
                 )
             sources[alias] = entry
         per_scope[id(scope.expression)] = sources
@@ -300,10 +338,13 @@ def relation_closure(scopes: list[Scope], declared: DeclaredSchemas) -> Relation
         expression = scope.expression
         known: frozenset[ColumnName] = frozenset()
         open_origins: tuple[RelationKey, ...] = ()
+        closed_by: tuple[RelationKey, ...] = ()
         if isinstance(expression, exp.SetOperation):
-            known, open_origins = _own_column_set_of_set_operation(scope, own_sets)
+            known, open_origins, closed_by = _own_column_set_of_set_operation(
+                scope, own_sets
+            )
         elif isinstance(expression, exp.Select):
-            known, open_origins = _own_column_set_of_select(scope, sources)
+            known, open_origins, closed_by = _own_column_set_of_select(scope, sources)
 
         name, kind = name_and_kind_of_scope(scope)
         own_sets[id(expression)] = RelationColumnSet(
@@ -313,6 +354,7 @@ def relation_closure(scopes: list[Scope], declared: DeclaredSchemas) -> Relation
             declaration=None,
             known=known,
             open_origins=open_origins,
+            closed_by=closed_by,
         )
         logger.debug(
             "%s %s: projects %s%s",

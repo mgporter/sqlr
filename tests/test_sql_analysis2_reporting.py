@@ -47,6 +47,132 @@ def test_an_unresolvable_column_points_at_its_own_name() -> None:
     assert finding.span is not None and str(finding.span) == "1:14"
 
 
+def unresolvable_findings(
+    sql: str,
+    declared: dict[str, dict[str, str]] | None = None,
+    dialect: str = DIALECT,
+) -> list[ColumnFinding]:
+    resolved, _ = resolve_columns_to_source_tables(
+        sqlglot.parse_one(sql, read=dialect), dialect, declarations(declared)
+    )
+    return findings_for_unresolvable_columns(
+        resolved.unresolvable_columns, Positions(sql)
+    )
+
+
+def test_a_complete_declaration_names_the_yml_entry_and_the_two_ways_to_fix_it() -> None:
+    """The case the fix sentence exists for.
+
+    A table declared without one of the columns the SQL reads is not a typo the reader can
+    spot in the SQL - nothing there is wrong. The error only makes sense next to the yml
+    entry that made the omission binding, so the message has to name it.
+    """
+    (finding,) = unresolvable_findings(
+        "select person_id, updated_at from mydatabase.myschema.raw_address",
+        {q("raw_address"): {"person_id": "varchar(20)"}},
+    )
+    assert finding.message == (
+        "found undeclared column 'updated_at' in table "
+        "'mydatabase.myschema.raw_address'. Declare it on "
+        "'mydatabase.myschema.raw_address' at schema.yml, or set "
+        "'declaration_is_partial' to 'true' there."
+    )
+
+
+def test_a_cte_over_a_declared_table_points_at_the_table_not_the_cte() -> None:
+    """`street` fails against `ranked`, but `ranked` is not the thing anyone can fix.
+
+    The CTE is closed only because the table under its `*` is, and a reader told to fix the
+    CTE has been sent somewhere with no answer in it. The fix has to name the table.
+    """
+    sql = (
+        "with ranked as (select * from mydatabase.myschema.raw_address)\n"
+        "select street from ranked"
+    )
+    (finding,) = unresolvable_findings(
+        sql, {q("raw_address"): {"person_id": "varchar(20)"}}
+    )
+    assert finding.message == (
+        "found undeclared column 'street' in CTE 'ranked'. Declare it on "
+        "'mydatabase.myschema.raw_address' at schema.yml, or set "
+        "'declaration_is_partial' to 'true' there."
+    )
+
+
+def test_a_cte_that_writes_its_own_columns_is_offered_no_yml_fix() -> None:
+    """Closed because the SQL enumerates it, so no declaration is involved and the name is
+    simply a typo. A `declaration_is_partial` hint here points at nothing."""
+    sql = (
+        "with src as (select id, name from mydatabase.myschema.test)\n"
+        "select src.nonsense from src"
+    )
+    (finding,) = unresolvable_findings(sql)
+    assert finding.message == "found undeclared column 'nonsense' in CTE 'src'."
+
+
+def test_a_name_no_undeclared_table_can_be_credited_with_says_so() -> None:
+    """Neither table declares anything, so nothing places `mystery` on one of them.
+
+    Distinct from every other unresolvable column in that the SQL is not wrong, so the fix
+    is a qualifier rather than a correction - and there is no yml entry to point at.
+    """
+    sql = (
+        "select a.x, mystery\n"
+        "from mydatabase.myschema.test a\n"
+        "join mydatabase.myschema.other b on a.id = b.id"
+    )
+    (finding,) = unresolvable_findings(sql)
+    assert finding.message == (
+        "column 'mystery' has no source alias and could come from "
+        "'mydatabase.myschema.test' and 'mydatabase.myschema.other'. Qualify it, or "
+        "declare the columns of the table that owns it."
+    )
+    assert "declaration_is_partial" not in finding.message
+
+
+def test_a_qualifier_naming_nothing_is_reported_as_a_bad_alias() -> None:
+    """No yml would change this, so no fix is offered."""
+    sql = (
+        "select bogus.id from mydatabase.myschema.test t "
+        "join mydatabase.myschema.other o on t.id = o.id"
+    )
+    (finding,) = unresolvable_findings(sql)
+    assert finding.message == (
+        "column 'id' is qualified with 'bogus', which matches no relation in this statement"
+    )
+
+
+def test_a_name_every_relation_rules_out_lists_none_of_their_columns() -> None:
+    """Several closed relations could each have been meant, and naming what each one
+    declares means printing most of the schema to say one thing. The fix is generic for the
+    same reason: there is no single entry to send the reader to."""
+    (finding,) = unresolvable_findings(
+        "select typo from mydatabase.myschema.test t "
+        "join mydatabase.myschema.other o on t.id = o.id",
+        {q("test"): {"id": "int"}, q("other"): {"id": "int"}},
+    )
+    assert finding.message == (
+        "column 'typo' is projected by none of the relations in scope. Declare it on a "
+        "source, or set 'declaration_is_partial' to 'true' for one of the relations."
+    )
+    assert "'id'" not in finding.message
+
+
+def test_a_message_quotes_the_name_the_user_typed_not_the_normalised_one() -> None:
+    """Snowflake folds unquoted identifiers up, so the tree holds `UPDATED_AT`.
+
+    A message built from the tree would put that beside the lower-case names the yml uses,
+    and neither spelling would be the one the reader can search their file for.
+    """
+    (finding,) = unresolvable_findings(
+        "select updated_at from mydatabase.myschema.raw_address",
+        {q("raw_address"): {"person_id": "varchar(20)"}},
+        dialect="snowflake",
+    )
+    assert "'updated_at'" in finding.message
+    assert "UPDATED_AT" not in finding.message
+
+
 # ------------------------------------------------------------------- dot access
 def test_a_dotted_read_reports_the_name_and_the_whole_access() -> None:
     """Both spans, because an editor underlines the name but a message quotes the read.

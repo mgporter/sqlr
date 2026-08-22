@@ -30,6 +30,7 @@ from sqlr.sql_analysis2.sourcedoc import token_offsets_of
 from sqlr.sql_analysis2.types import (
     AmbiguityKind,
     AmbiguousColumn,
+    ClosingDeclaration,
     ColumnName,
     ColumnTypeName,
     GuessedColumn,
@@ -39,6 +40,7 @@ from sqlr.sql_analysis2.types import (
     StructuredAccessKind,
     UnresolvableColumn,
     UnresolvableReason,
+    UnresolvableRelation,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,11 +116,13 @@ def attribute_a_column(
     | two or more relations *project* the name     | ambiguous - nothing can break the tie
     | exactly one does                             | resolved, or guessed when an open   |
     |                                              | relation could have projected it too|
-    | none do, no open relation                    | unresolvable                        |
-    | none do, several open relations              | unresolvable - a bare name over two |
-    |                                              | relations nobody can enumerate has  |
-    |                                              | no answer, and inventing one is a   |
-    |                                              | coin flip                           |
+    | none do, no open relation                    | unresolvable - `not_projected`, or  |
+    |                                              | `no_such_source` with no candidate  |
+    | none do, several open relations              | unresolvable -                      |
+    |                                              | `several_undeclared_sources`. A bare|
+    |                                              | name over two relations nobody can  |
+    |                                              | enumerate has no answer, and        |
+    |                                              | inventing one is a coin flip        |
     | none do, one open relation, one origin       | resolved through its star           |
     | none do, one open relation, several origins  | `star_over_join_behavior`           |
 
@@ -156,12 +160,23 @@ def attribute_a_column(
         )
 
     if len(open_relations) != 1:
+        # Zero or several open relations, and nothing projects the name. Which of the three
+        # reasons it is decides the whole message, because none of them share a fix: no
+        # candidate at all is a mistyped qualifier, candidates that are all closed is a
+        # mistyped column or an over-complete declaration, and several open ones is a name
+        # nobody can place until it is qualified.
+        if not candidates:
+            reason: UnresolvableReason = "no_such_source"
+        elif open_relations:
+            reason = "several_undeclared_sources"
+        else:
+            reason = "not_projected"
         return ColumnAttribution(
             verdict="unresolvable",
             relation=None,
             storage=None,
             candidates=sorted(relation.alias for relation in open_relations),
-            reason="not_projected" if candidates and not open_relations else "no_such_source",
+            reason=reason,
         )
 
     # Nobody projects it and one relation is transparent, so the name reaches whatever that
@@ -183,6 +198,60 @@ def attribute_a_column(
         storage=origins[0],
         candidates=sorted(origins[1:]),
     )
+
+
+def describe_relation_for_a_failed_read(
+    relation: RelationColumnSet, closure: RelationClosure
+) -> UnresolvableRelation:
+    """One relation, flattened into what a message about it needs.
+
+    The declarations come from `relation.closed_by` rather than from `relation.declaration`,
+    and the difference is the point: a CTE has no declaration of its own but is closed
+    because the tables under its star are, and those are the entries a reader can edit.
+
+    `storage` is preferred over `alias` for the display name because it is the relation as
+    the SQL wrote it - `mydatabase.myschema.raw_address` rather than the bare table name the
+    probe left behind. A CTE has no storage, so its alias is lowercased instead: the probe
+    normalised it to the dialect's case, which for Snowflake means shouting a name the user
+    typed in lower case.
+    """
+    return UnresolvableRelation(
+        display_name=relation.storage or relation.alias.lower(),
+        kind=relation.kind,
+        projected_columns=sorted(relation.known),
+        closing_declarations=[
+            ClosingDeclaration(
+                relation_name=key,
+                where=declaration.where,
+                declared_columns=sorted(
+                    column.name.lower() for column in declaration.columns
+                ),
+            )
+            for key in relation.closed_by
+            if (declaration := closure.declarations.get(key)) is not None
+        ],
+    )
+
+
+def _relations_behind_an_unresolvable_column(
+    reason: UnresolvableReason,
+    candidates: list[RelationColumnSet],
+    closure: RelationClosure,
+) -> list[UnresolvableRelation]:
+    """The relations a failed read's message is about.
+
+    `several_undeclared_sources` is about the *open* ones only: a closed relation in the
+    same scope was ruled out for certain and naming it would offer the reader a fix that
+    changes nothing.
+    """
+    relevant = (
+        [relation for relation in candidates if relation.is_open]
+        if reason == "several_undeclared_sources"
+        else candidates
+    )
+    return [
+        describe_relation_for_a_failed_read(relation, closure) for relation in relevant
+    ]
 
 
 def _candidate_relations(
@@ -302,13 +371,14 @@ def resolve_columns_to_source_tables(
 
             if attribution.verdict == "unresolvable":
                 if first_time:
-                    named = candidates[0] if candidates else None
+                    reason = attribution.reason or "no_such_source"
                     unresolvable_columns.append(
                         UnresolvableColumn(
                             column=column,
-                            reason=attribution.reason or "no_such_source",
-                            source_alias=named.alias if named is not None else None,
-                            projected=sorted(named.known) if named is not None else [],
+                            reason=reason,
+                            relations=_relations_behind_an_unresolvable_column(
+                                reason, candidates, closure
+                            ),
                         )
                     )
                 continue

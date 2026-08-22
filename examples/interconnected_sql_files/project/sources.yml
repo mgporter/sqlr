@@ -46,12 +46,12 @@ sources:
       - name: raw_address
         config:
           meta:
-            declaration_is_partial: false
+            declaration_is_partial: true
         columns:
           - name: person_id
             data_type: varchar(20)
-    #       - name: street
-    #         data_type: varchar(200)
+          - name: street
+            data_type: varchar(200)
     #       - name: city
     #         data_type: varchar(100)
     #       - name: state
