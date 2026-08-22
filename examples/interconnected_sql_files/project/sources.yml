@@ -7,12 +7,16 @@ sources:
     database: mydatabase
     schema: myschema
     tables:
-      # - name: raw_department
-      #   columns:
-      #     - name: department_id
-      #       data_type: varchar(20)
-      #     - name: department_name
-      #       data_type: varchar(100)
+      - name: raw_department
+        config:
+          meta:
+            declaration_is_partial: true
+        columns:
+          - name: department_id
+            data_type: varchar(20)
+          - name: department_name
+            # data_type: varchar(100)
+            data_type: number(38,0)
       #     - name: cost_center
       #       data_type: varchar(20)
       #     - name: budget
