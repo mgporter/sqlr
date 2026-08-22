@@ -32,6 +32,7 @@ from sqlr.sql_analysis2.reporting import (
     findings_for_columns_read_with_unsupported_dot_notation,
     findings_for_columns_without_a_source,
     findings_for_duplicate_projected_columns,
+    findings_for_unrecognized_declared_types,
     findings_for_unresolvable_columns,
     findings_without_exact_duplicates,
 )
@@ -45,6 +46,7 @@ from sqlr.sql_analysis2.resolve import (
     is_declared,
     nested_schema_for_sqlglot,
     resolve_columns_to_source_tables,
+    unrecognized_declared_types,
 )
 from sqlr.sql_analysis2.sourcedoc import (
     Positions,
@@ -327,8 +329,20 @@ def qualify_one_model(
 
     # Step 5: gap-fill. The union of what the SQL names and what the yml declares, with
     # declared types where the user wrote them and UNKNOWN everywhere else.
+    #
+    # A `data_type:` the dialect cannot parse is dropped here rather than handed on. sqlglot
+    # would turn it into a user-defined type, which belongs to no family, which makes every
+    # family test answer `False` - so a typo in the yml would come back as a confident type
+    # error about the SQL instead of a warning about the declaration.
+    unusable_types = unrecognized_declared_types(closure.declared_types, dialect_name)
+    findings += findings_for_unrecognized_declared_types(
+        closure.declarations, unusable_types
+    )
     declared_types_per_relation = get_declared_types_per_relation(
-        closure.declared_types, resolved.columns_per_relation, resolved.storage_keys
+        closure.declared_types,
+        resolved.columns_per_relation,
+        resolved.storage_keys,
+        unusable_types,
     )
     findings += findings_for_columns_declared_as_scalar_but_read_as_structured(
         closure.declared_types, resolved.columns_per_relation, positions

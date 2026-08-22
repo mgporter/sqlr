@@ -9,7 +9,8 @@ document, this one wins.
 Scope: goals **3** (usage contradicting a declaration) and **4** (inferring the types of
 undeclared columns). Goal 5, whole-file checking against a `models:` declaration, stays out.
 
-Status: **design agreed, not implemented.** Decisions are settled unless marked `❓`.
+Status: **implemented.** See "What was built" at the end for the four places the design was
+wrong. Decisions are settled unless marked `❓`.
 
 ---
 
@@ -560,8 +561,71 @@ Fixtures live with the tests; nothing reads from `examples/`.
 19. `data_type: frobnicate` → `unrecognized-declared-type` warning, and **no**
     `contradicted-type`.
 20. Monotone widening: `widen(s, verdicts) == s` when `s` has no UNKNOWN.
-21. Skip equivalence: inference forced on vs skipped on a fully-declared schema — identical types
-    *and* identical findings.
+21. ~~Skip equivalence~~ — **withdrawn during implementation, see below.** Replaced by: a
+    fully-declared schema still reports a stated conflict.
 22. Three-valued discipline: an undeclared, unconstrained column flowing into a catalogued
     function produces zero findings. The false-positive regression test.
 23. A declared column's projection reports provenance `declared`, not `unknown`. Guards X1.
+
+---
+
+## What was built
+
+All of the above, plus three things the design did not anticipate and one it got wrong.
+
+### ⚠️ The phase-D skip is gone, and it had to go
+
+`type_check_plan.md` and `pipeline_architecture.md` both skip inference when
+`needs_inference` is false, and both prove the skip sound: step 5 only ever fills `UNKNOWN`
+slots, and a schema with none gives it nothing to do.
+
+That proof no longer holds, because **step 5 now does a second job**. Detecting two *stated*
+values that disagree is not vacuous on a complete declaration — it is exactly the case a
+fully-documented project most needs reported:
+
+```sql
+select a.s from a join b on a.s = b.n     -- s declared varchar, n declared bigint
+```
+
+Every slot is declared, `needs_inference` is false, and under the old skip this passed in
+silence. Step 5 now runs unconditionally. Nothing was lost: it is union-find over facts that
+were extracted anyway, and the expensive half — annotation pass 2 — keeps its own gate, which
+compares `widened != schema` directly rather than predicting that they will match.
+
+This is the warning at the end of `type_check_plan.md` step 6 coming true, and it came true
+for the reason that warning gave: a feature was added to step 5 that the skip predicate did
+not know about. The predicate changed with it rather than getting a config bolted on top.
+
+### Corrected in the design
+
+**A bare literal proves its *root* family, not its leaf.** The plan said a literal
+contributes "its family"; the first run inferred `amount → BIGINT` from `where amount > 0`,
+because `0`'s leaf family is `INTEGER`. `> 0` proves the column is numeric and proves nothing
+about its width, so `root_family_of` walks to the top-level node and the answer is
+`NUMERIC → DECIMAL(38,9)`. A literal carrying a written type — `date '2024-01-01'`, a cast —
+is not an `exp.Literal` at all, so it takes the ordinary computed path and keeps its exact
+type.
+
+### Three things the tests forced out
+
+- **A component resolved from an anchor still needs `family_satisfies`, not set membership.**
+  A declared `INT` column beside a numeric literal folds to `NUMERIC`, and the declared
+  anchor's own family is `INTEGER` — so an exact-match test finds no concrete type and widens
+  a perfectly well-known column to `DECIMAL(38,9)`. The anchor contributes its type when its
+  family sits at or below the fold.
+- **Pass 2 was building its schema from the flat dotted keys.** `ensure_schema` needs the
+  nested form for the same reason step 3 does: a flat key only ever matches a table written
+  as one identifier. A second D1 leak, in the same file as the one X1 fixed and missed by the
+  same reading.
+- **`unknown-function` had to be gated before it could be honest.** It fired on
+  `frobnicate(x)` in a test and would have fired on every real function sqlglot parses as
+  `Anonymous`. `CATALOG_IS_COMPLETE` is False for all three dialects, so the finding ships
+  dormant — and the test that proves it fires was written against a monkeypatched flag rather
+  than deleted.
+
+### One module the plan did not name
+
+`families.py`. The plan described the lattice as three operations without saying where they
+live; putting them in `annotate.py` beside the sqlglot wiring would have made the type system
+a detail of the annotator. `catalog.py`, `facts.py`, `infer.py` and `check.py` all import the
+lattice and none of them import each other's idea of it.

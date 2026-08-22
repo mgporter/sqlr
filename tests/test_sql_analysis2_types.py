@@ -20,10 +20,15 @@ from sqlr.sql_analysis2.annotate import (
     arguments_of_call,
     catalog_key,
     expression_metadata,
-    in_family,
 )
 from sqlr.sql_analysis2.annotate_types import AnnotatedModel, annotate_one_model
-from sqlr.sql_analysis2.catalog import CATALOG, Sig
+from sqlr.sql_analysis2.catalog import (
+    CATALOG_BY_DIALECT,
+    CATALOG_IS_COMPLETE,
+    Sig,
+    signatures_for_dialect,
+)
+from sqlr.sql_analysis2.families import in_family
 from sqlr.sql_analysis2.infer import widen_schema_with_inferred_types
 from sqlr.sql_analysis2.qualify import qualify_one_model
 from sqlr.sql_analysis2.types import ColumnName, ColumnTypeName, RelationKey
@@ -226,7 +231,24 @@ def test_a_fully_declared_schema_infers_nothing(tmp_path: Path) -> None:
 
 
 # ------------------------------------------------------------- structural findings
-def test_an_unknown_function_is_reported(tmp_path: Path) -> None:
+def test_an_unknown_function_is_dormant_while_the_catalog_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    """"This function does not exist" is only truthful from an exhaustive list.
+
+    Every catalog sqlr ships is a hand-written gap-filler, so the finding stays off until a
+    dialect is marked complete - otherwise every real function sqlglot happens to parse as
+    `Anonymous` becomes a user-facing error.
+    """
+    result = annotate("select frobnicate(order_id) as z from orders", ORDERS, tmp_path)
+
+    assert codes(result) == []
+
+
+def test_an_unknown_function_is_reported_when_the_catalog_is_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(CATALOG_IS_COMPLETE, DIALECT, True)
     result = annotate("select zeroifnull(order_id) as z from orders", ORDERS, tmp_path)
 
     assert codes(result) == ["unknown-function"]
@@ -257,7 +279,7 @@ def test_wrong_arity_is_reported_instead_of_a_type_error(tmp_path: Path) -> None
 
 
 # ------------------------------------------------------------------ the catalog itself
-@pytest.mark.parametrize("dialect_name", sorted(CATALOG))
+@pytest.mark.parametrize("dialect_name", sorted(CATALOG_BY_DIALECT))
 def test_every_catalogued_function_can_be_called_with_its_signature_arity(
     dialect_name: str,
 ) -> None:
@@ -267,7 +289,7 @@ def test_every_catalogued_function_can_be_called_with_its_signature_arity(
     A class's `arg_types` bounds how many positional arguments `arguments_of_call` can ever
     produce, so a signature wanting more than that can never match anything.
     """
-    for key, signatures in CATALOG[dialect_name].items():
+    for key, signatures in signatures_for_dialect(dialect_name).items():
         cls = exp.FUNCTION_BY_NAME.get(key)
         if cls is None or issubclass(cls, exp.Anonymous):
             continue  # an operator or an Anonymous-only call; no arg_types to check
@@ -314,3 +336,286 @@ def test_arguments_of_call_follows_sqlglot_node_order() -> None:
     call = tree.find(exp.TimestampTrunc)
     assert call is not None
     assert [argument.sql() for argument in arguments_of_call(call)] == ["ts", "DAY"]
+
+
+# ============================================================== strength and the lattice
+def annotate_in(
+    sql: str,
+    declared: dict[RelationKey, dict[ColumnName, ColumnTypeName]],
+    tmp_path: Path,
+    dialect_name: str,
+) -> AnnotatedModel:
+    """`annotate`, for the tests that are about a dialect rather than about SQL."""
+    path = tmp_path / "x.sql"
+    path.write_text(sql)
+    model = Model(
+        name="x",
+        file=SqlFile(path=path, relative_path="x.sql", mtime=0.0, content_hash=""),
+    )
+    return annotate_one_model(
+        qualify_one_model(model, declarations(declared), dialect_name),
+        expression_metadata(dialect_name),
+    )
+
+
+def severities(result: AnnotatedModel) -> list[str]:
+    return [finding.severity for finding in result.findings]
+
+
+# ---- a literal is a stated type ---------------------------------------------------
+def test_a_string_literal_comparison_states_the_column_is_a_string(
+    tmp_path: Path,
+) -> None:
+    """sqlr does not model engine autocasting. If the column is really a date, the SQL
+    should say `date '2024-01-01'` or the yml should declare it - so the honest reading of
+    this file is that `d` is a string, and the tool says so rather than guessing."""
+    result = annotate(
+        "select d from events where d >= '2024-01-01'", {"events": {"d": "UNKNOWN"}}, tmp_path
+    )
+
+    assert inferred_types(result) == {("events", "d"): "VARCHAR"}
+    assert result.inference.inferred[0].strength == "stated"
+    assert codes(result) == []
+
+
+def test_a_stated_string_used_as_a_date_is_an_error(tmp_path: Path) -> None:
+    """The headline behaviour. `d` is stated STRING by the literal it is compared against,
+    so a temporal use of it is a contradiction and not a resolution failure."""
+    result = annotate(
+        """
+        select date_trunc('day', d) as day
+        from events
+        where d >= '2024-01-01'
+        """,
+        {"events": {"d": "UNKNOWN"}},
+        tmp_path,
+    )
+
+    assert codes(result) == ["contradicted-type"]
+    assert severities(result) == ["error"]
+    assert "TEMPORAL" in result.findings[0].message
+
+
+def test_a_numeric_literal_states_the_family_and_not_the_width(tmp_path: Path) -> None:
+    """`> 0` proves the column is numeric and proves nothing about its width. Inferring
+    `INT` from it would falsely contradict `amount * 1.5` three CTEs later."""
+    result = annotate(
+        "select amount from orders where amount > 0", ORDERS, tmp_path
+    )
+
+    entry = result.inference.inferred[0]
+    assert (entry.family, entry.type_name) == ("NUMERIC", "DECIMAL(38,9)")
+
+
+def test_a_link_to_a_declared_column_keeps_its_exact_type(tmp_path: Path) -> None:
+    """The other half of the rule: a *column* anchor is exact, only a literal is widened."""
+    result = annotate(
+        "select o.amount from orders o join t2 on o.amount = t2.n",
+        {**ORDERS, "t2": {"n": "decimal(10,2)"}},
+        tmp_path,
+    )
+    assert inferred_types(result)[("orders", "amount")] == "DECIMAL(10, 2)"
+
+
+# ---- the lattice ------------------------------------------------------------------
+def test_an_integer_compared_with_a_decimal_is_not_a_conflict(tmp_path: Path) -> None:
+    """Compatible iff the nearest common family is not ANY. `int_col = decimal_col` is
+    ordinary SQL, and reporting it is how a checker gets switched off."""
+    result = annotate(
+        "select a.n from a join b on a.n = b.n",
+        {"a": {"n": "bigint"}, "b": {"n": "decimal(10,2)"}},
+        tmp_path,
+    )
+    assert codes(result) == []
+
+
+def test_a_date_compared_with_a_timestamp_is_not_a_conflict(tmp_path: Path) -> None:
+    result = annotate(
+        "select a.d from a join b on a.d = b.ts",
+        {"a": {"d": "date"}, "b": {"ts": "timestamp"}},
+        tmp_path,
+    )
+    assert codes(result) == []
+
+
+def test_two_decimals_of_different_precision_are_not_a_conflict(tmp_path: Path) -> None:
+    """Precision and scale are recorded, printed, and never compared."""
+    result = annotate(
+        "select a.n from a join b on a.n = b.n",
+        {"a": {"n": "decimal(10,2)"}, "b": {"n": "decimal(38,9)"}},
+        tmp_path,
+    )
+    assert codes(result) == []
+
+
+def test_a_string_compared_with_a_number_is_an_error_at_every_site(
+    tmp_path: Path,
+) -> None:
+    """Two stated types in one component: two things were written down and one is wrong.
+    Every site gets a finding, because every site is a place the user has to look."""
+    result = annotate(
+        "select a.s from a join b on a.s = b.n",
+        {"a": {"s": "varchar"}, "b": {"n": "bigint"}},
+        tmp_path,
+    )
+
+    assert codes(result) == ["conflicting-usage", "conflicting-usage"]
+    assert severities(result) == ["error", "error"]
+    assert "does not assume the engine will cast" in result.findings[0].message
+
+
+def test_conflicting_claims_are_a_warning_rather_than_an_error(tmp_path: Path) -> None:
+    """Inferred-versus-inferred. sqlr guessed twice and the guesses fought; the SQL may be
+    fine and the honest answer is "I could not tell"."""
+    result = annotate(
+        "select upper(amount) as a, amount / 2 as b from orders", ORDERS, tmp_path
+    )
+
+    assert severities(result) == ["warning", "warning"]
+    assert not result.has_errors
+    assert inferred_types(result) == {}
+
+
+# ---- components -------------------------------------------------------------------
+def test_a_type_crosses_a_chain_of_links(tmp_path: Path) -> None:
+    """Transitivity, and strength crossing it intact: `c.z` is declared, so `a.x` is
+    stated - not "stated, then weaker, then weaker still"."""
+    result = annotate(
+        """
+        select a.x
+        from a
+        join b on a.x = b.y
+        join c on b.y = c.z
+        """,
+        {"a": {"x": "UNKNOWN"}, "b": {"y": "UNKNOWN"}, "c": {"z": "date"}},
+        tmp_path,
+    )
+
+    assert inferred_types(result) == {("a", "x"): "DATE", ("b", "y"): "DATE"}
+    assert {entry.strength for entry in result.inference.inferred} == {"stated"}
+
+
+def test_two_reads_of_one_column_are_one_component(tmp_path: Path) -> None:
+    """`orders.amount` at one line and at another are two `exp.Column` nodes and one
+    column. Without the union by schema slot the claim and the link land in different
+    components and neither ever sees the other - so this would infer VARCHAR in silence."""
+    result = annotate(
+        "select upper(amount) as a from orders where amount = 5", ORDERS, tmp_path
+    )
+
+    assert inferred_types(result)[("orders", "amount")] == "DECIMAL(38,9)"
+    assert codes(result) == ["contradicted-type"]
+
+
+def test_a_claim_reaches_a_storage_column_through_three_ctes(tmp_path: Path) -> None:
+    """Projection-passthrough. Without it transitivity stops at the first CTE boundary and
+    a claim made downstream never reaches the table it is really about."""
+    result = annotate(
+        """
+        with a as (select amount from orders),
+             b as (select amount from a),
+             c as (select amount from b)
+        select upper(amount) as x from c
+        """,
+        ORDERS,
+        tmp_path,
+    )
+    assert inferred_types(result) == {("orders", "amount"): "VARCHAR"}
+
+
+def test_arithmetic_carries_a_claim_back_to_its_operand(tmp_path: Path) -> None:
+    """`min(x)` returns `@arg0`, which says the result *is* `x`'s type - a link written in
+    the catalog. `min` claims nothing about its argument (its parameter is ANY), so this
+    type can only have arrived backwards through the return marker."""
+    result = annotate(
+        """
+        with a as (select min(amount) as m from orders)
+        select upper(m) as x from a
+        """,
+        ORDERS,
+        tmp_path,
+    )
+    assert inferred_types(result) == {("orders", "amount"): "VARCHAR"}
+
+
+def test_a_family_return_marker_carries_the_family_and_not_the_width(
+    tmp_path: Path,
+) -> None:
+    """`SUM(INT)` is HUGEINT in DuckDB and NUMBER(38,0) in Snowflake, so `sum` is not
+    `@arg0`. The component keeps the family and forfeits the concrete type."""
+    result = annotate(
+        """
+        with a as (select employee_id, sum(amount) as total from orders group by employee_id)
+        select a.total from a join t2 on a.total = t2.n
+        """,
+        {**ORDERS, "orders": {**ORDERS["orders"], "employee_id": "bigint"},
+         "t2": {"n": "decimal(10,2)"}},
+        tmp_path,
+    )
+    assert inferred_types(result)[("orders", "amount")] == "DECIMAL(38,9)"
+
+
+# ---- the catalog ------------------------------------------------------------------
+@pytest.mark.parametrize("dialect_name", ["duckdb", "snowflake", "spark"])
+def test_upper_of_a_number_is_an_error_in_every_dialect(
+    tmp_path: Path, dialect_name: str
+) -> None:
+    """The common catalog's whole reason for existing: this signature belongs to no engine
+    in particular, so it must not have to be written down once per engine."""
+    result = annotate_in(
+        "select upper(n) as u from t", {"t": {"n": "bigint"}}, tmp_path, dialect_name
+    )
+    assert codes(result) == ["contradicted-type"]
+
+
+def test_a_dialect_entry_replaces_the_common_one(tmp_path: Path) -> None:
+    """Replacement, never merged: a dialect layer exists to say something *different*, and
+    appending overloads could only ever widen what a key accepts."""
+    common = signatures_for_dialect("duckdb")["CONCAT"]
+    spark = signatures_for_dialect("spark")["CONCAT"]
+
+    assert len(common) == 1
+    assert len(spark) == 2
+    assert {sig.params[0] for sig in spark} == {"STRING", "ARRAY"}
+
+
+# ---- the declared-type boundary ---------------------------------------------------
+def test_an_unparseable_declared_type_is_reported_and_not_believed(
+    tmp_path: Path,
+) -> None:
+    """Without the boundary check the name reaches sqlglot as a *user-defined* type, which
+    belongs to no family, which makes every family test answer False - so a typo in the yml
+    would come back as a confident `contradicted-type` error about the SQL."""
+    result = annotate("select upper(s) as u from t", {"t": {"s": "frobnicate"}}, tmp_path)
+
+    qualified = result.qualified
+    assert [finding.code for finding in qualified.findings] == [
+        "unrecognized-declared-type"
+    ]
+    assert qualified.findings[0].severity == "warning"
+    assert "frobnicate" in qualified.findings[0].message
+    # ...and the column falls back to undeclared, so the SQL is checked, not blamed.
+    assert codes(result) == []
+    assert inferred_types(result) == {("t", "s"): "VARCHAR"}
+
+
+def test_a_structured_type_name_still_parses(tmp_path: Path) -> None:
+    """`json`, `variant`, `struct(...)` and `map(...)` are real type names. Only a name
+    nothing recognises is rejected."""
+    for written in ("json", "variant", "struct(a int)", "map(varchar, int)"):
+        result = annotate("select s from t", {"t": {"s": written}}, tmp_path)
+        assert result.qualified.findings == [], written
+
+
+# ---- provenance -------------------------------------------------------------------
+def test_a_declared_column_reports_provenance_declared(tmp_path: Path) -> None:
+    """The schema is keyed on the full `RelationKey`, so a bare-name lookup misses every
+    time - which reported every declared column as `unknown`."""
+    result = annotate("select status from orders", ORDERS, tmp_path)
+
+    provenance = {
+        column.name: column.provenance
+        for entry in result.scopes
+        for column in entry.columns
+    }
+    assert provenance == {"status": "declared"}

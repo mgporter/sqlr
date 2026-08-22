@@ -19,7 +19,7 @@ fact walk only speaks about columns nobody has described - see `facts.py`.
 from __future__ import annotations
 
 import logging
-from typing import Literal, NamedTuple, cast
+from typing import Literal, NamedTuple
 
 from sqlglot import exp
 from sqlglot.optimizer.annotate_types import annotate_types as annotate_types_with_sqlglot
@@ -49,13 +49,18 @@ from sqlr.sql_analysis2.qualify import (
     output_name_of,
     qualifier_of_a_star_projection,
 )
+from sqlr.sql_analysis2.relations import relation_key_of
 from sqlr.sql_analysis2.reporting import TypeFinding
-from sqlr.sql_analysis2.resolve import is_declared, needs_inference
+from sqlr.sql_analysis2.resolve import (
+    is_declared,
+    needs_inference,
+    nested_schema_for_sqlglot,
+)
 from sqlr.sql_analysis2.types import (
     ColumnName,
     ColumnTypeName,
+    RelationKey,
     ScopeKind,
-    TableName,
 )
 
 logger = logging.getLogger(__name__)
@@ -89,7 +94,7 @@ class ScopeTypes(NamedTuple):
 class SourceColumnType(NamedTuple):
     """One column of a real table: what it is, and how that was settled."""
 
-    table: TableName
+    table: RelationKey
     column: ColumnName
     type_name: str
     provenance: TypeProvenance
@@ -166,45 +171,55 @@ def annotate_one_model(
         len(facts.joins),
     )
 
-    inference = Inference()
-    if needs_inference(schema):
-        # Step 5 - facts about columns nobody declared become types. Only ever fills
-        # UNKNOWN slots, which is what makes this converge in one round AND makes the skip
-        # below sound.
-        inference = infer_types_for_undeclared_columns(facts, schema, dialect_name)
-        for entry in inference.inferred:
-            logger.info(
-                "inferred %s.%s %s from %d fact(s)",
-                entry.table,
-                entry.column,
-                entry.type_name,
-                len(entry.evidence),
-            )
+    # Step 5 - resolve every value to a type, or say why it could not be.
+    #
+    # ⚠️ This runs even when the schema is fully declared, and the earlier plan's skip is
+    # gone with it. That skip rested on step 5 doing one job - filling UNKNOWN slots - which
+    # nothing can do when there are none. Step 5 now does a second job that a complete
+    # declaration does not make vacuous: it detects **stated** values that disagree, and
+    # `select a.s from a join b on a.s = b.n` with `s` declared varchar and `n` declared
+    # bigint is exactly the case a fully-declared project most needs reported. The pass is
+    # union-find over facts already extracted, so what the skip used to save was never here.
+    if not needs_inference(schema):
+        logger.info("schema fully declared; nothing to infer, still checking for conflicts")
+    inference = infer_types_for_undeclared_columns(facts, schema, dialect_name)
+    for entry in inference.inferred:
+        logger.info(
+            "inferred %s.%s %s (%s, %s) from %d fact(s)",
+            entry.table,
+            entry.column,
+            entry.type_name,
+            entry.family,
+            entry.strength,
+            len(entry.evidence),
+        )
 
-        # Step 6 - annotate, pass 2. Same tree, no re-parse, no re-qualify. After this,
-        # declared and inferred types are indistinguishable downstream.
-        if inference.inferred:
-            widened = widen_schema_with_inferred_types(schema, inference)
-            tree = annotate_types_with_sqlglot(
-                tree,
-                schema=ensure_schema(
-                    cast("dict[str, object]", widened), dialect=dialect_name
-                ),
-                expression_metadata=metadata,
-                dialect=dialect_name,
-            )
-            log_type_coverage(tree, result.model.relative_path)
-    else:
-        # Proven no-op when nothing is UNKNOWN: no fact can be about an unknown slot, so
-        # inference is empty by construction and pass 2 cannot differ.
-        logger.info("schema fully declared; skipping inference passes 5-6")
+    # Step 6 - annotate, pass 2. Same tree, no re-parse, no re-qualify: qualification
+    # depends on which columns *exist*, and widening never changes the column set.
+    #
+    # Gated on the schema having actually changed. An undeclared project where inference
+    # finds nothing - a file with no predicates and no calls - would otherwise pay a full
+    # second annotation pass for a guaranteed no-op. This is the only skip left, and it is
+    # sound for the reason the old one was not: it compares the two inputs directly rather
+    # than predicting that they will match.
+    widened = widen_schema_with_inferred_types(schema, inference)
+    if widened != schema:
+        tree = annotate_types_with_sqlglot(
+            tree,
+            # The nested form, for the same reason step 3 needed it: a flat dotted key
+            # only ever matches a table written as one identifier.
+            schema=ensure_schema(nested_schema_for_sqlglot(widened), dialect=dialect_name),
+            expression_metadata=metadata,
+            dialect=dialect_name,
+        )
+        log_type_coverage(tree, result.model.relative_path)
 
     # Step 7 - check. Reads node.type only, never the SQL text: everything upstream has
     # been flattened into one uniform annotated tree.
     findings = [
         *findings_for_unknown_functions(tree, result.positions, dialect_name),
         *findings_for_calls_with_wrong_arity(tree, result.positions, dialect_name),
-        *findings_for_contradicted_claims(facts, schema),
+        *findings_for_contradicted_claims(facts, schema, inference),
         *findings_for_columns_with_conflicting_facts(inference.conflicts),
     ]
     logger.info(
@@ -262,7 +277,7 @@ def provenance_of_projection(
     projection: exp.Expr,
     scope: Scope,
     statement: QualifiedStatement,
-    inferred: dict[TableName, dict[ColumnName, InferredColumnType]],
+    inferred: dict[RelationKey, dict[ColumnName, InferredColumnType]],
 ) -> TypeProvenance:
     """How much to trust one projected column's type.
 
@@ -281,7 +296,10 @@ def provenance_of_projection(
         # A CTE or derived table: its column was computed by the scope that produced it.
         return "computed"
 
-    table = source.name.lower()
+    # The full dotted key, never the bare table name: the schema is keyed on `RelationKey`
+    # so that two schemas may each hold a `raw_department`, and a bare-name lookup misses
+    # every time - which reported every declared column as `unknown`.
+    table = relation_key_of(source)
     column = inner.name.lower()
     if is_declared(statement.declared_types_per_relation.get(table, {}).get(column)):
         return "declared"
@@ -309,10 +327,10 @@ def types_per_source_column(
 
 
 def _source_column_type(
-    table: TableName,
+    table: RelationKey,
     column: ColumnName,
     written: ColumnTypeName,
-    inferred: dict[TableName, dict[ColumnName, InferredColumnType]],
+    inferred: dict[RelationKey, dict[ColumnName, InferredColumnType]],
 ) -> SourceColumnType:
     if is_declared(written):
         return SourceColumnType(

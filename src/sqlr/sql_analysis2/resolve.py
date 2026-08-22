@@ -440,10 +440,41 @@ def resolve_columns_to_source_tables(
 
 
 # --------------------------------------------------------------------- step 5: gap-fill
+def type_name_is_recognized(written: ColumnTypeName, dialect_name: str) -> bool:
+    """Whether the dialect can parse a written `data_type:` into a real type.
+
+    The discriminator is `udt=False`. With sqlglot's default the name comes back as a
+    *user-defined* type instead of raising, and a user-defined type belongs to no family -
+    so `in_family` answers `False` for every family and a yml typo arrives as a confident
+    `contradicted-type` error about the SQL. `json`, `variant`, `struct(...)` and `map(...)`
+    all parse and are not affected; only a name nothing recognises fails here.
+    """
+    try:
+        exp.DataType.build(written, dialect=dialect_name, udt=False)
+    except Exception:
+        # sqlglot raises ParseError, but a malformed parameter list can surface as others,
+        # and every one of them means the same thing: this is not a usable type name.
+        return False
+    return True
+
+
+def unrecognized_declared_types(
+    declared: dict[RelationKey, dict[ColumnName, ColumnTypeName]], dialect_name: str
+) -> dict[RelationKey, set[ColumnName]]:
+    """Every declared type name the dialect cannot parse, by relation."""
+    out: dict[RelationKey, set[ColumnName]] = {}
+    for key, columns in declared.items():
+        for column, written in columns.items():
+            if is_declared(written) and not type_name_is_recognized(written, dialect_name):
+                out.setdefault(key, set()).add(column)
+    return out
+
+
 def get_declared_types_per_relation(
     declared: dict[RelationKey, dict[ColumnName, ColumnTypeName]],
     column_names_per_relation: dict[RelationKey, dict[ColumnName, ParsedColumn]],
     storage_keys: set[RelationKey],
+    unusable: dict[RelationKey, set[ColumnName]] | None = None,
 ) -> dict[RelationKey, dict[ColumnName, ColumnTypeName]]:
     """Complete the schema's *column set* so `qualify` does not raise.
 
@@ -465,14 +496,22 @@ def get_declared_types_per_relation(
     `ResolvedColumns.unresolvable_columns`, and against a *closed* relation, which is what
     a complete declaration makes one, that now includes a name the declaration omits.
     """
+    unusable = unusable or {}
     out: dict[RelationKey, dict[ColumnName, ColumnTypeName]] = {}
     for key in set(column_names_per_relation) | storage_keys:
         declared_here = declared.get(key, {})
+        rejected = unusable.get(key, set())
         columns = set(column_names_per_relation.get(key, {})) | set(declared_here)
         if not columns:
             continue
         out[key] = {
-            column: declared_here.get(column, UNKNOWN_TYPE) for column in sorted(columns)
+            # A name the dialect cannot parse is worth exactly as much as writing nothing,
+            # and is worth strictly less than a user-defined type sqlglot would invent - see
+            # `type_name_is_recognized`. So it falls back to UNKNOWN and gets inferred.
+            column: UNKNOWN_TYPE
+            if column in rejected
+            else declared_here.get(column, UNKNOWN_TYPE)
+            for column in sorted(columns)
         }
     return out
 

@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import BaseModel
 from sqlglot import exp
 
+from sqlr.declared.types import DeclaredRelation
 from sqlr.sql_analysis2.sourcedoc import Positions, SourceSpan
 from sqlr.sql_analysis2.types import (
     AmbiguousColumn,
@@ -32,6 +33,7 @@ type FindingCode = Literal[
     "ambiguous-column",
     "column-without-source",
     "duplicate-projected-column",
+    "unrecognized-declared-type",
 ]
 
 type FindingSeverity = Literal["error", "warning"]
@@ -407,6 +409,56 @@ def findings_for_columns_declared_as_scalar_but_read_as_structured(
                         access_span=span_of_access(node, positions),
                     )
                 )
+    return findings
+
+
+def findings_for_unrecognized_declared_types(
+    declarations: dict[RelationKey, DeclaredRelation],
+    unrecognized: dict[RelationKey, set[ColumnName]],
+) -> list[ColumnFinding]:
+    """A `data_type:` the dialect cannot parse.
+
+    Without this the name reaches sqlglot as a *user-defined* type, which belongs to no
+    family, which makes `in_family` answer `False` for every family - so a typo in the yml
+    would come back as a confident `contradicted-type` error about the SQL. The mistake is
+    in the declaration, and the message has to say so.
+
+    A warning rather than an error, and the slot falls back to UNKNOWN: an unparseable
+    declaration leaves the column exactly as undeclared as writing nothing would have, and
+    the rest of the file is still worth checking.
+
+    No span. The text is in a yml, not in the `.sql` this run is reporting on, so the file
+    and line are named in the message instead of underlined in the wrong document.
+    """
+    findings: list[ColumnFinding] = []
+    for relation_key, names in sorted(unrecognized.items()):
+        declaration = declarations.get(relation_key)
+        for name in sorted(names):
+            column = next(
+                (
+                    entry
+                    for entry in (declaration.columns if declaration else [])
+                    if entry.name.lower() == name
+                ),
+                None,
+            )
+            written = column.written_type if column is not None else "?"
+            where = ""
+            if declaration is not None and column is not None:
+                span = column.type_span or column.span
+                where = f" ({declaration.label}{f':{span}' if span else ''})"
+            findings.append(
+                ColumnFinding(
+                    code="unrecognized-declared-type",
+                    column_name=name,
+                    severity="warning",
+                    message=(
+                        f"column '{name}' of '{relation_key}' is declared '{written}', "
+                        f"which is not a type name this dialect recognises{where}; "
+                        "its type will be inferred instead"
+                    ),
+                )
+            )
     return findings
 
 

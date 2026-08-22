@@ -29,13 +29,19 @@ from sqlr.sql_analysis2.annotate import (
     arguments_of_call,
     candidate_overloads,
     catalog_key,
-    in_family,
     signatures_for_dialect,
     signatures_of_call,
+    unknown_function_findings_are_trustworthy,
 )
 from sqlr.sql_analysis2.catalog import DialectName, Sig
+from sqlr.sql_analysis2.families import in_family
 from sqlr.sql_analysis2.facts import Facts, TypeClaim
-from sqlr.sql_analysis2.infer import ColumnTypeConflict, TypeEvidence
+from sqlr.sql_analysis2.infer import (
+    ColumnTypeConflict,
+    Inference,
+    TypeEvidence,
+    TypeStrength,
+)
 from sqlr.sql_analysis2.reporting import TypeFinding
 from sqlr.sql_analysis2.resolve import is_declared
 from sqlr.sql_analysis2.sourcedoc import Positions, SourceSpan
@@ -75,7 +81,13 @@ def findings_for_unknown_functions(
     Only `Anonymous` calls qualify. A function sqlglot parsed into a class of its own exists
     *somewhere*, so its absence from the catalog says our catalog is thin, not that the SQL
     is wrong - reporting those would make every uncatalogued function a user-facing error.
+
+    Gated on the dialect's catalog being complete, for the same reason one step further out:
+    "this function does not exist" is only a truthful statement from an exhaustive list, and
+    every catalog sqlr ships is a hand-written gap-filler. See `CATALOG_IS_COMPLETE`.
     """
+    if not unknown_function_findings_are_trustworthy(dialect_name):
+        return []
     signatures = signatures_for_dialect(dialect_name)
     return [
         TypeFinding(
@@ -149,9 +161,15 @@ def _contradiction_message(
 ) -> str:
     """`ROUND argument 1 expects NUMERIC, but 'status' is declared varchar (TEXT)`.
 
-    Naming the declaration when there is one is the difference between a message about the
-    SQL and a message about the disagreement: the type did not appear from nowhere, the
-    user wrote it, and that is where the fix goes.
+    Three shapes for one finding, because the fix is in a different place each time:
+
+    - **declared** - the user wrote the type in a yml, and that is where the fix goes. Naming
+      the declaration is the difference between a message about the SQL and a message about
+      the disagreement.
+    - **a named value with a computed type** - `'amount' is TEXT here`. Nothing to edit in a
+      yml; the expression that produced it is upstream in this file.
+    - **anything else** - a literal, an expression with no name. The type is all there is to
+      say.
     """
     wants = f"{claim.because.describe()} expects {claim.describe_families()}"
     if declared is not None:
@@ -159,22 +177,34 @@ def _contradiction_message(
             f"{wants}, but {claim.site.describe()} is declared "
             f"{declared} ({actual.sql()})"
         )
+    if claim.site.column is not None:
+        return f"{wants}, but {claim.site.describe()} is {actual.sql()} here"
     return f"{wants}, got {actual.sql()}"
 
 
 def findings_for_contradicted_claims(
     facts: Facts,
     declared_types_per_relation: dict[RelationKey, dict[ColumnName, ColumnTypeName]],
+    inference: Inference,
 ) -> list[TypeFinding]:
     """Every claim the value it is about definitely does not satisfy.
 
     `is False`, never `None`. A claim about a value of unknown type produces nothing at all
     - that is what stops one uncatalogued function from blaming every column above it, and
     every false positive found while building this traced back to the distinction.
+
+    **Only against a `stated` value.** An inferred type was derived from this very claim set,
+    so if the claims disagreed the column is unresolved and there is nothing to contradict;
+    and a value in a component that *did* conflict is already reported once per site by
+    `findings_for_columns_with_conflicting_facts`. Either way a second finding on the same
+    span would be noise rather than information.
     """
     findings: list[TypeFinding] = []
     for claim in facts.type_claims:
         actual = claim.site.node.type
+        strength: TypeStrength | None = inference.strength_of_node.get(id(claim.site.node))
+        if strength is not None and strength != "stated":
+            continue
         if actual is None or not claim_is_contradicted(claim, actual):
             continue
         findings.append(
@@ -196,34 +226,55 @@ def findings_for_contradicted_claims(
 def _conflict_message(conflict: ColumnTypeConflict, here: TypeEvidence) -> str:
     """One site's half of a disagreement, with the other sites named.
 
-    Every site gets its own finding because every site is a place the user has to look:
-    the fix is either a declaration or one of these usages, and which one is theirs to say.
+    Every site gets its own finding because every site is a place the user has to look: the
+    fix is either a declaration or one of these usages, and which one is theirs to say.
+
+    The two strengths need two sentences, not one with a severity attached. A stated
+    conflict is an accusation about the SQL - two types are written down and one is wrong. An
+    inferred conflict is an admission about sqlr - it guessed twice and the guesses fought,
+    and declaring the column ends the argument.
     """
+    mine = here.describe_family()
     elsewhere = [
-        f"{item.family} at {item.span}" if item.span is not None else item.family
+        f"{item.describe_family()} at {item.span}"
+        if item.span is not None
+        else item.describe_family()
         for item in conflict.evidence
-        if item.family != here.family
+        if item.describe_family() != mine
     ]
+    others = " and ".join(dict.fromkeys(elsewhere))
+
+    if conflict.strength == "stated":
+        return (
+            f"{conflict.describe_subject()} is used as {mine} here ({here.detail}), "
+            f"but as {others}; these cannot both be true and sqlr does not assume the "
+            f"engine will cast between them"
+        )
     return (
-        f"column '{conflict.column}' of '{conflict.table}' has no declared type and its "
-        f"usage disagrees: {here.family} here ({here.detail}), "
-        f"{' and '.join(dict.fromkeys(elsewhere))}; declare its type or fix the usage"
+        f"{conflict.describe_subject()} has no declared type and its usage disagrees: "
+        f"{mine} here ({here.detail}), {others}; declare its type or fix the usage"
     )
 
 
 def findings_for_columns_with_conflicting_facts(
     conflicts: list[ColumnTypeConflict],
 ) -> list[TypeFinding]:
-    """An undeclared column used as two different things.
+    """A value used as two different things, reported once per site.
 
-    An error, not a warning. Engine autocasting is not something sqlr relies on, so
-    `upper(x)` beside `x > 5` is a defect rather than a dialect feature - and the column
-    stays UNKNOWN either way, so nothing downstream inherits a guess.
+    Severity is the conflict's strength, and the difference is real. Two *stated* types -
+    a declaration, a computed expression, a literal - means two things were written down and
+    one of them is wrong, which is an **error**. Two *inferred* families means sqlr derived
+    both from usage and they fought, which is a **warning** about sqlr's confidence rather
+    than an accusation about the SQL.
+
+    Either way the column stays UNKNOWN. UNKNOWN is absorbing in sqlglot, so everything
+    downstream goes quiet instead of inheriting a coin-flip.
     """
     return [
         TypeFinding(
             code="conflicting-usage",
             message=_conflict_message(conflict, item),
+            severity="error" if conflict.strength == "stated" else "warning",
             span=item.span,
             context_span=item.span,
             column_name=conflict.column,

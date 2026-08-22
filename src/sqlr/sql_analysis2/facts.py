@@ -33,11 +33,16 @@ from sqlr.sql_analysis2.annotate import (
     arguments_of_call,
     candidate_overloads,
     catalog_key,
-    is_a_type_variable,
     signatures_for_dialect,
     signatures_of_call,
+    surviving_overloads,
 )
-from sqlr.sql_analysis2.catalog import CatalogKey, FamilyName, Sig
+from sqlr.sql_analysis2.catalog import CatalogKey, Sig
+from sqlr.sql_analysis2.families import (
+    FamilyName,
+    describe_families,
+    is_a_type_variable,
+)
 from sqlr.sql_analysis2.qualify import (
     ColumnReference,
     QualifiedStatement,
@@ -108,8 +113,25 @@ class ValueSite:
 # ------------------------------------------------------------------------- type facts
 type ClaimReasonKind = Literal["call-argument", "boolean-context"]
 type LinkReasonKind = Literal[
-    "call-argument", "between", "case-arm", "in-list", "in-subquery", "set-operation-arm"
+    "call-argument",
+    "between",
+    "case-arm",
+    "in-list",
+    "in-subquery",
+    "set-operation-arm",
+    "projection-passthrough",
+    "return-type",
 ]
+"""Why two values share a domain.
+
+The last two are what make a link chain reach a storage column, and neither is a comparison:
+
+- `projection-passthrough` - a column read off a CTE *is* that CTE's projection. Without it
+  transitivity stops at every CTE boundary and a claim made three scopes downstream never
+  reaches the table it is really about.
+- `return-type` - a signature returning `@argN` says the result *is* that argument's type,
+  which is a link written down in the catalog and previously read only by the annotator.
+"""
 
 
 @dataclass(frozen=True)
@@ -149,10 +171,7 @@ class TypeClaim:
 
     def describe_families(self) -> str:
         """`NUMERIC`, `NUMERIC or INTERVAL` - in a stable order, since a set has none."""
-        names = sorted(self.families)
-        if len(names) == 1:
-            return names[0]
-        return f"{', '.join(names[:-1])} or {names[-1]}"
+        return describe_families(self.families)
 
 
 @dataclass(frozen=True)
@@ -172,10 +191,17 @@ class TypeLink:
     call: CatalogKey | None = None
     """The call whose type variable bound the two ends, when one did. `>` and `COALESCE`
     are both links, and a reader given only "same domain" cannot tell which."""
+    family_only: bool = False
+    """Whether the two ends share a *family* rather than a type.
+
+    `sum(x)` is numeric because `x` is, but `SUM(INT)` is HUGEINT in DuckDB and
+    NUMBER(38,0) in Snowflake - so the link carries the family across and the concrete type
+    stays behind. Set by `@family(argN)` signatures and by nothing else.
+    """
 
     def describe(self) -> str:
         """How the link reads in a message: `>`, `COALESCE`, `set operation arm`."""
-        if self.because == "call-argument" and self.call is not None:
+        if self.because in ("call-argument", "return-type") and self.call is not None:
             return self.call
         return self.because.replace("-", " ")
 
@@ -433,8 +459,33 @@ class _FactWalk:
             self._type_facts_of_syntax(node)
 
         for scope in self.statement.scopes:
+            self._link_columns_to_the_projections_they_read(scope)
             self._facts_of_scope(scope)
         return self.facts
+
+    # ---- links across a relation boundary --------------------------------------
+    def _link_columns_to_the_projections_they_read(self, scope: Scope) -> None:
+        """A column read off a CTE *is* that CTE's projection, so link the two.
+
+        This is what makes a link chain reach storage. `sum(o.amount)` in the last CTE of
+        `sales.sql` claims NUMERIC of a column that has no schema slot - it belongs to a
+        CTE, four relations above the table that really holds it. Without a link at each
+        boundary the claim dies there and the source column stays undeclared and untyped.
+
+        Only relations whose columns are *computed*: a real table has a schema slot of its
+        own and needs no link to reach it. `amount * 2 as amount` is linked too, and
+        correctly - the downstream column is that expression's value, and the expression's
+        own `@arg0` marker carries the type the rest of the way down to `amount`.
+        """
+        for column in scope.columns:
+            source = scope.sources.get(column.table)
+            if not isinstance(source, Scope):
+                continue
+            projection = projection_of_scope_named(source, column.name)
+            if projection is None:
+                continue
+            inner = projection.this if isinstance(projection, exp.Alias) else projection
+            self._add_link(column, inner, "projection-passthrough", column)
 
     # ---- type facts from the catalog -------------------------------------------
     def _type_facts_of_call(self, node: exp.Expr) -> None:
@@ -460,8 +511,13 @@ class _FactWalk:
 
         arguments = arguments_of_call(node)
         key = catalog_key(node)
+        # Claims read every arity candidate, so a position says everything any overload
+        # would accept there. Links read only the *surviving* ones: a link asserts an
+        # equality, and an overload some argument already rules out must not assert one.
+        surviving = surviving_overloads(node, signatures)
         self._claims_accepted_by_candidates(candidates, arguments, key)
-        self._links_bound_by_type_variables(candidates, arguments, node, key)
+        self._links_bound_by_type_variables(surviving, arguments, node, key)
+        self._link_bound_by_the_return_marker(surviving, arguments, node, key)
 
     def _claims_accepted_by_candidates(
         self, candidates: list[Sig], arguments: list[exp.Expr], key: CatalogKey | None
@@ -512,6 +568,40 @@ class _FactWalk:
                     arguments[left], arguments[right], "call-argument", node, key
                 )
 
+    def _link_bound_by_the_return_marker(
+        self,
+        surviving: list[Sig],
+        arguments: list[exp.Expr],
+        node: exp.Expr,
+        key: CatalogKey | None,
+    ) -> None:
+        """Link a call to the argument its return marker binds it to.
+
+        `Sig(returns="@arg0")` is not only a note for the annotator: it says the result *is*
+        that argument's value-type, which is a link. Reading it as one is what carries a type
+        *backwards* through arithmetic - a claim on `amount * 2` three CTEs downstream
+        reaches `amount` through the `Mul` node, with no rule written for arithmetic
+        anywhere.
+
+        Emitted only when every surviving overload names the same marker. `*` returns
+        `@arg0`, `@arg0` and `@arg1`, which disagree - but in `amount * 2` the literal rules
+        out `(NUMERIC, INTERVAL)` and the two survivors agree.
+        """
+        markers = {sig.return_link for sig in surviving}
+        if len(markers) != 1:
+            return
+        link = markers.pop()
+        if link is None or link.argument_index >= len(arguments):
+            return
+        self._add_link(
+            node,
+            arguments[link.argument_index],
+            "return-type",
+            node,
+            key,
+            family_only=link.family_only,
+        )
+
     # ---- type facts the catalog cannot express ---------------------------------
     def _type_facts_of_syntax(self, node: exp.Expr) -> None:
         """The constructs that constrain types without being calls.
@@ -551,6 +641,7 @@ class _FactWalk:
         because: LinkReasonKind,
         node: exp.Expr,
         call: CatalogKey | None = None,
+        family_only: bool = False,
     ) -> None:
         self.facts.type_links.append(
             TypeLink(
@@ -559,6 +650,7 @@ class _FactWalk:
                 because=because,
                 span=self.positions.span_of(node),
                 call=call,
+                family_only=family_only,
             )
         )
 
@@ -791,6 +883,31 @@ class _FactWalk:
         self.facts.cardinality.append(
             CardinalityFact(sites=sites, kind=kind, context_span=context_span)
         )
+
+
+def projection_of_scope_named(scope: Scope, name: ColumnName) -> exp.Expr | None:
+    """The projection one scope outputs under a given name, or None.
+
+    A set operation answers with its *left* arm, which is where its column names come from -
+    the arms are matched by position, and `_link_set_operation_arms` links the rest.
+
+    Matched case-sensitively first because a downstream reference has to quote the name
+    exactly, then case-insensitively: `qualify` normalises identifiers per dialect and the
+    two sides of this lookup are not always normalised by the same pass.
+    """
+    expression = scope.expression
+    if not isinstance(expression, (exp.Select, exp.SetOperation)):
+        return None
+
+    projections = expression.selects
+    for projection in projections:
+        if projection.alias_or_name == name:
+            return projection
+    folded = name.lower()
+    for projection in projections:
+        if projection.alias_or_name.lower() == folded:
+            return projection
+    return None
 
 
 def describe_join_type(join: exp.Join) -> str:

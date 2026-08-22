@@ -3,20 +3,20 @@
 sqlglot dispatches annotation on a plain dict keyed by expression class
 (`Dialect.EXPRESSION_METADATA`). That dict is the whole extension point. We build a
 *copy* of it with our entries layered on top and hand it to `annotate_types(
-expression_metadata=...)`, so nothing global is mutated (plan Q6).
+expression_metadata=...)`, so nothing global is mutated.
 
 Only the keys in `ANNOTATION_GAP_KEYS` are installed. The rest of the catalog exists for
 `facts.py`, which needs to know what a call *accepts* - something sqlglot's metadata never
 says. Installing an annotator for a function sqlglot already types correctly would replace a
 right answer with ours.
 
-The family test in here is the single most important function in the design. It is
-three-valued on purpose: `False` means "definitely wrong, report it" and `None` means
-"cannot say, stay quiet". Conflating them is how a checker gets a reputation for lying.
+The lattice itself lives in `families.py`; this module is the wiring between it, the
+catalog, and sqlglot.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, cast
 
 from sqlglot import exp
@@ -26,48 +26,31 @@ from sqlglot.typing import ExprMetadataType
 
 from sqlr.sql_analysis2.catalog import (
     ANNOTATION_GAP_KEYS,
-    CATALOG,
+    CATALOG_IS_COMPLETE,
     OPERATOR_SQL_NAMES,
     CatalogKey,
     DialectName,
-    FamilyName,
     Sig,
+    dialect_has_its_own_layer,
+    signatures_for_dialect,
 )
+from sqlr.sql_analysis2.families import in_family
+
+logger = logging.getLogger(__name__)
 
 Annotator = Callable[[TypeAnnotator, exp.Expr], None]
 
-# Families map onto sqlglot's own type-set constants. "ANY" and type variables are handled
-# in `in_family`, since neither is a set of types.
-FAMILIES: dict[FamilyName, set[exp.DType]] = {
-    "NUMERIC": set(exp.DataType.NUMERIC_TYPES),
-    "STRING": set(exp.DataType.TEXT_TYPES),
-    "TEMPORAL": set(exp.DataType.TEMPORAL_TYPES),
-    "BOOLEAN": {exp.DType.BOOLEAN},
-    "ARRAY": {exp.DType.ARRAY},
-    "INTERVAL": {exp.DType.INTERVAL},
-}
-
-FAMILY_DEFAULT_TYPE: dict[FamilyName, str] = {
-    "NUMERIC": "BIGINT",
-    "STRING": "VARCHAR",
-    "TEMPORAL": "TIMESTAMP",
-    "BOOLEAN": "BOOLEAN",
-    "ARRAY": "ARRAY<VARCHAR>",
-    "INTERVAL": "INTERVAL",
-}
-"""What an inferred family becomes when nothing more precise is available. A link carrying
-a concrete type is preferred over these - `DATE` stays `DATE` rather than widening to
-`TIMESTAMP` - so this only applies to claims, which name a family and nothing else."""
-
-
-def is_a_type_variable(family: FamilyName) -> bool:
-    """Whether a parameter is `@T`-style: accepts anything, but binds to its twin.
-
-    Two positions of one signature sharing a variable are constrained to each other. That
-    constraint is a *link* fact, and it is the only thing separating `a = b` (which types
-    either column from the other) from `a = anything` (which would say nothing at all).
-    """
-    return family.startswith("@")
+__all__ = [
+    "arguments_of_call",
+    "candidate_overloads",
+    "catalog_key",
+    "expression_metadata",
+    "pick_overload",
+    "signatures_for_dialect",
+    "signatures_of_call",
+    "surviving_overloads",
+    "unknown_function_findings_are_trustworthy",
+]
 
 
 def catalog_key(node: exp.Expr) -> CatalogKey | None:
@@ -81,10 +64,6 @@ def catalog_key(node: exp.Expr) -> CatalogKey | None:
     if isinstance(node, exp.Func):
         return node.sql_name()
     return None
-
-
-def signatures_for_dialect(dialect_name: DialectName) -> dict[CatalogKey, list[Sig]]:
-    return CATALOG.get(dialect_name, {})
 
 
 def signatures_of_call(
@@ -119,34 +98,6 @@ def arguments_of_call(node: exp.Expr) -> list[exp.Expr]:
     return out
 
 
-def in_family(dtype: exp.DataType | None, family: FamilyName) -> bool | None:
-    """True / False / None. None means unknown, so no judgement is made.
-
-    False means "definitely wrong, report it". Conflating the two is how a checker
-    gets a reputation for lying.
-    """
-    if family == "ANY" or is_a_type_variable(family):
-        return True
-    if dtype is None or dtype.is_type(exp.DType.UNKNOWN):
-        return None  # <- NOT False
-    return dtype.this in FAMILIES.get(family, set())
-
-
-def family_of_type(dtype: exp.DataType | None) -> FamilyName | None:
-    """Which family a concrete type belongs to, or None when it belongs to none.
-
-    The inverse of `in_family`, and the direction a link needs: a link says two nodes share
-    a domain, so the known end has to name the domain it is in before the unknown end can
-    take it.
-    """
-    if dtype is None or dtype.is_type(exp.DType.UNKNOWN):
-        return None
-    for family, types in FAMILIES.items():
-        if dtype.this in types:
-            return family
-    return None
-
-
 def candidate_overloads(node: exp.Expr, signatures: list[Sig]) -> list[Sig]:
     """The overloads whose arity this call could satisfy.
 
@@ -158,19 +109,44 @@ def candidate_overloads(node: exp.Expr, signatures: list[Sig]) -> list[Sig]:
     return [sig for sig in signatures if sig.accepts_arity(count)]
 
 
+def surviving_overloads(node: exp.Expr, signatures: list[Sig]) -> list[Sig]:
+    """Arity candidates minus the ones some argument definitively contradicts.
+
+    `is False`, never `None`: an argument of unknown type rules nothing out, which is what
+    keeps an undeclared column from silently narrowing the overload set to one that then
+    speaks confidently about it.
+
+    This is what makes a return-marker link possible on an overloaded operator. `*` has
+    three overloads returning `@arg0`, `@arg0` and `@arg1`, which disagree - but `amount * 2`
+    rules out `(NUMERIC, INTERVAL)` because `2` is not an interval, and the two survivors
+    agree.
+    """
+    args = arguments_of_call(node)
+    return [
+        sig
+        for sig in candidate_overloads(node, signatures)
+        if not any(
+            in_family(argument.type, sig.family_at(index)) is False
+            for index, argument in enumerate(args)
+        )
+    ]
+
+
 def pick_overload(
     node: exp.Expr, signatures: dict[CatalogKey, list[Sig]]
 ) -> tuple[Sig | None, list[exp.Expr]]:
     """First overload no argument definitively contradicts."""
-    args = arguments_of_call(node)
-    for sig in candidate_overloads(node, signatures_of_call(node, signatures)):
-        if any(
-            in_family(argument.type, sig.family_at(index)) is False
-            for index, argument in enumerate(args)
-        ):
-            continue  # definitely the wrong overload
-        return sig, args
-    return None, args
+    surviving = surviving_overloads(node, signatures_of_call(node, signatures))
+    return (surviving[0] if surviving else None), arguments_of_call(node)
+
+
+def unknown_function_findings_are_trustworthy(dialect_name: DialectName) -> bool:
+    """Whether `unknown-function` may be reported for this dialect.
+
+    "This function does not exist" is only truthful from an exhaustive list, and every
+    catalog here is a hand-written gap-filler. See `CATALOG_IS_COMPLETE`.
+    """
+    return CATALOG_IS_COMPLETE.get(dialect_name, False)
 
 
 def resolve_return_type(
@@ -183,10 +159,14 @@ def resolve_return_type(
             element = arr.expressions[0]
             return element if isinstance(element, exp.DataType) else exp.DType.UNKNOWN
         return exp.DType.UNKNOWN
-    if sig.returns.startswith("@arg"):
-        i = int(sig.returns[len("@arg") :])
-        arg_type = args[i].type if i < len(args) else None
+
+    link = sig.return_link
+    if link is not None:
+        # `@family(argN)` names no concrete type, so annotation can only pass the argument's
+        # own type through. The *family* half of it is a fact, read by `facts.py`.
+        arg_type = args[link.argument_index].type if link.argument_index < len(args) else None
         return arg_type if arg_type is not None else exp.DType.UNKNOWN
+
     return exp.DataType.build(sig.returns, dialect=dialect_name)
 
 
@@ -230,12 +210,29 @@ def expression_metadata(dialect_name: DialectName) -> ExprMetadataType:
     signatures = signatures_for_dialect(dialect_name)
     metadata: ExprMetadataType = dict(dialect.EXPRESSION_METADATA)
 
+    if not dialect_has_its_own_layer(dialect_name):
+        # Never silently: a dialect served common-only still checks `upper(number)`, but it
+        # knows none of the engine's own functions, and a reader seeing few findings needs
+        # to know which of the two reasons they are looking at.
+        logger.warning(
+            "no dialect catalog for %s; using the common signatures only "
+            "(%d entries). Engine-specific functions will not be checked.",
+            dialect_name,
+            len(signatures),
+        )
+
     mapped = 0
     for key in ANNOTATION_GAP_KEYS.get(dialect_name, frozenset()):
         cls = exp.FUNCTION_BY_NAME.get(key)  # sqlglot's own "ROUND" -> exp.Round map
         if cls is not None and not issubclass(cls, exp.Anonymous):
             metadata[cls] = {"annotator": _make_annotator(signatures, dialect_name)}
             mapped += 1
+    logger.info(
+        "catalog for %s: %d signatures, %d annotation gaps installed",
+        dialect_name,
+        len(signatures),
+        mapped,
+    )
 
     # Everything with no sqlglot class arrives as Anonymous; route it by written name.
     # Chain to the dialect's own Anonymous annotator so registered UDF types survive.
