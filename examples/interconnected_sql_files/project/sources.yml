@@ -6,19 +6,19 @@ sources:
   - name: mysource
     database: mydatabase
     schema: myschema
-    # tables:
-    #   - name: raw_department
-    #     columns:
-    #       - name: department_id
-    #         data_type: varchar(20)
-    #       - name: department_name
-    #         data_type: varchar(100)
-    #       - name: cost_center
-    #         data_type: varchar(20)
-    #       - name: budget
-    #         data_type: decimal(12,2)
-    #       - name: is_active
-    #         data_type: boolean
+    tables:
+      # - name: raw_department
+      #   columns:
+      #     - name: department_id
+      #       data_type: varchar(20)
+      #     - name: department_name
+      #       data_type: varchar(100)
+      #     - name: cost_center
+      #       data_type: varchar(20)
+      #     - name: budget
+      #       data_type: decimal(12,2)
+      #     - name: is_active
+      #       data_type: boolean
 
     #   - name: raw_employee
     #     columns:
@@ -43,10 +43,13 @@ sources:
     #       - name: modified_at
     #         data_type: timestamp_ntz
 
-    #   - name: raw_address
-    #     columns:
-    #       - name: person_id
-    #         data_type: varchar(20)
+      - name: raw_address
+        config:
+          meta:
+            declaration_is_partial: false
+        columns:
+          - name: person_id
+            data_type: varchar(20)
     #       - name: street
     #         data_type: varchar(200)
     #       - name: city
