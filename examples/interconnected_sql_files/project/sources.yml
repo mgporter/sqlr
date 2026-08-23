@@ -14,9 +14,9 @@ sources:
         columns:
           - name: department_id
             data_type: varchar(20)
-          - name: department_name
-            # data_type: varchar(100)
-            data_type: number(38,0)
+          # - name: department_name
+          #   data_type: varchar(100)
+            # data_type: number(38,0)
       #     - name: cost_center
       #       data_type: varchar(20)
       #     - name: budget

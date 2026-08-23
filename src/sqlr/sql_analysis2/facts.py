@@ -141,11 +141,11 @@ class ClaimReason:
     argument_index: ArgumentIndex | None = None
 
     def describe(self) -> str:
+        """`arg 1 of LOWER`, `LOWER` when the position is unknown."""
         if self.kind == "call-argument" and self.call is not None:
-            position = (
-                "" if self.argument_index is None else f" argument {self.argument_index + 1}"
-            )
-            return f"{self.call}{position}"
+            if self.argument_index is None:
+                return self.call
+            return f"arg {self.argument_index + 1} of {self.call}"
         return "boolean context"
 
 

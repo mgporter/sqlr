@@ -271,11 +271,24 @@ def _anchor_evidence_of(
         concrete_type=site.node.type,
         origin=origin,
         detail=(
-            f"{site.describe()} is declared {written}"
+            f"compared with {describe_declared_slot(site)} ({written})"
             if origin == "declared"
             else f"{site.describe()} is {written} here"
         ),
     )
+
+
+def describe_declared_slot(site: ValueSite) -> str:
+    """`raw_department.department_id` - the declared column this evidence came from.
+
+    The bare table name rather than the full `db.schema.table` key: the reader is looking at
+    a narrow evidence column, and the qualifier never disambiguates anything they can see.
+    """
+    slot = site.source_table_column
+    if slot is None:
+        return site.describe()
+    relation_key, column_name = slot
+    return f"{relation_key.split('.')[-1]}.{column_name}"
 
 
 def _intersect_family_sets(
