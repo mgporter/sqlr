@@ -40,6 +40,40 @@ type ScopeKind = Literal["cte", "derived", "final", "branch"]
 type SourceKind = ScopeKind | Literal["table", "unknown"]
 """What a column's qualifier turned out to name."""
 
+type TypeProvenance = Literal["declared", "inferred", "computed", "unknown"]
+"""Where a type came from, which is what a reader needs to know how much to trust it.
+
+- `declared` - the user wrote it in a yml. The source of truth; nothing was inferred.
+- `computed` - sqlglot derived it from the expression, bottom-up.
+- `inferred` - step 5 read it off how the SQL uses the column.
+- `unknown`  - nothing could say. Absorbing: anything computed from it is unknown too.
+"""
+
+
+class ColumnTypeAnnotation(NamedTuple):
+    """One output column of one scope, typed.
+
+    `type_name` is what a reader sees and `type` is what a check reads: the same answer
+    rendered and unrendered. Both are carried because parsing the printed name back into a
+    type would be a parser where a lookup will do - and would have to guess which dialect
+    printed it.
+    """
+
+    name: ColumnName
+    type_name: str
+    provenance: TypeProvenance
+    type: exp.DataType | None = None
+    """The annotated node's own type. None for a column nothing could type."""
+    span: SourceSpan | None = None
+    """Where the projection was written, or None for one a `*` expanded into being."""
+
+
+class ScopeTypes(NamedTuple):
+    name: str
+    kind: ScopeKind
+    columns: list[ColumnTypeAnnotation]
+
+
 type ArgumentIndex = int
 """A zero-based position in a call's argument list, in sqlglot's node order. Reported to
 the user one-based, because that is how a person counts arguments."""

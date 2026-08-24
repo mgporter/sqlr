@@ -3,7 +3,7 @@
 Two comparisons, one rule set:
 
 - the statement's **projection** against the declaration for the `.sql` file itself - the
-  source table that claims it with `sql_file:`, or a dbt project's `models:` entry;
+  source table that claims it with `meta.source_file`, or a dbt project's `models:` entry;
 - each **relation it reads** against the declaration of that name, which is what catches
   the interesting case - `orders.sql` declares `revenue` a varchar, and
   `revenue_report.sql` writes `where revenue > 1000`.
@@ -51,7 +51,7 @@ def check_schema(
     """Every divergence between `schema` and the declarations that bear on it."""
     diagnostics: list[Diagnostic] = []
 
-    own = declared.for_sql_file(path) if path is not None else None
+    own = declared.for_source_file(path) if path is not None else None
     if own is not None:
         diagnostics.extend(_check_projection(schema, own))
         # Only the file's own model can be *missing* a column. A declaration for an

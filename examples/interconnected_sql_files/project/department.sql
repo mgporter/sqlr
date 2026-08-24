@@ -3,4 +3,4 @@ select distinct
   upper(department_name) as department_name,
   cost_center,
   budget
-from mydatabase.myschema.raw_department
+from mydatabase.raw.raw_department

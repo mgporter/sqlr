@@ -31,11 +31,11 @@ def _column(validation: StatementValidation, table: str, name: str) -> ColumnVal
 
 
 
-def _yml(name: str, *columns: str, sql_file: str | None = None) -> str:
+def _yml(name: str, *columns: str, source_file: str | None = None) -> str:
     """A declaration for one relation, in the shape a standalone project writes.
 
     Everything is a `sources:` table, including what this project builds: those name the
-    file that builds them with `sql_file:`. `warehouse` declares no database and no
+    file that builds them with `meta.source_file`. `warehouse` declares no database and no
     schema, so its tables are referred to bare - `source_table`, not `db.schema.x`.
     """
     lines = [
@@ -45,8 +45,10 @@ def _yml(name: str, *columns: str, sql_file: str | None = None) -> str:
         "    tables:",
         f"      - name: {name}",
     ]
-    if sql_file is not None:
-        lines.append(f"        sql_file: {sql_file}")
+    if source_file is not None:
+        lines.append("        config:")
+        lines.append("          meta:")
+        lines.append(f"            source_file: {source_file}")
     if columns:
         lines.append("        columns:")
         for column in columns:
@@ -98,7 +100,7 @@ def test_a_declaration_looser_than_the_sql_is_a_widening_warning(tmp_path: Path)
     validation = _validate(
         tmp_path,
         "select cast(seen_at as timestamp_ntz) as seen_at\nfrom source_table\n",
-        _yml("orders", "seen_at timestamp", sql_file="orders"),
+        _yml("orders", "seen_at timestamp", source_file="orders"),
     )
 
     seen_at = _column(validation, "orders", "seen_at")
@@ -295,7 +297,7 @@ def test_a_zoned_declaration_never_collides_with_an_unzoned_one(
     validation = _validate(
         tmp_path,
         "select cast(seen_at as timestamp_ntz) as seen_at\nfrom source_table\n",
-        _yml("orders", "seen_at timestamptz", sql_file="orders"),
+        _yml("orders", "seen_at timestamptz", source_file="orders"),
     )
 
     seen_at = _column(validation, "orders", "seen_at")
@@ -312,7 +314,7 @@ def test_the_projection_is_checked_against_the_models_own_declaration(
     validation = _validate(
         tmp_path,
         "select cast(total as integer) as total\nfrom source_table\n",
-        _yml("orders", "total varchar(10)", sql_file="orders"),
+        _yml("orders", "total varchar(10)", source_file="orders"),
     )
 
     assert validation.projection.declared_model == "warehouse.orders"
@@ -328,7 +330,7 @@ def test_a_declared_column_the_projection_omits_is_an_error(tmp_path: Path) -> N
     validation = _validate(
         tmp_path,
         "select id\nfrom source_table\n",
-        _yml("orders", "id bigint", "total decimal(10,2)", sql_file="orders"),
+        _yml("orders", "id bigint", "total decimal(10,2)", source_file="orders"),
     )
 
     total = _column(validation, "orders", "total")
@@ -348,7 +350,7 @@ def test_an_unexpandable_star_softens_a_missing_projection_column(
     validation = _validate(
         tmp_path,
         "select *\nfrom source_table\n",
-        _yml("orders", "total decimal(10,2)", sql_file="orders"),
+        _yml("orders", "total decimal(10,2)", source_file="orders"),
     )
 
     total = _column(validation, "orders", "total")
@@ -368,7 +370,7 @@ def test_a_star_over_a_cte_still_makes_a_missing_column_an_error(
     validation = _validate(
         tmp_path,
         "with rows as (select id from source_table)\nselect * from rows\n",
-        _yml("orders", "total decimal(10,2)", sql_file="orders"),
+        _yml("orders", "total decimal(10,2)", source_file="orders"),
     )
 
     total = _column(validation, "orders", "total")
@@ -382,7 +384,7 @@ def test_a_column_the_projection_declares_nothing_about_is_only_a_warning(
     validation = _validate(
         tmp_path,
         "select id, total\nfrom source_table\n",
-        _yml("orders", "id bigint", sql_file="orders"),
+        _yml("orders", "id bigint", source_file="orders"),
     )
 
     total = _column(validation, "orders", "total")
@@ -412,7 +414,7 @@ def test_an_unrecognized_type_does_not_hide_a_missing_projection_column(
     validation = _validate(
         tmp_path,
         "select id\nfrom source_table\n",
-        _yml("orders", "total geography", sql_file="orders"),
+        _yml("orders", "total geography", source_file="orders"),
     )
 
     total = _column(validation, "orders", "total")

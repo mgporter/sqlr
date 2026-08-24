@@ -6,7 +6,7 @@ with online_orders as (
     order_date,
     amount,
     'online' as channel
-  from mydatabase.myschema.online_order
+  from mydatabase.raw.online_order
   where amount > 0
 ),
 instore_orders as (
@@ -17,7 +17,7 @@ instore_orders as (
     order_date,
     amount,
     'in_store' as channel
-  from mydatabase.myschema.instore_order
+  from mydatabase.raw.instore_order
   where amount > 0
 ),
 all_orders as (
@@ -32,7 +32,7 @@ active_customer_orders as (
   from all_orders o
   where exists (
     select 1
-    from mydatabase.myschema.customer c
+    from mydatabase.raw.customer c
     where c.customer_id = o.customer_id
       and c.is_active = true
   )

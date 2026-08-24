@@ -1,11 +1,11 @@
 version: 2
 
 # The tables this project reads but does not build. Both `database` and `schema` are
-# declared, so the SQL has to write them out: `mydatabase.myschema.raw_department`.
+# declared, so the SQL has to write them out: `mydatabase.raw.raw_department`.
 sources:
   - name: mysource
     database: mydatabase
-    schema: myschema
+    schema: raw
     tables:
       - name: raw_department
         config:
@@ -99,3 +99,29 @@ sources:
     #         data_type: varchar(20)
     #       - name: is_active
     #         data_type: boolean
+
+
+  - name: project
+    database: mydatabase
+    schema: ods
+    tables:
+      - name: employee
+        config:
+          meta:
+            source_file: employee
+            declaration_is_partial: true
+        columns:
+          - name: employee_id
+            data_type: varchar(20)
+          - name: department_id
+            data_type: varchar(20)
+          - name: full_name
+            data_type: varchar(101)
+          - name: email
+            data_type: varchar(200)
+          - name: salary
+            data_type: decimal(10,5)
+          - name: annual_salary
+            data_type: number
+          # - name: extracol
+          #   data_type: decimal(10,2)

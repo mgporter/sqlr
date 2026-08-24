@@ -19,7 +19,7 @@ fact walk only speaks about columns nobody has described - see `facts.py`.
 from __future__ import annotations
 
 import logging
-from typing import Literal, NamedTuple
+from typing import NamedTuple
 
 from sqlglot import exp
 from sqlglot.optimizer.annotate_types import annotate_types as annotate_types_with_sqlglot
@@ -29,6 +29,7 @@ from sqlglot.typing import ExprMetadataType
 
 from sqlr.sql_analysis2.annotate import arguments_of_call
 from sqlr.sql_analysis2.check import (
+    findings_for_a_projection_that_disagrees_with_its_declaration,
     findings_for_calls_with_wrong_arity,
     findings_for_columns_with_conflicting_facts,
     findings_for_contradicted_claims,
@@ -48,10 +49,12 @@ from sqlr.sql_analysis2.qualify import (
     QualifiedStatement,
     name_and_kind_of_scope,
     output_name_of,
+    output_projection_is_complete,
     qualifier_of_a_star_projection,
 )
 from sqlr.sql_analysis2.relations import relation_key_of
 from sqlr.sql_analysis2.reporting import TypeFinding
+from sqlr.sql_analysis2.sourcedoc import Positions
 from sqlr.sql_analysis2.resolve import (
     is_declared,
     needs_inference,
@@ -59,37 +62,16 @@ from sqlr.sql_analysis2.resolve import (
 )
 from sqlr.sql_analysis2.types import (
     ColumnName,
+    ColumnTypeAnnotation,
     ColumnTypeName,
     RelationKey,
-    ScopeKind,
+    ScopeTypes,
+    TypeProvenance,
 )
 
 logger = logging.getLogger(__name__)
 
-type TypeProvenance = Literal["declared", "inferred", "computed", "unknown"]
-"""Where a type came from, which is what a reader needs to know how much to trust it.
-
-- `declared` - the user wrote it in a yml. The source of truth; nothing was inferred.
-- `computed` - sqlglot derived it from the expression, bottom-up.
-- `inferred` - step 5 read it off how the SQL uses the column.
-- `unknown`  - nothing could say. Absorbing: anything computed from it is unknown too.
-"""
-
 UNKNOWN_TYPE_NAME = "unknown"
-
-
-class ColumnTypeAnnotation(NamedTuple):
-    """One output column of one scope, typed."""
-
-    name: ColumnName
-    type_name: str
-    provenance: TypeProvenance
-
-
-class ScopeTypes(NamedTuple):
-    name: str
-    kind: ScopeKind
-    columns: list[ColumnTypeAnnotation]
 
 
 class SourceColumnType(NamedTuple):
@@ -223,6 +205,10 @@ def annotate_one_model(
         )
         log_type_coverage(tree, result.model.relative_path)
 
+    # Every scope's output schema, built once: the reader's tables and the declaration check
+    # are the same rows, and walking the tree twice for them would let the two disagree.
+    scopes = types_per_scope(statement, inference, result.positions)
+
     # Step 7 - check. Reads node.type only, never the SQL text: everything upstream has
     # been flattened into one uniform annotated tree.
     findings = [
@@ -230,6 +216,12 @@ def annotate_one_model(
         *findings_for_calls_with_wrong_arity(tree, result.positions, dialect_name),
         *findings_for_contradicted_claims(facts, schema, inference),
         *findings_for_columns_with_conflicting_facts(inference.conflicts),
+        *findings_for_a_projection_that_disagrees_with_its_declaration(
+            final_projection_of(statement, inference, result.positions),
+            result.declaration,
+            dialect_name,
+            output_projection_is_complete(statement),
+        ),
     ]
     logger.info(
         "%s: %d type findings", result.model.relative_path, len(findings)
@@ -240,9 +232,45 @@ def annotate_one_model(
         facts=facts,
         inference=inference,
         findings=findings,
-        scopes=types_per_scope(statement, inference),
+        scopes=scopes,
         source_columns=types_per_source_column(statement, inference),
     )
+
+
+def final_projection_of(
+    statement: QualifiedStatement, inference: Inference, positions: Positions
+) -> list[ColumnTypeAnnotation]:
+    """What the statement itself outputs - the relation the model *is*.
+
+    The outermost scope, which `traverse_scope` yields last because everything else feeds
+    it. A set operation has no projection list of its own and takes its schema from the arm
+    on the *left*, positionally, which is the rule `relations.py` follows for the same
+    reason - and nesting means unwrapping until a real projection list is reached.
+
+    Read from the scope rather than found among `types_per_scope`'s rows: a union's arms and
+    a union nested inside a CTE are both `branch` scopes, and nothing in a list of those says
+    which one the statement's own output is.
+    """
+    if not statement.scopes:
+        return []
+
+    scope = statement.scopes[-1]
+    while isinstance(scope.expression, exp.SetOperation):
+        arms = scope.union_scopes
+        if not arms:
+            return []
+        scope = arms[0]
+
+    select = scope.expression
+    if not isinstance(select, exp.Select):
+        return []
+
+    inferred = inference.types_per_table()
+    return [
+        _column_type_annotation(projection, scope, statement, inferred, positions)
+        for projection in select.selects
+        if qualifier_of_a_star_projection(projection) is False
+    ]
 
 
 # ------------------------------------------------------------------ reading the types
@@ -257,11 +285,17 @@ def type_name_of(node: exp.Expr | None) -> str:
     return node.type.sql()
 
 
-def types_per_scope(statement: QualifiedStatement, inference: Inference) -> list[ScopeTypes]:
+def types_per_scope(
+    statement: QualifiedStatement, inference: Inference, positions: Positions | None = None
+) -> list[ScopeTypes]:
     """Every scope's output schema, typed, in the order sqlglot resolves them.
 
     Dependency order - a CTE before whatever selects from it - so the final projection comes
     last, which is where a reader looks for it.
+
+    `positions` is optional because a reader of the tables does not need spans; the check
+    that holds the final projection against its declaration does, and it consumes the same
+    rows rather than walking the tree a second time.
     """
     inferred = inference.types_per_table()
     out: list[ScopeTypes] = []
@@ -271,7 +305,7 @@ def types_per_scope(statement: QualifiedStatement, inference: Inference) -> list
             continue
         name, kind = name_and_kind_of_scope(scope)
         columns = [
-            _column_type_annotation(projection, scope, statement, inferred)
+            _column_type_annotation(projection, scope, statement, inferred, positions)
             for projection in select.selects
             if qualifier_of_a_star_projection(projection) is False
         ]
@@ -285,6 +319,7 @@ def _column_type_annotation(
     scope: Scope,
     statement: QualifiedStatement,
     inferred: dict[RelationKey, dict[ColumnName, InferredColumnType]],
+    positions: Positions | None = None,
 ) -> ColumnTypeAnnotation:
     """One projected column, named and typed.
 
@@ -303,6 +338,11 @@ def _column_type_annotation(
             source_column.type_name if source_column is not None else type_name_of(projection)
         ),
         provenance=provenance,
+        # sqlglot's own answer, even where `type_name` prints the source column's instead:
+        # the two are the same value named two ways, and a check comparing families cannot
+        # tell them apart anyway.
+        type=projection.type,
+        span=positions.span_of(projection) if positions is not None else None,
     )
 
 

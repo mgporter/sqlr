@@ -23,7 +23,7 @@ from sqlglot.optimizer.scope import Scope, traverse_scope
 from sqlglot.schema import Schema, ensure_schema
 
 from sqlr.config.types import SqlrConfig, StarOverJoinBehavior
-from sqlr.declared.types import DeclaredSchemas
+from sqlr.declared.types import DeclaredRelation, DeclaredSchemas
 from sqlr.selection.types import Model
 from sqlr.sql_analysis2.reporting import (
     ColumnFinding,
@@ -198,6 +198,16 @@ class QualifiedModel(NamedTuple):
     """File-level problems with nowhere to point: a parse failure, more than one statement,
     a `qualify` that raised."""
     statement: QualifiedStatement | None
+    declaration: DeclaredRelation | None = None
+    """The yml entry describing what this file *produces* - the source table claiming it
+    with `meta.source_file`, or a dbt project's `models:` entry of the same stem.
+
+    Deliberately kept out of the schema steps 4-6 work from. A model's own declaration
+    describes its output, so nothing in this file may be typed from it: the schema is built
+    from the relations the statement *reads*, and this entry joins it only when the file
+    reads its own relation, where it is a source like any other. Step 7 compares the final
+    projection against it, and that is the whole of its influence.
+    """
 
     @property
     def has_errors(self) -> bool:
@@ -263,6 +273,17 @@ def qualify_one_model(
     # stays valid however the statement is rewritten beneath it.
     positions = Positions(sql)
 
+    # What this file is declared to produce, which is a different question from what it
+    # reads and is answered by a different key - see `QualifiedModel.declaration`.
+    declaration = declared.for_source_file(model.path)
+    if declaration is not None:
+        logger.info(
+            "%s builds %s, declared at %s",
+            model.relative_path,
+            declaration.relation_name,
+            declaration.where,
+        )
+
     def failed(errors: list[str], findings: list[ColumnFinding] | None = None) -> QualifiedModel:
         return QualifiedModel(
             model=model,
@@ -271,6 +292,7 @@ def qualify_one_model(
             findings=findings or [],
             errors=errors,
             statement=None,
+            declaration=declaration,
         )
 
     # Step 1: parse.
@@ -425,6 +447,7 @@ def qualify_one_model(
         positions=positions,
         findings=findings,
         errors=[],
+        declaration=declaration,
         statement=QualifiedStatement(
             qualified=qualified,
             scopes=scopes,
@@ -781,20 +804,60 @@ def projection_is_complete(
     return True
 
 
-def columns_per_scope(statement: QualifiedStatement) -> list[ScopeColumns]:
-    """Every scope with columns to report, in the order sqlglot resolves them.
+def described_scopes(statement: QualifiedStatement) -> list[tuple[Scope, ScopeColumns]]:
+    """Every scope of a statement described, in the order sqlglot resolves them.
 
-    That order is dependency order - a CTE before whatever selects from it - so the final
-    projection comes last, which is where a reader looks for it, and every scope's sources
-    have been described before it is. Scopes with nothing in either list are dropped: a
-    set-operation wrapper has no columns of its own, and an empty table under its name only
-    asks the reader to work out why it is empty.
+    That order is dependency order - a CTE before whatever selects from it - so every
+    scope's sources have been described before it is, which is what lets an incomplete
+    projection propagate to whatever reads it in a single pass.
+
+    The scopes are kept beside their descriptions because the two callers ask different
+    questions of the same walk: a reader wants the tables, and the declaration check wants
+    to find one particular scope in them.
     """
     incomplete_scopes: set[int] = set()
-    described: list[ScopeColumns] = []
+    described: list[tuple[Scope, ScopeColumns]] = []
     for scope in statement.scopes:
         columns = scope_columns_of(scope, statement, incomplete_scopes)
         if not columns.complete:
             incomplete_scopes.add(id(scope.expression))
-        described.append(columns)
-    return [scope for scope in described if scope.projected or scope.non_projected]
+        described.append((scope, columns))
+    return described
+
+
+def columns_per_scope(statement: QualifiedStatement) -> list[ScopeColumns]:
+    """Every scope with columns to report, in dependency order.
+
+    Scopes with nothing in either list are dropped: a set-operation wrapper has no columns
+    of its own, and an empty table under its name only asks the reader to work out why it
+    is empty.
+    """
+    return [
+        columns
+        for _, columns in described_scopes(statement)
+        if columns.projected or columns.non_projected
+    ]
+
+
+def output_projection_is_complete(statement: QualifiedStatement) -> bool:
+    """Whether what this file produces is the whole relation or only a lower bound.
+
+    `projection_is_complete` for the statement's own outermost scope, which is the one the
+    model *is*. Only that scope: a CTE expanded from an unexpandable star is a lower bound
+    on the CTE, and says nothing about a final projection that goes on to enumerate its
+    columns by hand.
+
+    A set operation has no projection list of its own, so it is complete only if every arm
+    is - a name any arm cannot enumerate is one the union cannot promise either.
+    """
+    described = described_scopes(statement)
+    if not described:
+        return True
+
+    complete_of = {id(scope.expression): columns.complete for scope, columns in described}
+    outermost, columns = described[-1]
+    if isinstance(outermost.expression, exp.SetOperation):
+        return all(
+            complete_of.get(id(arm.expression), True) for arm in outermost.union_scopes
+        )
+    return columns.complete

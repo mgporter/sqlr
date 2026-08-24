@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from sqlglot import exp
 
-from declared_helpers import declarations
+from declared_helpers import declarations, q
 
 from sqlr.catalog.types import SqlFile
 from sqlr.selection.types import Model
@@ -41,15 +41,26 @@ def annotate(
     sql: str,
     declared: dict[RelationKey, dict[ColumnName, ColumnTypeName]],
     tmp_path: Path,
+    partial: frozenset[RelationKey] = frozenset(),
+    built_by: dict[RelationKey, str] | None = None,
 ) -> AnnotatedModel:
-    """Steps 1-7 over one file, the way `validate-schema` runs them."""
+    """Steps 1-7 over one file, the way `validate-schema` runs them.
+
+    The file is always `x.sql`, so `built_by={key: "x"}` is what makes one of the
+    declarations a description of *this file's output* rather than of a table it reads.
+    """
     path = tmp_path / "x.sql"
     path.write_text(sql)
     model = Model(
         name="x",
         file=SqlFile(path=path, relative_path="x.sql", mtime=0.0, content_hash=""),
     )
-    return annotate_one_model(qualify_one_model(model, declarations(declared), DIALECT), METADATA)
+    return annotate_one_model(
+        qualify_one_model(
+            model, declarations(declared, partial, built_by), DIALECT
+        ),
+        METADATA,
+    )
 
 
 def codes(result: AnnotatedModel) -> list[str]:
@@ -681,3 +692,247 @@ def test_a_declared_column_reports_provenance_declared(tmp_path: Path) -> None:
         for column in entry.columns
     }
     assert provenance == {"status": "declared"}
+
+
+# ---- the file's own output against its own declaration ----------------------------
+#
+# The one check that reads a declaration of the *model* rather than of a table the file
+# reads. Its whole effect is on findings: a model's declaration describes the output, so
+# nothing in the file may be typed from it - which is what the isolation test below pins.
+
+BUILT = {q("x"): "x"}
+"""`meta.source_file: x` - the declaration of `x.sql`'s own output."""
+
+ORDERS_TYPED = {q("orders"): {"order_id": "bigint", "amount": "decimal(10,2)"}}
+
+
+def declaration_findings(result: AnnotatedModel) -> list[tuple[str, str, str]]:
+    """Each output finding as `(code, severity, column)`, in the order reported."""
+    return [
+        (finding.code, finding.severity, finding.column_name or "")
+        for finding in result.findings
+        if finding.code
+        in (
+            "contradicted-declaration",
+            "projected-column-not-declared",
+            "declared-column-not-projected",
+        )
+    ]
+
+
+def test_a_file_with_no_declaration_of_its_own_is_not_held_against_one(
+    tmp_path: Path,
+) -> None:
+    """The regression that matters most here: every model without `meta.source_file` has to
+    go on being checked exactly as it was."""
+    result = annotate(
+        f"select order_id, amount from {q('orders')}", ORDERS_TYPED, tmp_path
+    )
+    assert declaration_findings(result) == []
+
+
+def test_a_projected_column_the_declaration_omits_is_an_error(tmp_path: Path) -> None:
+    """The same rule reading a column off a closed table follows. A declaration without
+    `declaration_is_partial` is the complete column list, so a file producing a column it
+    omits contradicts it - and any file *reading* that column already errors."""
+    result = annotate(
+        f"select order_id, amount from {q('orders')}",
+        {**ORDERS_TYPED, q("x"): {"order_id": "bigint"}},
+        tmp_path,
+        built_by=BUILT,
+    )
+
+    assert declaration_findings(result) == [
+        ("projected-column-not-declared", "error", "amount")
+    ]
+    assert "does not declare it" in result.findings[0].message
+    assert result.has_errors
+
+
+def test_a_partial_declaration_allows_columns_it_does_not_list(tmp_path: Path) -> None:
+    """`declaration_is_partial` means the same thing on a model as on a source table: the
+    listed columns are described and the rest are not claimed either way."""
+    result = annotate(
+        f"select order_id, amount from {q('orders')}",
+        {**ORDERS_TYPED, q("x"): {"order_id": "bigint"}},
+        tmp_path,
+        partial=frozenset({q("x")}),
+        built_by=BUILT,
+    )
+    assert declaration_findings(result) == []
+
+
+def test_a_declared_column_the_file_does_not_produce_is_an_error(
+    tmp_path: Path,
+) -> None:
+    """The projection list is the whole answer here - no star expanded over anything - so
+    the column really is not produced."""
+    result = annotate(
+        f"select order_id from {q('orders')}",
+        {**ORDERS_TYPED, q("x"): {"order_id": "bigint", "absent": "varchar"}},
+        tmp_path,
+        built_by=BUILT,
+    )
+
+    assert declaration_findings(result) == [
+        ("declared-column-not-projected", "error", "absent")
+    ]
+
+
+def test_a_declared_column_missing_from_a_lower_bound_projection_is_a_warning(
+    tmp_path: Path,
+) -> None:
+    """A `*` over a table nobody declares expands to the columns this file happens to name,
+    not to the columns the table has, so the projection is a lower bound and a column
+    missing from it may still be produced."""
+    result = annotate(
+        f"""
+        with ranked as (select * from {q('orders')} where status = 'new')
+        select * from ranked
+        """,
+        {q("x"): {"status": "varchar", "amount": "decimal(10,2)"}},
+        tmp_path,
+        built_by=BUILT,
+    )
+
+    assert declaration_findings(result) == [
+        ("declared-column-not-projected", "warning", "amount")
+    ]
+    assert "lower bound" in result.findings[0].message
+    assert not result.has_errors
+
+
+def test_a_computed_type_that_contradicts_the_declaration_is_an_error(
+    tmp_path: Path,
+) -> None:
+    """Two written-down things disagree and one of them is wrong."""
+    result = annotate(
+        f"select order_id * 2 as order_id from {q('orders')}",
+        {**ORDERS_TYPED, q("x"): {"order_id": "varchar(10)"}},
+        tmp_path,
+        built_by=BUILT,
+    )
+
+    assert declaration_findings(result) == [
+        ("contradicted-declaration", "error", "order_id")
+    ]
+    assert "declared varchar(10)" in result.findings[0].message
+
+
+def test_an_inferred_type_that_contradicts_the_declaration_is_a_warning(
+    tmp_path: Path,
+) -> None:
+    """sqlr read a family off how an undeclared column is used, and the guess fought the
+    declaration. An admission about sqlr's confidence, not an accusation about the SQL -
+    the same split `conflicting-usage` makes."""
+    result = annotate(
+        f"select amount as amount from {q('orders')} where amount > 0",
+        {q("orders"): {"amount": "UNKNOWN"}, q("x"): {"amount": "varchar(10)"}},
+        tmp_path,
+        built_by=BUILT,
+    )
+
+    assert declaration_findings(result) == [
+        ("contradicted-declaration", "warning", "amount")
+    ]
+    assert "infers" in result.findings[0].message
+    assert not result.has_errors
+
+
+def test_a_type_the_declaration_merely_narrows_is_not_a_finding(
+    tmp_path: Path,
+) -> None:
+    """Precision and scale are recorded, never checked - two types conflict only when their
+    nearest common family is ANY."""
+    result = annotate(
+        f"select amount * 2 as amount from {q('orders')}",
+        {**ORDERS_TYPED, q("x"): {"amount": "decimal(10,2)"}},
+        tmp_path,
+        built_by=BUILT,
+    )
+    assert declaration_findings(result) == []
+
+
+def test_a_column_with_no_type_is_not_held_against_the_declaration(
+    tmp_path: Path,
+) -> None:
+    """Three-valued to the end: nothing could say what this column is, so nothing is said
+    about the declaration either."""
+    result = annotate(
+        f"select amount from {q('orders')}",
+        {q("orders"): {"amount": "UNKNOWN"}, q("x"): {"amount": "varchar(10)"}},
+        tmp_path,
+        built_by=BUILT,
+    )
+    assert declaration_findings(result) == []
+
+
+def test_a_declaration_with_no_columns_says_nothing(tmp_path: Path) -> None:
+    """Naming a relation without listing its columns says nothing about them - the same
+    reading a source table's empty declaration gets."""
+    result = annotate(
+        f"select order_id from {q('orders')}",
+        {**ORDERS_TYPED, q("x"): {}},
+        tmp_path,
+        built_by=BUILT,
+    )
+    assert declaration_findings(result) == []
+
+
+def test_a_model_declaration_never_types_the_columns_its_own_file_reads(
+    tmp_path: Path,
+) -> None:
+    """The isolation rule. A declaration of what a file *produces* cannot describe the
+    columns feeding it, so it stays out of the schema steps 4-6 work from: `amount` is
+    inferred from usage here, and would have been `declared` had the declaration leaked in.
+    """
+    result = annotate(
+        f"select amount from {q('orders')} where amount > 0",
+        {q("orders"): {"amount": "UNKNOWN"}, q("x"): {"amount": "decimal(10,2)"}},
+        tmp_path,
+        built_by=BUILT,
+    )
+
+    statement = result.qualified.statement
+    assert statement is not None
+    assert statement.declared_types_per_relation[q("orders")]["amount"] == "UNKNOWN"
+    assert inferred_types(result) == {(q("orders"), "amount"): "NUMERIC"}
+    assert [column.provenance for column in result.scopes[-1].columns] == ["inferred"]
+
+
+def test_a_file_that_reads_its_own_relation_reads_it_as_a_source(
+    tmp_path: Path,
+) -> None:
+    """The incremental-model shape. Where the file reads the relation it builds, that
+    declaration is a source declaration like any other and types the read."""
+    result = annotate(
+        f"select amount from {q('x')}",
+        {q("x"): {"amount": "decimal(10,2)"}},
+        tmp_path,
+        built_by=BUILT,
+    )
+
+    assert declaration_findings(result) == []
+    assert [column.provenance for column in result.scopes[-1].columns] == ["declared"]
+
+
+def test_a_set_operation_is_held_against_the_declaration_by_its_left_arm(
+    tmp_path: Path,
+) -> None:
+    """A union has no projection list of its own: the arms are matched by position and the
+    left one supplies the names, so that is the arm the declaration is compared against."""
+    result = annotate(
+        f"""
+        select id, 'a' as tag from {q('arm_a')}
+        union all
+        select id, 'b' as label from {q('arm_b')}
+        """,
+        {
+            q("arm_a"): {"id": "bigint"},
+            q("arm_b"): {"id": "bigint"},
+            q("x"): {"id": "bigint", "tag": "varchar"},
+        },
+        tmp_path,
+        built_by=BUILT,
+    )
+    assert declaration_findings(result) == []

@@ -36,11 +36,11 @@ def _check(tmp_path: Path, sql: str, yml: str) -> list[Diagnostic]:
 
 
 
-def _yml(name: str, *columns: str, sql_file: str | None = None) -> str:
+def _yml(name: str, *columns: str, source_file: str | None = None) -> str:
     """A declaration for one relation, in the shape a standalone project writes.
 
     Everything is a `sources:` table, including what this project builds: those name the
-    file that builds them with `sql_file:`. `warehouse` declares no database and no
+    file that builds them with `meta.source_file`. `warehouse` declares no database and no
     schema, so its tables are referred to bare - `source_table`, not `db.schema.x`.
     """
     lines = [
@@ -50,8 +50,10 @@ def _yml(name: str, *columns: str, sql_file: str | None = None) -> str:
         "    tables:",
         f"      - name: {name}",
     ]
-    if sql_file is not None:
-        lines.append(f"        sql_file: {sql_file}")
+    if source_file is not None:
+        lines.append("        config:")
+        lines.append("          meta:")
+        lines.append(f"            source_file: {source_file}")
     if columns:
         lines.append("        columns:")
         for column in columns:
@@ -90,7 +92,7 @@ def test_a_cast_contradicting_a_declaration_is_an_error(tmp_path: Path) -> None:
     diagnostics = _check(
         tmp_path,
         "select cast(x as integer) as revenue\nfrom source_table\n",
-        _yml("orders", "revenue varchar", sql_file="orders"),
+        _yml("orders", "revenue varchar", source_file="orders"),
     )
 
     [mismatch] = [d for d in diagnostics if d.code == codes.TYPE_MISMATCH]
@@ -231,7 +233,7 @@ def test_a_declared_column_the_model_does_not_produce_is_reported(
     diagnostics = _check(
         tmp_path,
         "select id from source_table\n",
-        _yml("orders", "id integer", "absent integer", sql_file="orders"),
+        _yml("orders", "id integer", "absent integer", source_file="orders"),
     )
 
     [missing] = [d for d in diagnostics if d.code == codes.MISSING_COLUMN]

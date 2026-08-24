@@ -440,8 +440,10 @@ def resolve_columns_to_source_tables(
 
 
 # --------------------------------------------------------------------- step 5: gap-fill
-def type_name_is_recognized(written: ColumnTypeName, dialect_name: str) -> bool:
-    """Whether the dialect can parse a written `data_type:` into a real type.
+def declared_data_type(
+    written: ColumnTypeName, dialect_name: str
+) -> exp.DataType | None:
+    """A written `data_type:` as a real type, or None when the dialect cannot parse it.
 
     The discriminator is `udt=False`. With sqlglot's default the name comes back as a
     *user-defined* type instead of raising, and a user-defined type belongs to no family -
@@ -450,12 +452,16 @@ def type_name_is_recognized(written: ColumnTypeName, dialect_name: str) -> bool:
     all parse and are not affected; only a name nothing recognises fails here.
     """
     try:
-        exp.DataType.build(written, dialect=dialect_name, udt=False)
+        return exp.DataType.build(written, dialect=dialect_name, udt=False)
     except Exception:
         # sqlglot raises ParseError, but a malformed parameter list can surface as others,
         # and every one of them means the same thing: this is not a usable type name.
-        return False
-    return True
+        return None
+
+
+def type_name_is_recognized(written: ColumnTypeName, dialect_name: str) -> bool:
+    """Whether the dialect can parse a written `data_type:` into a real type."""
+    return declared_data_type(written, dialect_name) is not None
 
 
 def unrecognized_declared_types(

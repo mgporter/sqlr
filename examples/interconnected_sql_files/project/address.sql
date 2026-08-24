@@ -2,7 +2,7 @@ with ranked as (
   select
     *,
     row_number() over (partition by person_id order by updated_at desc) as rn
-  from mydatabase.myschema.raw_address
+  from mydatabase.raw.raw_address
   where country = 'US'
 ),
 current_address as (

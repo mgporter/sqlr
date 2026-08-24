@@ -271,7 +271,8 @@ project root is the whole test.
 
 *Standalone* — no `dbt_project.yml`. There are no models, only sources: a project with no
 dbt has no `ref()`/`source()` distinction to inherit, so every relation the SQL reads is a
-table someone has to describe, and the ones this project builds say so with `sql_file:`.
+table someone has to describe, and the ones this project builds say so with
+`meta.source_file`.
 
 ```yml
 sources:
@@ -279,12 +280,14 @@ sources:
     database: mydatabase
     schema: myschema
     tables:
-      - name: raw_department      # read as mydatabase.myschema.raw_department
+      - name: raw_department          # read as mydatabase.myschema.raw_department
         columns:
           - name: department_id
             data_type: string
       - name: employee
-        sql_file: employee        # ...and this one is built by employee.sql
+        config:
+          meta:
+            source_file: employee     # ...and this one is built by employee.sql
 ```
 
 The parts a table writes down **are** the relation, exactly: `database` and `schema` appear
@@ -312,7 +315,7 @@ behaviour, kept working.
 same thing, and when two entries give one column two types there is no answer to choose.
 Sources collide on the *relation they resolve to* rather than on their `source.table`
 names, so two sources may both have a `raw_department` as long as they land in different
-schemas. The same goes for two entries claiming one `sql_file:`, and for a column described
+schemas. The same goes for two entries claiming one `meta.source_file`, and for a column described
 twice inside one entry.
 
 **An unmatched relation is not fatal** — its columns simply have nothing to check against,
@@ -559,7 +562,7 @@ The first real consumer, and the reason the module exists now rather than later.
 comparisons share one rule set:
 
 - the statement's **projection** against the declaration for the `.sql` file itself — the
-  source table that claims it with `sql_file:`, or a dbt project's `models:` entry;
+  source table that claims it with `meta.source_file`, or a dbt project's `models:` entry;
 - each **relation it reads** against the declaration of that name — which catches the
   interesting case, where `orders.sql` declares `revenue` a varchar and
   `revenue_report.sql` writes `where revenue > 1000`.

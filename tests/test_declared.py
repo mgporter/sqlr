@@ -13,7 +13,7 @@ from pathlib import Path
 
 from sqlr.catalog import find_yaml_files
 from sqlr.declared import (
-    check_sql_file_links,
+    check_source_file_links,
     ignored_models_warning,
     load_declared_schemas,
     near_miss_warnings,
@@ -191,7 +191,7 @@ def test_an_identifier_overrides_the_name_in_the_relation(tmp_path: Path) -> Non
 # ---- tables this project builds ------------------------------------------------------
 
 
-SQL_FILE_YML = """\
+SOURCE_FILE_YML = """\
 version: 2
 
 sources:
@@ -200,17 +200,19 @@ sources:
     schema: myschema
     tables:
       - name: employee
-        sql_file: employee
+        config:
+          meta:
+            source_file: employee
         columns:
           - name: employee_id
             data_type: varchar
 """
 
 
-def test_sql_file_links_a_declaration_to_the_file_that_builds_it(tmp_path: Path) -> None:
-    declared = _load(tmp_path, **{"s.yml": SQL_FILE_YML})
+def test_source_file_links_a_declaration_to_the_file_that_builds_it(tmp_path: Path) -> None:
+    declared = _load(tmp_path, **{"s.yml": SOURCE_FILE_YML})
 
-    table = declared.for_sql_file(Path("project/employee.sql"))
+    table = declared.for_source_file(Path("project/employee.sql"))
     assert table is not None
     assert table.column("employee_id") is not None
 
@@ -218,32 +220,33 @@ def test_sql_file_links_a_declaration_to_the_file_that_builds_it(tmp_path: Path)
 def test_a_built_table_is_still_read_by_its_full_relation_name(tmp_path: Path) -> None:
     # The point of declaring database and schema on a table this project builds: another
     # file has to write them out to reach it.
-    declared = _load(tmp_path, **{"s.yml": SQL_FILE_YML})
+    declared = _load(tmp_path, **{"s.yml": SOURCE_FILE_YML})
 
     assert declared.for_relation("mydatabase.myschema.employee") is not None
     assert declared.for_relation("employee") is None
 
 
-def test_sql_file_accepts_the_file_name_as_well_as_the_stem(tmp_path: Path) -> None:
+def test_source_file_accepts_the_file_name_as_well_as_the_stem(tmp_path: Path) -> None:
     declared = _load(
         tmp_path,
         **{
             "s.yml": "sources:\n  - name: mysource\n    tables:\n"
-            "      - name: employee\n        sql_file: employee.sql\n"
+            "      - name: employee\n        config:\n          meta:\n"
+            "            source_file: employee.sql\n"
         },
     )
 
-    assert declared.for_sql_file(Path("employee.sql")) is not None
+    assert declared.for_source_file(Path("employee.sql")) is not None
 
 
-def test_a_sql_file_naming_nothing_in_the_project_is_an_error(tmp_path: Path) -> None:
-    declared = _load(tmp_path, **{"s.yml": SQL_FILE_YML})
+def test_a_source_file_naming_nothing_in_the_project_is_an_error(tmp_path: Path) -> None:
+    declared = _load(tmp_path, **{"s.yml": SOURCE_FILE_YML})
 
-    [error] = check_sql_file_links(declared, ["department", "sales"])
-    assert "sql_file 'employee' does not name a SQL file" in error
-    assert "s.yml:9" in error
+    [error] = check_source_file_links(declared, ["department", "sales"])
+    assert "source_file 'employee' does not name a SQL file" in error
+    assert "s.yml:11" in error
 
-    assert check_sql_file_links(declared, ["employee"]) == []
+    assert check_source_file_links(declared, ["employee"]) == []
 
 
 # ---- columns -------------------------------------------------------------------------
@@ -354,15 +357,16 @@ def test_a_column_described_twice_is_an_error(tmp_path: Path) -> None:
     assert declared.for_relation("t").column("c").written_type == "date"  # type: ignore[union-attr]
 
 
-def test_two_tables_claiming_one_sql_file_are_an_error(tmp_path: Path) -> None:
+def test_two_tables_claiming_one_source_file_are_an_error(tmp_path: Path) -> None:
     other = (
         "sources:\n  - name: othersource\n    tables:\n"
-        "      - name: employee\n        sql_file: employee\n"
+        "      - name: employee\n        config:\n          meta:\n"
+        "            source_file: employee\n"
     )
-    declared = _load(tmp_path, **{"a.yml": SQL_FILE_YML, "b.yml": other})
+    declared = _load(tmp_path, **{"a.yml": SOURCE_FILE_YML, "b.yml": other})
 
     [error] = declared.errors
-    assert "sql_file 'employee' is claimed by both" in error
+    assert "source_file 'employee' is claimed by both" in error
 
 
 def test_a_sources_key_that_is_not_a_list_is_an_error(tmp_path: Path) -> None:
@@ -511,7 +515,7 @@ def test_models_are_read_in_a_dbt_project(tmp_path: Path) -> None:
 
     assert set(declared.models) == {"employee", "unrelated"}
     assert declared.ignored_models == []
-    assert declared.for_sql_file(Path("models/employee.sql")) is not None
+    assert declared.for_source_file(Path("models/employee.sql")) is not None
 
 
 def test_a_model_described_twice_in_a_dbt_project_is_an_error(tmp_path: Path) -> None:

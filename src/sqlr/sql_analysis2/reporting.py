@@ -65,12 +65,21 @@ type TypeFindingCode = Literal[
     "function-arity",
     "contradicted-type",
     "conflicting-usage",
+    "contradicted-declaration",
+    "projected-column-not-declared",
+    "declared-column-not-projected",
 ]
 """What went wrong with a *value*, as opposed to with a column's attribution.
 
 `unknown-function` and `function-arity` are structural - they need no types at all and are
-about the call. The other two are the two readings of one fact: a claim contradicted by a
-type that is already known, and claims that disagree about a column with no type at all.
+about the call. `contradicted-type` and `conflicting-usage` are the two readings of one
+fact: a claim contradicted by a type that is already known, and claims that disagree about a
+column with no type at all.
+
+The last three are about the file's *output* rather than about a value inside it - what this
+file produces, held against the yml entry that says what it produces. They are the only
+findings a declaration of the model itself can cause; see
+`findings_for_a_projection_that_disagrees_with_its_declaration`.
 """
 
 

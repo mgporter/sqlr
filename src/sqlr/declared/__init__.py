@@ -7,7 +7,7 @@ fields are required of each column - `name` and `data_type`.
 Which key is read depends on the project. Without a `dbt_project.yml` there are no models,
 only sources, because a standalone project has no `ref()`/`source()` distinction to
 inherit - every relation the SQL reads is a table someone has to describe, and the ones
-this project builds say so with `sql_file:`:
+this project builds say so with `meta.source_file`:
 
 ```yml
 sources:
@@ -15,12 +15,14 @@ sources:
     database: mydatabase
     schema: myschema
     tables:
-      - name: raw_department      # read as mydatabase.myschema.raw_department
+      - name: raw_department          # read as mydatabase.myschema.raw_department
         columns:
           - name: department_id
             data_type: string
       - name: employee
-        sql_file: employee        # ...and this one is built by employee.sql
+        config:
+          meta:
+            source_file: employee     # ...and this one is built by employee.sql
 ```
 
 The parts a table writes down are the relation, exactly: `database` and `schema` appear in
@@ -88,7 +90,7 @@ __all__ = [
     "DeclarationProvider",
     "Declarations",
     "YamlDeclarationProvider",
-    "check_sql_file_links",
+    "check_source_file_links",
     "ignored_models_warning",
     "load_declared_schemas",
     "near_miss_warnings",
@@ -116,6 +118,13 @@ dbt itself would apply.
 """
 
 DECLARATION_IS_PARTIAL_KEY = "declaration_is_partial"
+SOURCE_FILE_KEY = "source_file"
+"""The `meta:` key naming the `.sql` file a source table is built by.
+
+Unlike `declaration_is_partial` this is *not* inherited from the source: one file builds
+one table, so a value written on the source would claim the same file for every table
+under it - which is the error `load_declared_schemas` raises, not a shorthand.
+"""
 
 BOOLEANS = {"true": True, "false": False}
 """The only two words a sqlr `meta:` flag accepts, case-insensitively.
@@ -352,12 +361,12 @@ class YamlDeclarationProvider:
             )
             return None
 
-        sql_file_node = _entry(node, "sql_file")
-        sql_file = _scalar(sql_file_node)
-        if sql_file is not None:
-            # `sql_file: employee.sql` is what a person writes half the time, and the two
-            # spellings naming the same file should not be two different answers.
-            sql_file = Path(sql_file).stem
+        source_file_node = _meta_entry(node, SOURCE_FILE_KEY)
+        source_file = _scalar(source_file_node)
+        if source_file is not None:
+            # `source_file: employee.sql` is what a person writes half the time, and the
+            # two spellings naming the same file should not be two different answers.
+            source_file = Path(source_file).stem
 
         own_partial = _meta_flag(
             node, DECLARATION_IS_PARTIAL_KEY, label, f"{source_name}.{name}", found
@@ -385,8 +394,8 @@ class YamlDeclarationProvider:
             database=database,
             schema_name=schema,
             identifier=_scalar(_entry(node, "identifier")),
-            sql_file=sql_file,
-            sql_file_span=_span(positions, sql_file_node),
+            source_file=source_file,
+            source_file_span=_span(positions, source_file_node),
             columns=columns,
             declaration_is_partial=declaration_is_partial,
             span=_span(positions, node),
@@ -507,17 +516,17 @@ def load_declared_schemas(
                 continue
             sources[table.key] = table
 
-            if table.sql_file is None:
+            if table.source_file is None:
                 continue
-            owner = claimed.get(table.sql_file.lower())
+            owner = claimed.get(table.source_file.lower())
             if owner is not None:
                 errors.append(
-                    f"sql_file {table.sql_file!r} is claimed by both "
+                    f"source_file {table.source_file!r} is claimed by both "
                     f"{owner.display_name} at {owner.where} and {table.display_name} at "
                     f"{table.where}; a SQL file may only be described once"
                 )
                 continue
-            claimed[table.sql_file.lower()] = table
+            claimed[table.source_file.lower()] = table
 
     return DeclaredSchemas(
         mode=mode,
@@ -532,20 +541,20 @@ def load_declared_schemas(
 # ---- checks that need the rest of the project ----------------------------------------
 
 
-def check_sql_file_links(
+def check_source_file_links(
     declared: DeclaredSchemas, model_names: Iterable[str]
 ) -> list[str]:
-    """Errors for `sql_file:` values that name no SQL file in the project.
+    """Errors for `meta.source_file` values that name no SQL file in the project.
 
     Separate from loading because it is the one thing a yml cannot answer on its own: the
     set of models is built from the config's search paths, not from the yml.
     """
     known = {name.lower() for name in model_names}
     return [
-        f"{_at(table)}: sql_file {table.sql_file!r} does not name a SQL file in this "
+        f"{_at(table)}: source_file {table.source_file!r} does not name a SQL file in this "
         f"project"
         for table in declared.sources.values()
-        if table.sql_file is not None and table.sql_file.lower() not in known
+        if table.source_file is not None and table.source_file.lower() not in known
     ]
 
 
@@ -583,7 +592,7 @@ def ignored_models_warning(
         f"and `models:` entries are ignored - sqlr reads declarations from `sources:` "
         f"only. {len(matched)} ignored entr{'y' if len(matched) == 1 else 'ies'} "
         f"name{'s' if len(matched) == 1 else ''} a SQL file in this project: {listed}. "
-        f"Move them under `sources:`, adding `sql_file:`, to have them applied."
+        f"Move them under `sources:`, adding `meta.source_file`, to have them applied."
     )
 
 
@@ -639,11 +648,11 @@ def _omitted(table: DeclaredSourceTable) -> str:
 
 
 def _at(table: DeclaredSourceTable) -> str:
-    """Where a table's `sql_file:` was written, falling back to the entry itself."""
-    if table.sql_file_span is None:
+    """Where a table's `meta.source_file` was written, falling back to the entry itself."""
+    if table.source_file_span is None:
         return table.where
     base = table.label or str(table.path)
-    return f"{base}:{table.sql_file_span.start_line + 1}"
+    return f"{base}:{table.source_file_span.start_line + 1}"
 
 
 # ---- yaml node helpers ---------------------------------------------------------------

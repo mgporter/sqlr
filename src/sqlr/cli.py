@@ -7,7 +7,7 @@ from sqlr import config as config_module
 from sqlr.catalog import find_yaml_files
 from sqlr.config.types import SqlrConfig
 from sqlr.declared import (
-    check_sql_file_links,
+    check_source_file_links,
     ignored_models_warning,
     load_declared_schemas,
 )
@@ -138,7 +138,7 @@ def _load_declarations(root: Path, index: ModelIndex) -> DeclaredSchemas:
 
     Project-wide regardless of selection: a selected model's upstream tables are usually
     described in some other file's yml. Two of the checks need the model index rather than
-    the yml alone - whether a `sql_file:` names a real file, and whether an ignored
+    the yml alone - whether a `meta.source_file` names a real file, and whether an ignored
     `models:` entry would have described one - so they run here.
     """
     mode = config_module.declaration_mode(root)
@@ -158,7 +158,7 @@ def _load_declarations(root: Path, index: ModelIndex) -> DeclaredSchemas:
     for warning in warnings:
         typer.echo(f"warning: {warning}", err=True)
 
-    errors = [*declared.errors, *check_sql_file_links(declared, index.names)]
+    errors = [*declared.errors, *check_source_file_links(declared, index.names)]
     for error in errors:
         typer.echo(f"error: {error}", err=True)
     if errors:

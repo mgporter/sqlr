@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from sqlglot import exp
 
+from sqlr.declared.types import DeclaredColumn, DeclaredRelation
 from sqlr.sql_analysis2.annotate import (
     arguments_of_call,
     candidate_overloads,
@@ -34,7 +35,7 @@ from sqlr.sql_analysis2.annotate import (
     unknown_function_findings_are_trustworthy,
 )
 from sqlr.sql_analysis2.catalog import DialectName, Sig
-from sqlr.sql_analysis2.families import in_family
+from sqlr.sql_analysis2.families import ANY, family_of_type, in_family, nearest_common_family
 from sqlr.sql_analysis2.facts import Facts, TypeClaim
 from sqlr.sql_analysis2.infer import (
     ColumnTypeConflict,
@@ -42,10 +43,15 @@ from sqlr.sql_analysis2.infer import (
     TypeEvidence,
     TypeStrength,
 )
-from sqlr.sql_analysis2.reporting import TypeFinding
-from sqlr.sql_analysis2.resolve import is_declared
+from sqlr.sql_analysis2.reporting import TypeFinding, FindingSeverity
+from sqlr.sql_analysis2.resolve import declared_data_type, is_declared
 from sqlr.sql_analysis2.sourcedoc import Positions, SourceSpan
-from sqlr.sql_analysis2.types import ColumnName, ColumnTypeName, RelationKey
+from sqlr.sql_analysis2.types import (
+    ColumnName,
+    ColumnTypeAnnotation,
+    ColumnTypeName,
+    RelationKey,
+)
 
 
 def span_of_call_name(node: exp.Expr, positions: Positions) -> SourceSpan | None:
@@ -220,6 +226,198 @@ def findings_for_contradicted_claims(
                 column_name=claim.site.column.name if claim.site.column else None,
             )
         )
+    return findings
+
+
+# ------------------------------------- the file's own output against its own declaration
+def _declared_columns_by_name(
+    declaration: DeclaredRelation,
+) -> dict[ColumnName, DeclaredColumn]:
+    return {column.name.lower(): column for column in declaration.columns}
+
+
+def _where_declared(declaration: DeclaredRelation) -> str:
+    """`'mydatabase.ods.employee' at project/sources.yml:108` - the entry to go and edit."""
+    return f"'{declaration.relation_name}' at {declaration.where}"
+
+
+def _where_declared_column(
+    declaration: DeclaredRelation, column: DeclaredColumn
+) -> str:
+    """The same, pointing at one column's own line instead of at the table entry.
+
+    A finding about a declared column sends the reader to the line they have to change,
+    which for a table with twenty columns is not the line the entry starts on. Falls back to
+    the entry when the column carries no position.
+    """
+    located = column.name_span or column.span
+    if located is None:
+        return _where_declared(declaration)
+    base = declaration.label or str(declaration.path)
+    return f"'{declaration.relation_name}' at {base}:{located.start_line + 1}"
+
+
+def _finding_for_a_projected_column_no_declaration_covers(
+    projected: ColumnTypeAnnotation, declaration: DeclaredRelation
+) -> TypeFinding:
+    """A column this file produces that its declaration leaves out.
+
+    An error for the same reason reading an undeclared column off a closed table is one:
+    a declaration without `declaration_is_partial` is the *complete* column list, so a file
+    producing a column it omits contradicts it. Letting this pass would make one wrong yml
+    fatal in every file that reads the relation and silent in the file that builds it.
+    """
+    return TypeFinding(
+        code="projected-column-not-declared",
+        message=(
+            f"column '{projected.name}' is projected by this file, but "
+            f"{_where_declared(declaration)} does not declare it; declare it there, or "
+            f"set 'declaration_is_partial' to 'true'"
+        ),
+        span=projected.span,
+        context_span=projected.span,
+        column_name=projected.name,
+    )
+
+
+def _finding_for_a_declared_column_the_file_does_not_produce(
+    declared: DeclaredColumn, declaration: DeclaredRelation, projection_is_complete: bool
+) -> TypeFinding:
+    """A column the declaration promises that the projection list does not carry.
+
+    Only an error when the projection list is the whole answer. A list built by expanding a
+    `*` over a table nobody declares is a lower bound - the columns this file happens to
+    name - so the column may well be produced and simply be invisible from here, and
+    reporting that as a defect would blame the yml for a gap in a different yml.
+    """
+    if projection_is_complete:
+        return TypeFinding(
+            code="declared-column-not-projected",
+            message=(
+                f"column '{declared.name}' is declared for "
+                f"{_where_declared_column(declaration, declared)}, "
+                f"but this file does not project it"
+            ),
+            column_name=declared.name,
+        )
+    return TypeFinding(
+        code="declared-column-not-projected",
+        severity="warning",
+        message=(
+            f"column '{declared.name}' is declared for "
+            f"{_where_declared_column(declaration, declared)}, and "
+            f"this file's projection list is a lower bound - it expands a '*' over a table "
+            f"nobody declares - so nothing here can say whether it is produced; declare "
+            f"that table's columns, or project the column explicitly"
+        ),
+        column_name=declared.name,
+    )
+
+
+def _finding_for_a_projected_type_that_contradicts_the_declaration(
+    projected: ColumnTypeAnnotation,
+    declared: DeclaredColumn,
+    declaration: DeclaredRelation,
+    dialect_name: DialectName,
+) -> TypeFinding | None:
+    """The declared type of an output column against the type this file gives it.
+
+    Two stated types conflict **iff their nearest common family is `ANY`** - the same test
+    every other type comparison in the pipeline makes, so `decimal(10,2)` declared against a
+    computed `DECIMAL(38,9)` is not a finding and a `varchar` against a `DECIMAL` is.
+
+    Severity splits on where the projected type came from, exactly as a conflicting-usage
+    finding does. **Computed** or **declared** means two written-down things disagree and one
+    is wrong: an error. **Inferred** means sqlr read a family off how an undeclared column is
+    used and that guess fought the declaration: a warning, whose fix is usually to declare
+    the column being read.
+
+    Nothing is reported when either side is unknown, and nothing when the declared type is
+    one the dialect cannot parse - that is `unrecognized-declared-type`'s finding to make.
+    """
+    if projected.provenance == "unknown":
+        return None
+    declared_type = declared_data_type(declared.written_type, dialect_name)
+    declared_family = family_of_type(declared_type)
+    projected_family = family_of_type(projected.type)
+    if declared_family is None or projected_family is None:
+        return None
+    if nearest_common_family(declared_family, projected_family) != ANY:
+        return None
+
+    inferred = projected.provenance == "inferred"
+    severity: FindingSeverity = "warning" if inferred else "error"
+    return TypeFinding(
+        code="contradicted-declaration",
+        severity=severity,
+        message=(
+            f"column '{declared.name}' of "
+            f"{_where_declared_column(declaration, declared)} is declared "
+            f"{declared.written_type} ({declared_type.sql() if declared_type else '?'}), "
+            f"but this file "
+            + (
+                f"infers {projected.type_name} for it from usage; declare the column it "
+                f"reads, or fix the declaration"
+                if inferred
+                else f"projects {projected.type_name}"
+            )
+        ),
+        span=projected.span,
+        context_span=projected.span,
+        column_name=declared.name,
+    )
+
+
+def findings_for_a_projection_that_disagrees_with_its_declaration(
+    projected: list[ColumnTypeAnnotation],
+    declaration: DeclaredRelation | None,
+    dialect_name: DialectName,
+    projection_is_complete: bool = True,
+) -> list[TypeFinding]:
+    """What this file produces, held against what its yml says it produces.
+
+    The one check that reads a declaration of the *model* rather than of a table it reads,
+    and the only place that declaration has any effect on this file at all: it never types
+    anything here, because a declaration of a model's output cannot describe the columns
+    feeding it. Every type on this side was inferred or computed from the SQL, and the
+    comparison is between those and the yml.
+
+    A declaration with no columns is read as no declaration, exactly as it is for a source
+    table: naming a relation without listing its columns says nothing about them.
+
+    The projected side is walked in projection order and the declared side after it, so a
+    reader sees the file's own columns in the order they wrote them before the ones only
+    the yml knows about.
+    """
+    if declaration is None or not declaration.columns:
+        return []
+
+    declared_columns = _declared_columns_by_name(declaration)
+    findings: list[TypeFinding] = []
+    for column in projected:
+        declared = declared_columns.get(column.name.lower())
+        if declared is None:
+            if not declaration.declaration_is_partial:
+                findings.append(
+                    _finding_for_a_projected_column_no_declaration_covers(
+                        column, declaration
+                    )
+                )
+            continue
+        finding = _finding_for_a_projected_type_that_contradicts_the_declaration(
+            column, declared, declaration, dialect_name
+        )
+        if finding is not None:
+            findings.append(finding)
+
+    produced = {column.name.lower() for column in projected}
+    findings.extend(
+        _finding_for_a_declared_column_the_file_does_not_produce(
+            declared, declaration, projection_is_complete
+        )
+        for declared in declaration.columns
+        if declared.name.lower() not in produced
+    )
     return findings
 
 

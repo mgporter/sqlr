@@ -2,7 +2,7 @@ with deduped as (
   select
     *,
     row_number() over (partition by employee_id order by modified_at desc) as rn
-  from mydatabase.myschema.raw_employee
+  from mydatabase.raw.raw_employee
   where status in ('ACTIVE', 'ON_LEAVE')
 ),
 current_employee as (
@@ -21,7 +21,7 @@ current_employee as (
   where rn = 1
     and department_id in (
       select department_id
-      from mydatabase.myschema.raw_department
+      from mydatabase.raw.raw_department
       where is_active = true
     )
 )

@@ -79,7 +79,7 @@ def validate_schema(
     """Check `schema` against every declaration that bears on it.
 
     `path` is the `.sql` file this statement came from; the declaration describing what it
-    produces is the one that claims it with `sql_file:`, or - in a dbt project - the
+    produces is the one that claims it with `meta.source_file`, or - in a dbt project - the
     `models:` entry of the same stem. Every relation it *reads* is matched by the name the
     SQL writes.
     """
@@ -91,7 +91,7 @@ def validate_schema(
         ],
         projection=_validate_projection(
             schema.projection,
-            declared.for_sql_file(path) if path is not None else None,
+            declared.for_source_file(path) if path is not None else None,
             complete=schema.projection_is_complete,
         ),
     )

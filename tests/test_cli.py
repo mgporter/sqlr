@@ -301,13 +301,14 @@ def test_validate_schema_errors_on_a_sources_key_that_is_not_a_list(
     assert "`sources:` must be a list of sources" in result.output
 
 
-def test_validate_schema_errors_when_sql_file_names_nothing(
+def test_validate_schema_errors_when_source_file_names_nothing(
     tmp_path: Path, wide: None
 ) -> None:
     _project(tmp_path)
     (tmp_path / "models" / "schema.yml").write_text(
         "version: 2\nsources:\n  - name: warehouse\n    tables:\n"
-        "      - name: person\n        sql_file: nowhere\n"
+        "      - name: person\n        config:\n          meta:\n"
+        "            source_file: nowhere\n"
     )
 
     result = runner.invoke(
@@ -316,7 +317,7 @@ def test_validate_schema_errors_when_sql_file_names_nothing(
     )
 
     assert result.exit_code == 1
-    assert "sql_file 'nowhere' does not name a SQL file" in result.output
+    assert "source_file 'nowhere' does not name a SQL file" in result.output
 
 
 

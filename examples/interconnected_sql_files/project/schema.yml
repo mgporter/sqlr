@@ -1,16 +1,18 @@
 version: 2
 
-# The tables this project builds. `sql_file:` is what makes one of these a model: the
-# columns below describe what that file produces, and the file is checked against them.
+# The tables this project builds. `meta.source_file` is what makes one of these a model:
+# the columns below describe what that file produces, and the file is checked against them.
 #
 # Neither `database` nor `schema` is declared here, so these are referred to bare -
 # `from employee`, the way employee_dashboard.sql already writes it. Declaring either one
-# would mean every reference had to write it too: `from mydatabase.myschema.employee`.
+# would mean every reference had to write it too: `from mydatabase.raw.employee`.
 # sources:
 #   - name: project
 #     tables:
 #       - name: employee
-#         sql_file: employee
+#         config:
+#           meta:
+#             source_file: employee
 #         columns:
 #           - name: employee_id
 #             data_type: varchar(20)
@@ -26,7 +28,9 @@ version: 2
 #             data_type: decimal(10,2)
 
 #       - name: department
-#         sql_file: department
+#         config:
+#           meta:
+#             source_file: department
 #         columns:
 #           - name: department_id
 #             data_type: varchar(20)
@@ -36,7 +40,9 @@ version: 2
 #             data_type: varchar(20)
 
 #       - name: address
-#         sql_file: address
+#         config:
+#           meta:
+#             source_file: address
 #         columns:
 #           - name: person_id
 #             data_type: varchar(20)
@@ -44,7 +50,9 @@ version: 2
 #             data_type: varchar(500)
 
 #       - name: sales
-#         sql_file: sales
+#         config:
+#           meta:
+#             source_file: sales
 #         columns:
 #           - name: employee_id
 #             data_type: varchar(20)
@@ -52,7 +60,9 @@ version: 2
 #             data_type: decimal(18,2)
 
 #       - name: employee_dashboard
-#         sql_file: employee_dashboard
+#         config:
+#           meta:
+#             source_file: employee_dashboard
 #         columns:
 #           - name: employee_id
 #             data_type: varchar(20)

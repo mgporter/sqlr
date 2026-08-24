@@ -3,7 +3,8 @@
 Two shapes of project, and the difference runs through everything here:
 
 - **standalone** - no `dbt_project.yml`. Every relation the SQL reads is a `sources:`
-  table, including the ones this project produces, which mark themselves with `sql_file:`.
+  table, including the ones this project produces, which mark themselves with
+  `meta.source_file`.
   A declaration names a relation *exactly*: the parts it writes down, joined, are what the
   SQL has to write.
 - **dbt** - a `dbt_project.yml` is present. `models:` entries come back, matched by file
@@ -111,9 +112,12 @@ class DeclaredSourceTable(DeclaredRelation):
     schema_name: str | None = None
     identifier: str | None = None
     """dbt's escape hatch: the real table name, when `name` is what you want to call it."""
-    sql_file: str | None = None
-    """The stem of the `.sql` file that builds this table - what dbt would call a model."""
-    sql_file_span: SourceSpan | None = None
+    source_file: str | None = None
+    """The stem of the `.sql` file that builds this table - what dbt would call a model.
+
+    Written under `meta:` so the yml stays a valid dbt file - see the loader.
+    """
+    source_file_span: SourceSpan | None = None
 
     @property
     def table_name(self) -> str:
@@ -193,10 +197,10 @@ class DeclaredSchemas(BaseModel):
     def for_model(self, name: str) -> DeclaredModel | None:
         return self.models.get(name.lower())
 
-    def for_sql_file(self, path: Path) -> DeclaredRelation | None:
+    def for_source_file(self, path: Path) -> DeclaredRelation | None:
         """The declaration describing what a `.sql` file produces.
 
-        Standalone: the source table that claims the file with `sql_file:`. dbt: the
+        Standalone: the source table that claims the file with `meta.source_file`. dbt: the
         `models:` entry of the same stem.
         """
         stem = Path(path).stem.lower()
@@ -206,7 +210,7 @@ class DeclaredSchemas(BaseModel):
             (
                 table
                 for table in self.sources.values()
-                if table.sql_file is not None and table.sql_file.lower() == stem
+                if table.source_file is not None and table.source_file.lower() == stem
             ),
             None,
         )

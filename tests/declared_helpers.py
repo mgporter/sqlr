@@ -12,6 +12,9 @@ from sqlr.declared.types import DeclaredColumn, DeclaredSchemas, DeclaredSourceT
 from sqlr.sql_analysis2.types import ColumnName, ColumnTypeName, RelationKey
 from sqlr.typemap import resolve_type_name
 
+type SqlFileStem = str
+"""The name of a `.sql` file without its extension - what `meta.source_file` names."""
+
 
 def q(name: str) -> RelationKey:
     """`test` -> `mydatabase.myschema.test`, the relation most fixtures write.
@@ -26,6 +29,7 @@ def q(name: str) -> RelationKey:
 def declarations(
     declared: dict[RelationKey, dict[ColumnName, ColumnTypeName]] | None = None,
     partial: frozenset[RelationKey] = frozenset(),
+    built_by: dict[RelationKey, SqlFileStem] | None = None,
 ) -> DeclaredSchemas:
     """A `DeclaredSchemas` from `{relation: {column: type}}`.
 
@@ -33,7 +37,12 @@ def declarations(
     resolves to the same relation the SQL names. `partial` holds the keys whose entry
     carries `meta.declaration_is_partial: true` - the declared columns keep their types and
     everything else stays open to inference.
+
+    `built_by` holds the keys whose entry carries `meta.source_file`, mapped to the stem of
+    the `.sql` file that builds them - what makes the entry a description of a *model's
+    output* rather than of a table the project only reads.
     """
+    built_by = built_by or {}
     sources: dict[RelationKey, DeclaredSourceTable] = {}
     for key, columns in (declared or {}).items():
         *prefix, name = key.split(".")
@@ -45,6 +54,7 @@ def declarations(
             database=database,
             schema_name=schema,
             declaration_is_partial=key in partial,
+            source_file=built_by.get(key),
             columns=[
                 DeclaredColumn(
                     name=column,
