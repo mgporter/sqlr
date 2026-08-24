@@ -516,8 +516,35 @@ def get_declared_types_per_relation(
     return out
 
 
+def type_held_without_parameters_nobody_wrote(
+    written: ColumnTypeName, dialect_name: str
+) -> exp.DataType | ColumnTypeName:
+    """A written type name as sqlglot should hold it, carrying no width nobody wrote.
+
+    `DataType.build('decimal', dialect='snowflake')` comes back as `DECIMAL(38, 0)` - the
+    dialect's default, filled in by sqlglot rather than written by anyone. That default does
+    not stay put: `ifnull(bonus, 0)` inherits it and every scope downstream prints a scale
+    the project never stated, which is exactly the invented precision inference goes to some
+    length to avoid. A name written without parameters is therefore held without them.
+
+    Returns the name unchanged when it carries parameters (`varchar(20)`, `array<varchar>` -
+    those the user *did* write) or when the dialect cannot parse it at all.
+    """
+    if "(" in written or "<" in written:
+        return written
+    try:
+        dtype = exp.DataType.build(written, dialect=dialect_name)
+    except Exception:
+        # Same reasoning as `type_name_is_recognized`: a name nothing recognises is not a
+        # usable type, and sqlglot's own handling of it is no worse than ours.
+        return written
+    dtype.set("expressions", [])
+    return dtype
+
+
 def nested_schema_for_sqlglot(
     types_per_relation: dict[RelationKey, dict[ColumnName, ColumnTypeName]],
+    dialect_name: str,
 ) -> dict[str, object]:
     """A `RelationKey`-keyed schema in the nested shape `MappingSchema` resolves against.
 
@@ -538,7 +565,10 @@ def nested_schema_for_sqlglot(
                 child = {}
                 node[part] = child
             node = cast("dict[str, object]", child)
-        node[table] = dict(columns)
+        node[table] = {
+            column: type_held_without_parameters_nobody_wrote(written, dialect_name)
+            for column, written in columns.items()
+        }
     return nested
 
 

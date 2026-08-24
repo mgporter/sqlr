@@ -404,7 +404,68 @@ def test_a_numeric_literal_states_the_family_and_not_the_width(tmp_path: Path) -
     )
 
     entry = result.inference.inferred[0]
-    assert (entry.family, entry.type_name) == ("NUMERIC", "DECIMAL(38,9)")
+    assert (entry.family, entry.type_name) == ("NUMERIC", "NUMERIC")
+    # The schema sqlglot re-annotates with needs something it can parse, and that stand-in
+    # is the one place a concrete type is allowed to appear.
+    assert entry.schema_type_name == "DECIMAL"
+
+
+def test_a_family_with_no_parameter_free_type_of_its_own_still_annotates(
+    tmp_path: Path,
+) -> None:
+    """`TEMPORAL` is what a report should say and is not a type any dialect parses, so the
+    schema handed to pass 2 gets the stand-in. Reporting the stand-in instead would claim
+    the column is a timestamp when a date satisfies the evidence just as well."""
+    result = annotate(
+        "select date_trunc('day', ts) as d from events",
+        {"events": {"ts": "UNKNOWN"}},
+        tmp_path,
+    )
+
+    entry = result.inference.inferred[0]
+    assert (entry.family, entry.type_name, entry.schema_type_name) == (
+        "TEMPORAL",
+        "TEMPORAL",
+        "TIMESTAMP",
+    )
+    # Pass 2 parsed the stand-in and typed the projection from it - `unknown` here would
+    # mean the schema never took the inferred type at all.
+    assert projected_types(result) == {"d": "TIMESTAMPNTZ"}
+
+
+def test_a_type_carrying_no_parameters_is_reported_without_any(tmp_path: Path) -> None:
+    """sqlglot's generator fills defaults in: a `DataType` built from `DECIMAL` holds no
+    parameters and still renders as `DECIMAL(38, 0)`. Printing that would put a precision in
+    the report that the yml never wrote."""
+    result = annotate(
+        "select amount as a from orders",
+        {"orders": {"amount": "decimal"}},
+        tmp_path,
+    )
+
+    assert projected_types(result) == {"a": "DECIMAL"}
+
+
+def test_a_passthrough_of_an_inferred_column_is_reported_as_that_column(
+    tmp_path: Path,
+) -> None:
+    """A scope that does nothing but read an inferred column reports what the source column
+    reports. sqlglot only ever saw the stand-in, so asking it would print `DECIMAL` one line
+    under the `NUMERIC` the source table is listed as. Anything *computed* keeps sqlglot's
+    answer - `amount * 2` really is a decimal expression."""
+    result = annotate(
+        """
+        with a as (select amount, amount * 2 as doubled from orders where amount > 0)
+        select amount, doubled from a
+        """,
+        ORDERS,
+        tmp_path,
+    )
+
+    assert projected_types(result, scope="a") == {"amount": "NUMERIC", "doubled": "DECIMAL"}
+    # And a width appears nowhere down the chain: the stand-in in the schema carries none,
+    # so neither does anything sqlglot computed from it.
+    assert projected_types(result) == {"amount": "DECIMAL", "doubled": "DECIMAL"}
 
 
 def test_a_link_to_a_declared_column_keeps_its_exact_type(tmp_path: Path) -> None:
@@ -503,7 +564,7 @@ def test_two_reads_of_one_column_are_one_component(tmp_path: Path) -> None:
         "select upper(amount) as a from orders where amount = 5", ORDERS, tmp_path
     )
 
-    assert inferred_types(result)[("orders", "amount")] == "DECIMAL(38,9)"
+    assert inferred_types(result)[("orders", "amount")] == "NUMERIC"
     assert codes(result) == ["contradicted-type"]
 
 
@@ -542,7 +603,8 @@ def test_a_family_return_marker_carries_the_family_and_not_the_width(
     tmp_path: Path,
 ) -> None:
     """`SUM(INT)` is HUGEINT in DuckDB and NUMBER(38,0) in Snowflake, so `sum` is not
-    `@arg0`. The component keeps the family and forfeits the concrete type."""
+    `@arg0`. The component keeps the family and forfeits the concrete type - `decimal(10,2)`
+    is at the far end of the family link, and its width does not cross."""
     result = annotate(
         """
         with a as (select employee_id, sum(amount) as total from orders group by employee_id)
@@ -552,7 +614,7 @@ def test_a_family_return_marker_carries_the_family_and_not_the_width(
          "t2": {"n": "decimal(10,2)"}},
         tmp_path,
     )
-    assert inferred_types(result)[("orders", "amount")] == "DECIMAL(38,9)"
+    assert inferred_types(result)[("orders", "amount")] == "DECIMAL"
 
 
 # ---- the catalog ------------------------------------------------------------------

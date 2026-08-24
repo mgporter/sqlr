@@ -132,8 +132,13 @@ def nearest_common_family(left: FamilyName, right: FamilyName) -> FamilyName:
     """`INTEGER`,`DECIMAL` -> `NUMERIC`. `DATE`,`TIMESTAMP` -> `TEMPORAL`.
     `STRING`,`NUMERIC` -> `ANY`, which is the conflict signal."""
 
-def widest_type_in(family: FamilyName) -> ColumnTypeName:
-    """What an inferred family becomes in the schema. `NUMERIC` -> `DECIMAL(38,9)`."""
+def reported_type_for(family: FamilyName) -> ColumnTypeName:
+    """What an inferred family is called in a report. `NUMERIC` -> `NUMERIC`, parameter-free
+    always: usage evidence proves a kind and never a width."""
+
+def schema_type_for(family: FamilyName) -> ColumnTypeName:
+    """What it becomes in the schema sqlglot re-annotates with. `NUMERIC` -> `DECIMAL`,
+    `TEMPORAL` -> `TIMESTAMP`, because that one has to parse."""
 ```
 
 **`in_family` keeps its three-valued contract exactly.** `None` means "cannot say, stay quiet";
@@ -219,7 +224,7 @@ if anchors:
                      any claim not satisfied by it -> ERROR (contradicted-type)
 else:
     intersect the claims' family sets
-    exactly one   -> strength = "inferred", type = widest_type_in(family)
+    exactly one   -> strength = "inferred", type = the family itself (reported_type_for)
     empty         -> WARNING at every claim site; component unresolved
     several       -> unresolved, silent   (`x * 2` alone says numeric-or-interval)
 ```
@@ -234,11 +239,11 @@ honest answer is "I could not tell, here is what I saw".
 | the stated anchor is | the component gets |
 |---|---|
 | a column with a declared or computed type | that **exact type** — `= order_date` gives `DATE`, not "some temporal" |
-| a literal | its **family**, materialised as `widest_type_in(family)` |
+| a literal | its **family**, reported as the family and nothing narrower |
 
-`where amount > 0` therefore infers NUMERIC → `DECIMAL(38,9)`, not `INT`. The literal proves the
-column is numeric; it proves nothing about its width, and a narrow guess would falsely contradict
-`amount * 1.5` later. `where d >= '2024-01-01'` infers STRING → `VARCHAR`, at stated strength,
+`where amount > 0` therefore infers NUMERIC → `NUMERIC`, not `INT` and not `DECIMAL(38,9)`. The
+literal proves the column is numeric; it proves nothing about its width, so naming a precision
+would invent one, and a narrow guess would falsely contradict `amount * 1.5` later. `where d >= '2024-01-01'` infers STRING → `VARCHAR`, at stated strength,
 per the position above.
 
 ### ⚠️ Never overwrite a stated type
@@ -480,7 +485,7 @@ change is theirs to decide.
 1. **X1** — the `RelationKey` fix. One line, unblocks reading every other result correctly.
 2. **C1** — common catalog plus the three dialect layers. Without it nothing else is observable
    on the example project.
-3. **Lattice** — the family tree, `nearest_common_family`, `widest_type_in`, and `in_family`
+3. **Lattice** — the family tree, `nearest_common_family`, `reported_type_for` / `schema_type_for`, and `in_family`
    rewritten against it. Everything downstream depends on the shape.
 4. **F1, F2, F3** — the three new link sources, in `facts.py`. Each is independently testable
    against a fixture before any of them is consumed.

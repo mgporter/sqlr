@@ -35,6 +35,7 @@ from sqlr.sql_analysis2.check import (
     findings_for_unknown_functions,
 )
 from sqlr.sql_analysis2.facts import Facts, extract_facts_from_annotated_tree
+from sqlr.sql_analysis2.families import FamilyName
 from sqlr.sql_analysis2.infer import (
     Inference,
     InferredColumnType,
@@ -100,6 +101,12 @@ class SourceColumnType(NamedTuple):
     provenance: TypeProvenance
     evidence: list[TypeEvidence]
     """Empty for a declared column - a declaration needs no evidence, it *is* the answer."""
+    family: FamilyName | None = None
+    """The lattice node behind an inferred type. None for anything else.
+
+    What a consumer that needs a real column type should read: `type_name` may be the family
+    name itself (`NUMERIC`, `TEMPORAL`), and matching on that string is a parser where a
+    lookup will do."""
 
 
 class AnnotatedModel(NamedTuple):
@@ -208,7 +215,9 @@ def annotate_one_model(
             tree,
             # The nested form, for the same reason step 3 needed it: a flat dotted key
             # only ever matches a table written as one identifier.
-            schema=ensure_schema(nested_schema_for_sqlglot(widened), dialect=dialect_name),
+            schema=ensure_schema(
+                nested_schema_for_sqlglot(widened, dialect_name), dialect=dialect_name
+            ),
             expression_metadata=metadata,
             dialect=dialect_name,
         )
@@ -238,7 +247,11 @@ def annotate_one_model(
 
 # ------------------------------------------------------------------ reading the types
 def type_name_of(node: exp.Expr | None) -> str:
-    """A node's type as a reader would write it, or `unknown`."""
+    """A node's type as a reader would write it, or `unknown`.
+
+    Prints whatever parameters the type carries and never fills any in - the schema was built
+    to hold none that nobody wrote, see `type_held_without_parameters_nobody_wrote`.
+    """
     if node is None or node.type is None or node.type.is_type(exp.DType.UNKNOWN):
         return UNKNOWN_TYPE_NAME
     return node.type.sql()
@@ -258,13 +271,7 @@ def types_per_scope(statement: QualifiedStatement, inference: Inference) -> list
             continue
         name, kind = name_and_kind_of_scope(scope)
         columns = [
-            ColumnTypeAnnotation(
-                name=output_name_of(projection, statement.engine_named_projections),
-                type_name=type_name_of(projection),
-                provenance=provenance_of_projection(
-                    projection, scope, statement, inferred
-                ),
-            )
+            _column_type_annotation(projection, scope, statement, inferred)
             for projection in select.selects
             if qualifier_of_a_star_projection(projection) is False
         ]
@@ -273,28 +280,58 @@ def types_per_scope(statement: QualifiedStatement, inference: Inference) -> list
     return out
 
 
-def provenance_of_projection(
+def _column_type_annotation(
     projection: exp.Expr,
     scope: Scope,
     statement: QualifiedStatement,
     inferred: dict[RelationKey, dict[ColumnName, InferredColumnType]],
-) -> TypeProvenance:
-    """How much to trust one projected column's type.
+) -> ColumnTypeAnnotation:
+    """One projected column, named and typed.
+
+    A projection that is nothing but a read of an inferred source column is reported as that
+    column. sqlglot only ever saw the stand-in widening wrote into the schema, so asking it
+    would print `DECIMAL` under a column the source table calls `NUMERIC` - the same value,
+    named two ways, one line apart. Anything computed keeps sqlglot's answer: `ifnull(bonus,
+    0)` really is a decimal expression, whatever the column feeding it is known as.
+    """
+    provenance, source_column = provenance_and_inferred_column_of_projection(
+        projection, scope, statement, inferred
+    )
+    return ColumnTypeAnnotation(
+        name=output_name_of(projection, statement.engine_named_projections),
+        type_name=(
+            source_column.type_name if source_column is not None else type_name_of(projection)
+        ),
+        provenance=provenance,
+    )
+
+
+def provenance_and_inferred_column_of_projection(
+    projection: exp.Expr,
+    scope: Scope,
+    statement: QualifiedStatement,
+    inferred: dict[RelationKey, dict[ColumnName, InferredColumnType]],
+) -> tuple[TypeProvenance, InferredColumnType | None]:
+    """How much to trust one projected column's type, and the inferred column behind it.
 
     A projection that *is* a source column carries that column's provenance; anything built
     from one is computed, whatever its inputs were. `unknown` wins over everything, because
     an untyped column is not a computed answer - it is the absence of one.
+
+    The second half of the answer is non-None only for a passthrough of a column step 5
+    inferred - the one case where the scope's type and the source column's type are the same
+    fact and the caller should print the source column's name for it.
     """
     if type_name_of(projection) == UNKNOWN_TYPE_NAME:
-        return "unknown"
+        return "unknown", None
     inner = projection.this if isinstance(projection, exp.Alias) else projection
     if not isinstance(inner, exp.Column):
-        return "computed"
+        return "computed", None
 
     source = scope.sources.get(inner.table)
     if not isinstance(source, exp.Table):
         # A CTE or derived table: its column was computed by the scope that produced it.
-        return "computed"
+        return "computed", None
 
     # The full dotted key, never the bare table name: the schema is keyed on `RelationKey`
     # so that two schemas may each hold a `raw_department`, and a bare-name lookup misses
@@ -302,10 +339,11 @@ def provenance_of_projection(
     table = relation_key_of(source)
     column = inner.name.lower()
     if is_declared(statement.declared_types_per_relation.get(table, {}).get(column)):
-        return "declared"
-    if column in inferred.get(table, {}):
-        return "inferred"
-    return "unknown"
+        return "declared", None
+    entry = inferred.get(table, {}).get(column)
+    if entry is not None:
+        return "inferred", entry
+    return "unknown", None
 
 
 def types_per_source_column(
@@ -349,6 +387,7 @@ def _source_column_type(
             type_name=entry.type_name,
             provenance="inferred",
             evidence=entry.evidence,
+            family=entry.family,
         )
 
     return SourceColumnType(

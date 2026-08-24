@@ -377,7 +377,8 @@ def qualify_one_model(
     # MappingSchema from a bare dict otherwise. The nesting is what lets sqlglot match a
     # table node's own catalog/db/name parts - see `nested_schema_for_sqlglot`.
     mapped_schema = ensure_schema(
-        nested_schema_for_sqlglot(declared_types_per_relation), dialect=dialect_name
+        nested_schema_for_sqlglot(declared_types_per_relation, dialect_name),
+        dialect=dialect_name,
     )
 
     # Two things about the projection lists that only exist before step 6. Where the stars

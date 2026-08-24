@@ -701,7 +701,9 @@ def qualified_projection_names(
     fabricated = get_declared_types_per_relation(
         closure.declared_types, resolved.columns_per_relation, resolved.storage_keys
     )
-    schema = ensure_schema(nested_schema_for_sqlglot(fabricated), dialect=DIALECT)
+    schema = ensure_schema(
+        nested_schema_for_sqlglot(fabricated, DIALECT), dialect=DIALECT
+    )
 
     qualified = qualify(statement, schema=schema, dialect=DIALECT)
 

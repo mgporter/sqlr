@@ -9,7 +9,9 @@ leaf of it, and every type decision in the pipeline is one of three operations:
   most important contract in the design.
 - `nearest_common_family` - what do these two types have in common? `ANY` means nothing,
   which is the conflict signal.
-- `widest_type_in`       - what does an inferred family become in the schema?
+- `reported_type_for` / `schema_type_for` - what does an inferred family get called, in a
+  report and in the schema sqlglot re-annotates with? Two answers, because a reader wants
+  the family and sqlglot wants something it can parse.
 
 **Precision and scale are recorded, never checked.** `DECIMAL(10,2)` against `DECIMAL(38,9)`
 is not a finding and `VARCHAR(20)` against `VARCHAR(100)` is not a finding. The parameters
@@ -106,31 +108,58 @@ def _leaf_families() -> dict[exp.DType, FamilyName]:
 LEAF_FAMILY_OF_TYPE: dict[exp.DType, FamilyName] = _leaf_families()
 
 
-WIDEST_TYPE_IN_FAMILY: dict[FamilyName, str] = {
-    "NUMERIC": "DECIMAL(38,9)",
-    "INTEGER": "BIGINT",
-    "DECIMAL": "DECIMAL(38,9)",
-    "FLOAT": "DOUBLE",
+REPORTED_TYPE_FOR_FAMILY: dict[FamilyName, str] = {
+    "NUMERIC": "NUMERIC",
+    "INTEGER": "INTEGER",
+    "DECIMAL": "DECIMAL",
+    "FLOAT": "FLOAT",
     "STRING": "VARCHAR",
-    "TEMPORAL": "TIMESTAMP",
+    "TEMPORAL": "TEMPORAL",
     "DATE": "DATE",
     "TIME": "TIME",
     "TIMESTAMP": "TIMESTAMP",
     "BOOLEAN": "BOOLEAN",
     "INTERVAL": "INTERVAL",
     "BINARY": "VARBINARY",
-    "ARRAY": "ARRAY<VARCHAR>",
+    "ARRAY": "ARRAY",
 }
-"""What an inferred family becomes in the schema sqlglot re-annotates with.
+"""What an inferred family is called in a report, when no anchor pinned a concrete type.
 
-The *widest* member, never a plausible-looking narrow one. `where amount > 0` proves the
-column is numeric and proves nothing about its width, so inferring `INT` from it would
-falsely contradict `amount * 1.5` three CTEs later. A wide type contradicts nothing, and the
-family - which is what a report prints and what fixture generation reads - is recorded
-separately and stays exact.
+**Never parameterised.** `where amount > 0` proves the column is numeric and proves nothing
+about its precision, so reporting `DECIMAL(38,9)` would claim a scale nobody wrote and no
+evidence supports. The family name itself is the honest answer, and a consumer that needs a
+real column type picks one from the family it reads off `InferredColumnType.family`.
 
-`STRUCT` and `ANY` are deliberately absent: neither has a member wide enough to stand for the
-rest, and a column inferred into one of them is better left UNKNOWN.
+Mostly the family's own name, because a family named after a type is exactly the
+parameter-free type a reader wants. Where the family name is not one - `STRING`, `BINARY` -
+the parameter-free member stands in, since `VARCHAR` says everything `STRING` does and is
+a name an engine would accept. `TEMPORAL` has no such member: nothing parameter-free covers
+a date, a time and an instant at once, so the family name stands.
+
+`STRUCT` and `ANY` are deliberately absent: neither has a member that stands for the rest,
+and a column inferred into one of them is better left UNKNOWN.
+"""
+
+SCHEMA_TYPE_FOR_FAMILY: dict[FamilyName, str] = {
+    **REPORTED_TYPE_FOR_FAMILY,
+    "NUMERIC": "DECIMAL",
+    "INTEGER": "BIGINT",
+    "FLOAT": "DOUBLE",
+    "TEMPORAL": "TIMESTAMP",
+}
+"""What an inferred family becomes in the schema sqlglot re-annotates with. Not reported.
+
+Two things separate this from the reported name, and both are sqlglot's requirements rather
+than the reader's:
+
+- it has to **parse**. `DataType.build('TEMPORAL')` raises, so the family that has no
+  parameter-free type of its own borrows the widest one that does.
+- it has to be the **widest** member, never a plausible-looking narrow one, because
+  everything computed downstream inherits it. `INTEGER` reads better in a report; `BIGINT`
+  is what keeps `amount * 1000000000` from being annotated into an overflow.
+
+Parameter-free throughout regardless - a width invented here would be printed by every
+scope that reads the column, which is the leak this pair of maps exists to close.
 """
 
 
@@ -209,9 +238,14 @@ def nearest_common_family(left: FamilyName, right: FamilyName) -> FamilyName:
     return ANY
 
 
-def widest_type_in(family: FamilyName) -> str | None:
-    """The type name an inferred family becomes, or None when the family has no stand-in."""
-    return WIDEST_TYPE_IN_FAMILY.get(family)
+def reported_type_for(family: FamilyName) -> str | None:
+    """What to call an inferred family, or None when the family has no stand-in at all."""
+    return REPORTED_TYPE_FOR_FAMILY.get(family)
+
+
+def schema_type_for(family: FamilyName) -> str | None:
+    """The type sqlglot's schema gets for a family, or None when the family has no stand-in."""
+    return SCHEMA_TYPE_FOR_FAMILY.get(family)
 
 
 def describe_families(families: frozenset[FamilyName] | set[FamilyName]) -> str:

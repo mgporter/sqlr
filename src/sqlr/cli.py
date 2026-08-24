@@ -109,10 +109,6 @@ def validate(
 
     results = validate_schema(cfg, declared, models)
 
-    # Both halves are printed: where each column comes from, then what type it is. The
-    # second is unreadable without the first - a type nobody can trace back to a source is
-    # a number on a page.
-    # print_qualification([result.qualified for result in results])
     print_annotations(results)
 
     if any_model_has_errors(results):

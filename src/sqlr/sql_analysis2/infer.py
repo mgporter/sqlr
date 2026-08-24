@@ -59,8 +59,9 @@ from sqlr.sql_analysis2.families import (
     family_of_type,
     family_satisfies,
     nearest_common_family,
+    reported_type_for,
     root_family_of,
-    widest_type_in,
+    schema_type_for,
 )
 from sqlr.sql_analysis2.facts import Facts, ValueSite
 from sqlr.sql_analysis2.resolve import is_declared
@@ -122,8 +123,12 @@ class InferredColumnType:
     table: RelationKey
     column: ColumnName
     type_name: ColumnTypeName
-    """What goes into the widened schema - concrete, because sqlglot's schema speaks types
-    and not families."""
+    """What a report calls this column. An anchor's exact type when one pinned it down -
+    `where d = order_date` gives `DATE(3)` if that is what was declared - and otherwise the
+    family, parameter-free, because usage evidence proves a kind and never a width."""
+    schema_type_name: ColumnTypeName
+    """What goes into the widened schema instead. Differs from `type_name` only for a family
+    whose reported name sqlglot cannot parse or would narrow on - see `SCHEMA_TYPE_FOR_FAMILY`."""
     family: FamilyName
     strength: TypeStrength
     evidence: list[TypeEvidence]
@@ -317,10 +322,26 @@ class ComponentVerdict:
 
     members: list[ValueSite]
     family: FamilyName | None
-    type_name: ColumnTypeName | None
+    concrete_type_name: ColumnTypeName | None
+    """The exact type an anchor pinned down, or None when the family is all that is known -
+    which is the usual case, since usage evidence proves a kind and never a width."""
     strength: TypeStrength
     evidence: list[TypeEvidence]
     conflict: ColumnTypeConflict | None = None
+
+    @property
+    def type_name(self) -> ColumnTypeName | None:
+        """What a report calls this. None when the component resolved to nothing nameable."""
+        if self.concrete_type_name is not None:
+            return self.concrete_type_name
+        return reported_type_for(self.family) if self.family is not None else None
+
+    @property
+    def schema_type_name(self) -> ColumnTypeName | None:
+        """What sqlglot's schema gets instead. None for the same components `type_name` is."""
+        if self.concrete_type_name is not None:
+            return self.concrete_type_name
+        return schema_type_for(self.family) if self.family is not None else None
 
 
 class _Resolver:
@@ -401,7 +422,7 @@ class _Resolver:
             return ComponentVerdict(
                 members=members,
                 family=None,
-                type_name=None,
+                concrete_type_name=None,
                 strength="unresolved",
                 evidence=anchors,
                 conflict=self._conflict(members, anchors, "stated"),
@@ -410,36 +431,36 @@ class _Resolver:
         return ComponentVerdict(
             members=members,
             family=family,
-            type_name=self._type_name_for(family, anchors, members),
+            concrete_type_name=self._concrete_type_name_for(family, anchors, members),
             strength="stated",
             evidence=anchors,
         )
 
-    def _type_name_for(
+    def _concrete_type_name_for(
         self, family: FamilyName, anchors: list[TypeEvidence], members: list[ValueSite]
     ) -> ColumnTypeName | None:
-        """The concrete type an agreed family becomes.
+        """The exact type an agreed family pinned down, or None when it pinned down none.
 
         A single anchor type that *is* the agreed family wins, because it is strictly more
         informative: `where d = order_date` gives `DATE` rather than widening a date column
-        to `TIMESTAMP`. Anything else falls back to the widest member, which contradicts
-        nothing later.
+        to `TIMESTAMP`. Anything else is the family and nothing more - two anchors that
+        merely agree on a family agree on no width between them, and picking one of their
+        widths would report a precision the SQL never established.
 
         ⚠️ A `@family` link anywhere in the component forfeits the concrete type for all of
         it. `sum(x)` is numeric because `x` is, but its width is the engine's business, and
         carrying a width across that link would invent one. Coarse on purpose - a component
         is resolved as a whole and there is no half-precision.
         """
-        if not any(id(member.node) in self.family_only_links for member in members):
-            concrete = {
-                anchor.concrete_type.sql()
-                for anchor in anchors
-                if anchor.concrete_type is not None
-                and any(family_satisfies(named, family) for named in anchor.families)
-            }
-            if len(concrete) == 1:
-                return concrete.pop()
-        return widest_type_in(family)
+        if any(id(member.node) in self.family_only_links for member in members):
+            return None
+        concrete = {
+            anchor.concrete_type.sql()
+            for anchor in anchors
+            if anchor.concrete_type is not None
+            and any(family_satisfies(named, family) for named in anchor.families)
+        }
+        return concrete.pop() if len(concrete) == 1 else None
 
     def _resolve_from_claims(self, members: list[ValueSite]) -> ComponentVerdict:
         """Nobody stated anything, so the claims are all there is."""
@@ -470,7 +491,7 @@ class _Resolver:
             return ComponentVerdict(
                 members=members,
                 family=None,
-                type_name=None,
+                concrete_type_name=None,
                 strength="unresolved",
                 evidence=evidence,
                 conflict=self._conflict(members, evidence, "inferred"),
@@ -484,7 +505,7 @@ class _Resolver:
         return ComponentVerdict(
             members=members,
             family=family,
-            type_name=widest_type_in(family),
+            concrete_type_name=None,
             strength="inferred",
             evidence=evidence,
         )
@@ -518,7 +539,8 @@ class _Resolver:
         if verdict.conflict is not None:
             inference.conflicts.append(verdict.conflict)
             return
-        if verdict.family is None or verdict.type_name is None:
+        type_name, schema_type_name = verdict.type_name, verdict.schema_type_name
+        if verdict.family is None or type_name is None or schema_type_name is None:
             return
 
         # Only source columns have a schema slot to widen. A CTE column's type is computed
@@ -535,7 +557,8 @@ class _Resolver:
                 InferredColumnType(
                     table=table,
                     column=column,
-                    type_name=verdict.type_name,
+                    type_name=type_name,
+                    schema_type_name=schema_type_name,
                     family=verdict.family,
                     strength=verdict.strength,
                     evidence=verdict.evidence,
@@ -575,5 +598,5 @@ def widen_schema_with_inferred_types(
         current = widened.get(entry.table, {}).get(entry.column)
         if current is None or is_declared(current):
             continue
-        widened[entry.table][entry.column] = entry.type_name
+        widened[entry.table][entry.column] = entry.schema_type_name
     return widened
