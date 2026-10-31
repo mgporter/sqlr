@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sqlr"
+version = "0.1.0"
+description = ""
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "pathspec>=1.1.1",
+    "rich>=13.0",
+    "sqlglot>=30.14.0",
+    "duckdb>=2.0.0",
+    "pandas>=3.1.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pyright>=1.1.400",
+]
+
+[project.scripts]
+sqlr = "sqlr.app:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sqlr"]
