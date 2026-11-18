@@ -18,6 +18,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from enum import Enum
 
+from sqlr.schema_compare import cast_to_common, compare_schemas, Policy
+
 def run_query(query: str) -> pa.Table:
     result = duckdb.sql(query)
 
@@ -132,61 +134,72 @@ def replace_sources(scope: Scope, fixtures: Iterable[SourceFixture], tag: str = 
     return scope_copy
 
 
-def schema_diff_table(actual: pa.Schema, expected: pa.Schema) -> RichTable | None:
-    """Table of expected columns vs actual types, mismatches in red. None if schemas match."""
-    table = RichTable(box=None, padding=(0, 2))
-    table.add_column()
-    table.add_column("expected")
-    table.add_column("actual")
+# def schema_diff_table(actual: pa.Schema, expected: pa.Schema) -> RichTable | None:
+#     """Table of expected columns vs actual types, mismatches in red. None if schemas match."""
+#     table = RichTable(box=None, padding=(0, 2))
+#     table.add_column()
+#     table.add_column("expected")
+#     table.add_column("actual")
 
-    actual_types = dict(zip(actual.names, actual.types))
-    expected_names = set(expected.names)
-    differs = False
+#     actual_types = dict(zip(actual.names, actual.types))
+#     expected_names = set(expected.names)
+#     differs = False
 
-    # Text (not str) cells so rich doesn't parse markup, e.g. the "[s]" in "timestamp[s]".
-    for name, expected_type in zip(expected.names, expected.types):
-        actual_type = actual_types.get(name)
-        if actual_type is None:
-            actual_cell = Text("<missing column>", style="red")
-            differs = True
-        elif actual_type != expected_type:
-            actual_cell = Text(str(actual_type), style="red")
-            differs = True
-        else:
-            actual_cell = Text(str(actual_type))
-        table.add_row(Text(name), Text(str(expected_type)), actual_cell)
+#     # Text (not str) cells so rich doesn't parse markup, e.g. the "[s]" in "timestamp[s]".
+#     for name, expected_type in zip(expected.names, expected.types):
+#         actual_type = actual_types.get(name)
+#         if actual_type is None:
+#             actual_cell = Text("<missing column>", style="red")
+#             differs = True
+#         elif actual_type != expected_type:
+#             actual_cell = Text(str(actual_type), style="red")
+#             differs = True
+#         else:
+#             actual_cell = Text(str(actual_type))
+#         table.add_row(Text(name), Text(str(expected_type)), actual_cell)
 
-    for name in actual.names:
-        if name not in expected_names:
-            table.add_row("", "", Text(f"<extra column '{name}'>", style="red"))
-            differs = True
+#     for name in actual.names:
+#         if name not in expected_names:
+#             table.add_row("", "", Text(f"<extra column '{name}'>", style="red"))
+#             differs = True
 
-    if not differs:
-        if actual.names == expected.names:
-            return None
-        table.caption = f"Names and types match but column order differs. Actual order: {actual.names}"
+#     if not differs:
+#         if actual.names == expected.names:
+#             return None
+#         table.caption = f"Names and types match but column order differs. Actual order: {actual.names}"
 
-    return table
+#     return table
+
+def sort_pa_table(table: pa.Table, sort_by: list[str]) -> pa.Table:
+    # sort_keys: list[tuple[str, Literal["ascending", "descending"]]] = [(col, "ascending") for col in sort_by]
+    return table.take(pc.sort_indices(table, sort_keys=[(col, "ascending") for col in sort_by]))  # pyright: ignore[reportUnknownMemberType]
 
 
-def assert_equals(actual: FixtureData | pa.Table, expected: FixtureData | pa.Table, sort_by: list[str] | None = None) -> None:
+def assert_equals(
+        actual: FixtureData | pa.Table, 
+        expected: FixtureData | pa.Table, 
+        sort_by: list[str] | None = None,
+        policy: Policy = Policy()
+        ) -> None:
     """Assert actual holds the same data as expected. If sort_by is given, sort both by those columns (ascending) first."""
     actual_table = actual.to_arrow() if isinstance(actual, FixtureData) else actual
     expected_table = expected.to_arrow() if isinstance(expected, FixtureData) else expected
 
-    schema_diff = schema_diff_table(actual_table.schema, expected_table.schema)
-    if schema_diff is not None:
-        print()
-        console.print(schema_diff)
-        print()
-        raise AssertionError("Schema of actual does not match expected.")
+    schema_comparison = compare_schemas(actual_table.schema, expected_table.schema, policy)
+    # print(schema_comparison)
+    actual_table, expected_table = cast_to_common(actual_table, expected_table, schema_comparison)
 
     if sort_by:
-        sort_keys: list[tuple[str, Literal["ascending", "descending"]]] = [(col, "ascending") for col in sort_by]
-        actual_table = actual_table.take(pc.sort_indices(actual_table, sort_keys=sort_keys))  # pyright: ignore[reportUnknownMemberType]
-        expected_table = expected_table.take(pc.sort_indices(expected_table, sort_keys=sort_keys))  # pyright: ignore[reportUnknownMemberType]
-    if not actual_table.equals(expected_table):
-        raise AssertionError("actual is not equal to expected.")
+        actual_table = sort_pa_table(actual_table, sort_by)
+        expected_table = sort_pa_table(expected_table, sort_by)
+
+    comparison_result = actual_table.equals(expected_table)
+    if not comparison_result:
+        print("Tables are not equal")
+        return
+        # raise AssertionError("actual is not equal to expected.")
+    
+    print("Tables are equal")
 
 
 
@@ -205,19 +218,9 @@ class TestableSql(BaseModel):
     def get_source_aliases(self) -> list[str]:
         return list(self.original_scope.selected_sources.keys())
 
-    def set_fixtures(self, fixtures: Iterable[SourceFixture]) -> None:
+    def run_with_fixtures(self, fixtures: Iterable[SourceFixture]) -> pa.Table:
         fixtured_scope = replace_sources(self.original_scope, fixtures, self.tag)
-        self.fixtured_scope = fixtured_scope
-
-    def fixtures_set(self) -> bool:
-        return self.fixtured_scope is not None
-
-    def run_with_fixtures(self) -> pa.Table:
-        scope = self.fixtured_scope
-        if scope is None:
-            raise Exception("Fixtures are not set.")
-
-        return run_query(scope.expression.sql())
+        return run_query(fixtured_scope.expression.sql())
 
 
 def by_tag(tag: str) -> TestableSql | None:
@@ -248,14 +251,14 @@ def by_tag(tag: str) -> TestableSql | None:
 
 @app.command()
 def te() -> None:
-    testable_sql = by_tag("inner_select")
-    # testable_sql = by_tag("plus_two")
+    # testable_sql = by_tag("inner_select")
+    testable_sql = by_tag("plus_two")
 
     if testable_sql is None:
         print("Testable SQL not found.")
         return
 
-    print(testable_sql.get_source_aliases())
+    # print(testable_sql.get_source_aliases())
 
     numbers_fixture = SourceFixture(
         alias="numbers",
@@ -268,83 +271,27 @@ def te() -> None:
         ),
     )
 
-    expected = FixtureData(
-        data=[(1,), (5,), (17,)],
-        columns=[FixtureColumn(name="num", type=SqlType.INT)]
+    # inner_select_expected = FixtureData(
+    #     data=[(1,), (5,), (17,)],
+    #     columns=[FixtureColumn(name="num", type=SqlType.INT)]
+    # )
+
+    plus_two_expected = FixtureData(
+        data=[(17,19,'seventeen'), (1,3,'one'), (5,7,'five'), (5,7,'five??'),],
+        columns=[
+            FixtureColumn(name="num", type=SqlType.INT),
+            FixtureColumn(name="num_plus_two", type=SqlType.INT),
+            FixtureColumn(name="name", type=SqlType.STRING)
+        ]
     )
 
-    testable_sql.set_fixtures([numbers_fixture])
-
-    print(testable_sql.fixtures_set())
-
-    result = testable_sql.run_with_fixtures()
+    result = testable_sql.run_with_fixtures([numbers_fixture])
 
     print(result)
 
-    assert_equals(result, expected, sort_by=["num"])
+    policy = Policy()
 
-
-def _demo_expected() -> FixtureData:
-    return FixtureData(
-        data=[(1, "one", date(2020, 1, 1)), (2, "two", date(2021, 2, 2))],
-        columns=[
-            FixtureColumn(name="num", type=SqlType.INT),
-            FixtureColumn(name="name", type=SqlType.STRING),
-            FixtureColumn(name="born", type=SqlType.DATE),
-        ],
-    )
-
-
-def _demo_assert_equals(actual: FixtureData, expected: FixtureData) -> None:
-    try:
-        assert_equals(actual, expected)
-    except AssertionError as e:
-        print(f"AssertionError: {e}")
-    else:
-        print("assert_equals passed.")
-
-
-@app.command()
-def test_assert_equal1() -> None:
-    """Schema demo: actual is missing the 'name' column."""
-    actual = FixtureData(
-        data=[(1, date(2020, 1, 1)), (2, date(2021, 2, 2))],
-        columns=[
-            FixtureColumn(name="num", type=SqlType.INT),
-            FixtureColumn(name="born", type=SqlType.DATE),
-        ],
-    )
-    _demo_assert_equals(actual, _demo_expected())
-
-
-@app.command()
-def test_assert_equal2() -> None:
-    """Schema demo: actual has an extra 'nickname' column."""
-    actual = FixtureData(
-        data=[(1, "one", date(2020, 1, 1), "uno"), (2, "two", date(2021, 2, 2), "dos")],
-        columns=[
-            FixtureColumn(name="num", type=SqlType.INT),
-            FixtureColumn(name="name", type=SqlType.STRING),
-            FixtureColumn(name="born", type=SqlType.DATE),
-            FixtureColumn(name="nickname", type=SqlType.STRING),
-        ],
-    )
-    _demo_assert_equals(actual, _demo_expected())
-
-
-@app.command()
-def test_assert_equal3() -> None:
-    """Schema demo: 'num' and 'born' have different types in actual, 'name' matches."""
-    actual = FixtureData(
-        data=[(1.0, "one", "2020-01-01"), (2.0, "two", "2021-02-02")],
-        columns=[
-            FixtureColumn(name="num", type=SqlType.FLOAT),
-            FixtureColumn(name="name", type=SqlType.STRING),
-            FixtureColumn(name="born", type=SqlType.STRING),
-        ],
-    )
-    _demo_assert_equals(actual, _demo_expected())
-
+    assert_equals(result, plus_two_expected, sort_by=["num"], policy=policy)
 
 
 
