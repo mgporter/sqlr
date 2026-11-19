@@ -1,11 +1,11 @@
-from datetime import date
-from typing import Iterable, Literal
+
+from typing import Iterable, Sequence
 import re
 
 import typer
 from rich.console import Console
-from rich.table import Table as RichTable
-from rich.text import Text
+# from rich.table import Table as RichTable
+# from rich.text import Text
 import sqlglot
 from sqlglot import Expr
 import sqlglot.expressions as exp
@@ -15,10 +15,11 @@ from pydantic import BaseModel, ConfigDict, Field
 import duckdb
 import pandas as pd
 import pyarrow as pa
-import pyarrow.compute as pc
 from enum import Enum
 
-from sqlr.schema_compare import cast_to_common, compare_schemas, Policy
+from sqlr.errors import ComparisonError
+from sqlr.schema_compare import Policy
+from sqlr.table_compare import TableMismatchError, assert_equals
 
 def run_query(query: str) -> pa.Table:
     result = duckdb.sql(query)
@@ -79,7 +80,7 @@ class FixtureData(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    data: Iterable[tuple[object, ...]]
+    data: Sequence[tuple[object, ...]]
     columns: list[FixtureColumn]
 
     _paTable: pa.Table | None = None
@@ -170,41 +171,6 @@ def replace_sources(scope: Scope, fixtures: Iterable[SourceFixture], tag: str = 
 
 #     return table
 
-def sort_pa_table(table: pa.Table, sort_by: list[str]) -> pa.Table:
-    # sort_keys: list[tuple[str, Literal["ascending", "descending"]]] = [(col, "ascending") for col in sort_by]
-    return table.take(pc.sort_indices(table, sort_keys=[(col, "ascending") for col in sort_by]))  # pyright: ignore[reportUnknownMemberType]
-
-
-def assert_equals(
-        actual: FixtureData | pa.Table, 
-        expected: FixtureData | pa.Table, 
-        sort_by: list[str] | None = None,
-        policy: Policy = Policy()
-        ) -> None:
-    """Assert actual holds the same data as expected. If sort_by is given, sort both by those columns (ascending) first."""
-    actual_table = actual.to_arrow() if isinstance(actual, FixtureData) else actual
-    expected_table = expected.to_arrow() if isinstance(expected, FixtureData) else expected
-
-    schema_comparison = compare_schemas(actual_table.schema, expected_table.schema, policy)
-    # print(schema_comparison)
-    actual_table, expected_table = cast_to_common(actual_table, expected_table, schema_comparison)
-
-    if sort_by:
-        actual_table = sort_pa_table(actual_table, sort_by)
-        expected_table = sort_pa_table(expected_table, sort_by)
-
-    comparison_result = actual_table.equals(expected_table)
-    if not comparison_result:
-        print("Tables are not equal")
-        return
-        # raise AssertionError("actual is not equal to expected.")
-    
-    print("Tables are equal")
-
-
-
-
-
 
 class TestableSql(BaseModel):
 
@@ -277,7 +243,7 @@ def te() -> None:
     # )
 
     plus_two_expected = FixtureData(
-        data=[(17,19,'seventeen'), (1,3,'one'), (5,7,'five'), (5,7,'five??'),],
+        data=[(17,19,'seventeen'), (1,3,'ont'), (5,7,'five'), (5,7,'five??'),],
         columns=[
             FixtureColumn(name="num", type=SqlType.INT),
             FixtureColumn(name="num_plus_two", type=SqlType.INT),
@@ -291,7 +257,16 @@ def te() -> None:
 
     policy = Policy()
 
-    assert_equals(result, plus_two_expected, sort_by=["num"], policy=policy)
+    try:
+        assert_equals(result, plus_two_expected, sort_by=["num"], policy=policy)
+    except TableMismatchError as e:
+        typer.echo(f"FAILED\n{e}")
+        raise typer.Exit(code=1)
+    except ComparisonError as e:
+        typer.echo(f"ERROR\n{e}", err=True)
+        raise typer.Exit(code=2)
+
+    print("Tables are equal")
 
 
 

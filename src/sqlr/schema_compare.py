@@ -39,6 +39,8 @@ from typing import Any, Callable, Literal, Self, Sequence, cast
 import pyarrow as pa
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from sqlr.errors import ComparisonError
+
 __all__ = [
     "Policy",
     "SchemaPolicyError",
@@ -50,7 +52,7 @@ __all__ = [
 ]
 
 
-class SchemaPolicyError(Exception):
+class SchemaPolicyError(ComparisonError):
     """The Policy combines options that contradict each other."""
 
 
@@ -137,7 +139,7 @@ class SchemaComparison:
         return not self.problems and all(column.ok for column in self.columns)
 
 
-class SchemaCastError(Exception):
+class SchemaCastError(ComparisonError):
     """A column could not be cast to its common type."""
 
     def __init__(
